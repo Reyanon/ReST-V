@@ -76,6 +76,20 @@ static void decode(const Entry *e, const uint8_t *vram, uint8_t *atlas)
 		for (int k = 0; k < 16; k++)
 			lut[k] = (uint16_t)rd16(vram, ((uint32_t)e->colr << 3) + (uint32_t)k * 2);
 	const int rb = row_bytes(cm, w);
+	// transparent border around the pattern: a texture coordinate landing exactly on the pattern edge (distorted
+	// sprites: vertices on pixel centres, coordinates on texel edges) may round to the texel outside, which held the
+	// last row of the pattern above or stale data (thuntk hats: dark lines along the top edge)
+	{
+		uint32_t *top = (uint32_t *)(atlas + ((size_t)(e->ay - 1) * V1GPU_ATLAS + e->ax - 1) * 4);
+		uint32_t *bot = (uint32_t *)(atlas + ((size_t)(e->ay + h) * V1GPU_ATLAS + e->ax - 1) * 4);
+		memset(top, 0, (size_t)(w + 2) * 4);
+		memset(bot, 0, (size_t)(w + 2) * 4);
+		for (int y = 0; y < h; y++) {
+			uint32_t *row = (uint32_t *)(atlas + ((size_t)(e->ay + y) * V1GPU_ATLAS + e->ax) * 4);
+			row[-1] = 0;
+			row[w] = 0;
+		}
+	}
 	for (int y = 0; y < h; y++) {
 		uint32_t *d = (uint32_t *)(atlas + ((size_t)(e->ay + y) * V1GPU_ATLAS + e->ax) * 4);
 		const uint32_t row = e->addr + (uint32_t)(y * rb);
@@ -193,8 +207,10 @@ static int lookup(uint32_t addr, uint16_t size, int cmode, uint16_t colr, int fl
 		}
 		if (!e->used) {
 			int x, y;
-			if (atlas_alloc(w, h, &x, &y) < 0)
+			if (atlas_alloc(w + 2, h + 2, &x, &y) < 0) // 1-texel transparent border (see decode)
 				return -1;
+			x++;
+			y++;
 			e->used = 1;
 			e->addr = addr; e->size = size; e->colr = colr; e->cmode = (uint8_t)cmode; e->flags = (uint8_t)flags;
 			e->ax = (uint16_t)x; e->ay = (uint16_t)y; e->w = (uint16_t)w; e->h = (uint16_t)h;

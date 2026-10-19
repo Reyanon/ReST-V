@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "frontend/cheats.h"
 #include "frontend/stv_list.h"
 #include "frontend/ui.h"
 #include "stv.h"
@@ -371,20 +372,36 @@ int rstv_settings_delete_game(void)
 // ================================ menu state ================================
 static char s_set[32], s_title[96];
 static UiCanvas *s_cv, *s_osd_cv, *s_fps_cv;
-enum { PAGE_MAIN, PAGE_STATES, PAGE_DISPLAY, PAGE_CONTROLS, PAGE_ABOUT };
-enum { M_RESUME, M_RESET, M_STATES, M_DISPLAY, M_CONTROLS, M_GAME_SAVE, M_GAME_DEL, M_ABOUT, M_SELECT_GAME, M_EXIT, M_BACK, M_COUNT };
+enum { PAGE_MAIN, PAGE_STATES, PAGE_DISPLAY, PAGE_CONTROLS, PAGE_ABOUT, PAGE_CHEATS };
+enum { M_RESUME, M_RESET, M_STATES, M_DISPLAY, M_CONTROLS, M_CHEATS, M_GAME_SAVE, M_GAME_DEL, M_ABOUT, M_SELECT_GAME, M_EXIT, M_BACK, M_COUNT };
 // game list options (START in the list): no game. Only Display / Controls / Back, global settings only
 static int s_list_mode;
-// main menu row count and row -> item (Delete only if per-game settings exist, else Save only. Back only in list options)
-static int main_rows(void) { return s_list_mode ? 3 : M_COUNT - 2; }
+// main menu rows -> items (Delete only if per-game settings exist, else Save only. Cheats only for games that have some.
+// Back only in list options)
+static int main_list(int *k)
+{
+	int n = 0;
+	if (s_list_mode) {
+		k[n++] = M_DISPLAY;
+		k[n++] = M_CONTROLS;
+		k[n++] = M_BACK;
+		return n;
+	}
+	for (int m = 0; m < M_BACK; m++) {
+		if (m == (rstv_settings_has_game() ? M_GAME_SAVE : M_GAME_DEL))
+			continue;
+		if (m == M_CHEATS && !rstv_cheats_count())
+			continue;
+		k[n++] = m;
+	}
+	return n;
+}
+static int main_rows(void) { int k[M_COUNT]; return main_list(k); }
 static int main_kind(int row)
 {
-	if (s_list_mode) {
-		static const int k[3] = { M_DISPLAY, M_CONTROLS, M_BACK };
-		return k[row];
-	}
-	const int hidden = rstv_settings_has_game() ? M_GAME_SAVE : M_GAME_DEL;
-	return row >= hidden ? row + 1 : row;
+	int k[M_COUNT];
+	const int n = main_list(k);
+	return row >= 0 && row < n ? k[row] : M_RESUME;
 }
 enum { S_SLOT, S_SAVE, S_LOAD, S_BACK, S_COUNT };
 enum { D_FPS, D_ASPECT, D_FILTER, D_SCAN, D_SCAN_STR, D_BORDER, D_BORDER_COL, D_BACK, D_COUNT };
@@ -428,7 +445,7 @@ static const char *const s_about[] = {
 	"Sega ST-V / System C / C2 arcade board emulator",
 	"Games (c) their owners. ROM images are not included.",
 	"Not affiliated with or endorsed by Sega.",
-	"Free software under the GNU GPL version 2.",
+	"Free software under the GNU GPL version 3.",
 	"",
 	"#Open source used",
 	"Yabause / YabaSanshiro - SH-2, SCU, VDP1/2, SCSP, SMPC",
@@ -493,6 +510,7 @@ void rstv_menu_init(const char *set, const char *title, int buttons)
 		g_set.turbo_btn = 1;
 	snprintf(s_set, sizeof(s_set), "%s", set);
 	snprintf(s_title, sizeof(s_title), "%s", title ? title : set);
+	rstv_cheats_init(set);
 	ensure_canvases();
 }
 
@@ -523,6 +541,7 @@ static int page_items(void)
 	case PAGE_CONTROLS: return ctrl_rows();
 	case PAGE_STATES: return S_COUNT;
 	case PAGE_ABOUT: return ABOUT_VISIBLE;
+	case PAGE_CHEATS: return rstv_cheats_count() + 1;
 	default: return main_rows();
 	}
 }
@@ -595,6 +614,9 @@ static void change(int dir)
 		if (s_sel == S_SLOT)
 			s_state_slot = wrap(s_state_slot + dir, STATE_SLOTS);
 		break;
+	case PAGE_CHEATS:
+		rstv_cheats_change(s_sel, dir);
+		break;
 	}
 }
 
@@ -613,6 +635,7 @@ static rstv_menu_result confirm(void)
 		case M_STATES: go_page(PAGE_STATES); break;
 		case M_DISPLAY: go_page(PAGE_DISPLAY); break;
 		case M_CONTROLS: go_page(PAGE_CONTROLS); break;
+		case M_CHEATS: go_page(PAGE_CHEATS); break;
 		case M_GAME_SAVE: // this game only (the global settings file is not written)
 			if (rstv_settings_save_game())
 				rstv_osd_show("Saved settings for %s", s_set);
@@ -648,6 +671,10 @@ static rstv_menu_result confirm(void)
 	}
 	case PAGE_ABOUT:
 		go_page(PAGE_MAIN);
+		break;
+	case PAGE_CHEATS:
+		if (s_sel == rstv_cheats_count()) go_page(PAGE_MAIN);
+		else change(+1);
 		break;
 	case PAGE_STATES:
 		if (s_sel == S_SAVE) return RSTV_MENU_SAVE;
@@ -851,6 +878,10 @@ static void menu_paint(UiCanvas *c, int overlay)
 		title = "CONTROLS";
 		foot = s_list_mode ? "Left/Right: choose button   (global settings)" : "Left/Right: choose button   Menu: SELECT+START";
 		break;
+	case PAGE_CHEATS:
+		title = "CHEATS";
+		foot = "Applies from the next game start (Reset game to use it now)";
+		break;
 	case PAGE_STATES:
 		title = "SAVE / LOAD STATE";
 		foot = "Quick save: SELECT+L   Quick load: SELECT+R";
@@ -882,7 +913,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 		switch (s_page) {
 		case PAGE_MAIN: {
 			static const char *const names[M_COUNT] = { "Resume game", "Reset game", "Save / Load state  >", "Display  >",
-				"Controls  >", "Save game settings", "Delete game settings", "About  >", "Select game", "Exit", "Back" };
+				"Controls  >", "Cheats  >", "Save game settings", "Delete game settings", "About  >", "Select game", "Exit", "Back" };
 			const int k = main_kind(i);
 			const char *name = names[k];
 			char rbuf[64];
@@ -939,6 +970,12 @@ static void menu_paint(UiCanvas *c, int overlay)
 				static const char *const names[S_COUNT] = { "", "Save state", "Load state", "Back" };
 				item(c, px, ty, i, s_sel, names[i], NULL);
 			}
+			break;
+		case PAGE_CHEATS:
+			if (i < rstv_cheats_count())
+				item(c, px, ty, i, s_sel, rstv_cheats_name(i), rstv_cheats_value(i));
+			else
+				item(c, px, ty, i, s_sel, "Back", NULL);
 			break;
 		case PAGE_ABOUT: {
 			const int k = s_about_scroll + i;
@@ -1023,7 +1060,7 @@ void rstv_loading_progress(int permille)
 	ui_text(c, x, y - 20, COL_TEXT, 1.0f, s_loading_title[0] ? s_loading_title : "Loading...");
 	ui_rect(c, x - 2, y - 2, w + 4, h + 4, COL_DIM);
 	ui_rect(c, x, y, w, h, COL_PANEL);
-	ui_rect(c, x, y, w * permille / 1000, h, COL_SEL);
+	ui_rect(c, x, y, w * permille / 1000, h, UI_RGBA(0x38, 0xA8, 0xFF, 0xFF)); // blue, the app art accent
 	ui_commit(c);
 	rstv_video_present();
 }

@@ -220,7 +220,30 @@ static INLINE void *DMAMemoryPointer(u32 address) {
 
 #endif  // OPTIMIZED_DMA
 
+// Game hack RSTV_HACK_NULL_DMA (thunt / thuntk final boss): a direct-mode DMA whose source is a NULL-based address
+// (< 0x100: a field read through a NULL sprite pointer) is not started. With count 0 it would copy 1 MB of 0xFFFF over
+// VDP1 VRAM, the framebuffer and the VDP1 registers, and VDP1 would stop for good. Skipping it loses one sprite
+extern unsigned rstv_game_hacks;
+unsigned rstv_null_dma_skips;
+static int rstv_null_dma(u32 src, u32 md)
+{
+  if (!(rstv_game_hacks & 2) || (md & 0x1000000) || (src & 0x0FFFFFFF) >= 0x100)
+    return 0;
+  rstv_null_dma_skips++;
+  return 1;
+}
+int rstv_dma_busy; // diag (vdp1.cpp v1watch): 1 = SCU direct DMA, 2 = SCU timed DMA, 3 = SH-2 DMAC
+static void DoDMA0(u32 ReadAddress, unsigned int ReadAdd, u32 WriteAddress, unsigned int WriteAdd, u32 TransferSize);
 static void DoDMA(u32 ReadAddress, unsigned int ReadAdd,
+                  u32 WriteAddress, unsigned int WriteAdd,
+                  u32 TransferSize)
+{
+  const int prev = rstv_dma_busy;
+  rstv_dma_busy = 1;
+  DoDMA0(ReadAddress, ReadAdd, WriteAddress, WriteAdd, TransferSize);
+  rstv_dma_busy = prev;
+}
+static void DoDMA0(u32 ReadAddress, unsigned int ReadAdd,
                   u32 WriteAddress, unsigned int WriteAdd,
                   u32 TransferSize)
 {
@@ -1095,7 +1118,14 @@ void SucDmaExec(scudmainfo_struct * dma, int * time ) {
   SucDmaExecImpl(dma, time);
   rstv_dma_units += (unsigned)(t0 - *time);
 }
+static void SucDmaExecImpl0(scudmainfo_struct * dma, int * time );
 static void SucDmaExecImpl(scudmainfo_struct * dma, int * time ) {
+  const int prev = rstv_dma_busy;
+  rstv_dma_busy = 2;
+  SucDmaExecImpl0(dma, time);
+  rstv_dma_busy = prev;
+}
+static void SucDmaExecImpl0(scudmainfo_struct * dma, int * time ) {
 #ifndef __vita__
   {
     static int shown = 0;
@@ -2865,8 +2895,23 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          ScuRegs->D0AD = val;
          break;
       case 0x10:
-      if ((val & 0x1) && ((ScuRegs->D0MD&0x7)==0x7) )
+      if ((val & 0x1) && ((ScuRegs->D0MD&0x7)==0x7) && !rstv_null_dma(ScuRegs->D0R, ScuRegs->D0MD))
          {
+            { // diag (RSTV_V1WATCH): every level 0 start with its parameters
+              extern int rstv_v1watch;
+              if (rstv_v1watch == 2)
+                fprintf(stderr, "dma0 f%u l%d R %08X W %08X C %08X AD %X MD %08X | %s pc %08X pr %08X r4-7 %08X %08X %08X %08X r8-14 %08X %08X %08X %08X %08X %08X %08X sp %08X\n",
+                        (unsigned)yabsys.frame_count, yabsys.LineCount, ScuRegs->D0R, ScuRegs->D0W, ScuRegs->D0C, ScuRegs->D0AD, ScuRegs->D0MD,
+                        CurrentSH2 == SSH2 ? "s" : "m", CurrentSH2->regs.PC, CurrentSH2->regs.PR, CurrentSH2->regs.R[4], CurrentSH2->regs.R[5],
+                        CurrentSH2->regs.R[6], CurrentSH2->regs.R[7], CurrentSH2->regs.R[8], CurrentSH2->regs.R[9], CurrentSH2->regs.R[10],
+                        CurrentSH2->regs.R[11], CurrentSH2->regs.R[12], CurrentSH2->regs.R[13], CurrentSH2->regs.R[14], CurrentSH2->regs.R[15]);
+              if (rstv_v1watch == 2) {
+                fprintf(stderr, "  stack");
+                for (int k = 0; k < 64; k++)
+                  fprintf(stderr, " %08X", MappedMemoryReadLongNocache(CurrentSH2->regs.R[15] + 4 * k));
+                fprintf(stderr, "\n");
+              }
+            }
             if (ScuRegs->dma0.TransferNumber != 0) {
               ScuDmaProc(ScuRegs, 0x7FFFFFFF);
             }
@@ -2901,7 +2946,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          ScuRegs->D1AD = val;
          break;
       case 0x30:
-      if ((val & 0x1) && ((ScuRegs->D1MD&0x07) == 0x7))
+      if ((val & 0x1) && ((ScuRegs->D1MD&0x07) == 0x7) && !rstv_null_dma(ScuRegs->D1R, ScuRegs->D1MD))
          {
             if (ScuRegs->dma1.TransferNumber != 0) {
               ScuDmaProc(ScuRegs, 0x7FFFFFFF);
@@ -2940,7 +2985,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          ScuRegs->D2AD = val;
          break;
       case 0x50:
-      if ((val & 0x1) && ((ScuRegs->D2MD & 0x7) == 0x7))
+      if ((val & 0x1) && ((ScuRegs->D2MD & 0x7) == 0x7) && !rstv_null_dma(ScuRegs->D2R, ScuRegs->D2MD))
          {
 
             if (ScuRegs->dma2.TransferNumber != 0) {

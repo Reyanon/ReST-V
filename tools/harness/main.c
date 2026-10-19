@@ -298,6 +298,10 @@ int main(int argc, char **argv)
 
 	t0 = now_s();
 	double tc = t0;
+	if (getenv("RSTV_V1WATCH")) { // diag: print who writes 0xFFFF to the VDP1 control registers
+		extern int rstv_v1watch;
+		rstv_v1watch = atoi(getenv("RSTV_V1WATCH")) > 1 ? 2 : 1; // 2 = also list level 0 DMA starts
+	}
 	if (getenv("RSTV_HALF")) { // ADR-100: hi-res / interlace screens at half size (Vita default)
 		extern int rstv_hires_half;
 		rstv_hires_half = 1;
@@ -369,7 +373,32 @@ int main(int argc, char **argv)
 		}
 		if (pchist_cpu && f == pchist_from)
 			rstv_pc_hist_on = pchist_cpu;
+		{ // diag: RSTV_POKE=F1-F2:FILE (and RSTV_POKE2) writes the bytes "addr value" (hex, one per line) before every frame F1..F2
+			static int pinit, pf1[2] = { -1, -1 }, pf2[2], pn[2];
+			static u32 pa[2][4096];
+			static u8 pv[2][4096];
+			if (!pinit) {
+				pinit = 1;
+				for (int w = 0; w < 2; w++) {
+					const char *e = getenv(w ? "RSTV_POKE2" : "RSTV_POKE");
+					char path[512];
+					if (e && sscanf(e, "%d-%d:%511s", &pf1[w], &pf2[w], path) == 3) {
+						FILE *pfp = fopen(path, "r");
+						unsigned a, v;
+						while (pfp && pn[w] < 4096 && fscanf(pfp, "%x %x", &a, &v) == 2) { pa[w][pn[w]] = a; pv[w][pn[w]] = (u8)v; pn[w]++; }
+						if (pfp) fclose(pfp);
+						printf("poke%d %d bytes f%d-%d\n", w + 1, pn[w], pf1[w], pf2[w]);
+					} else
+						pf1[w] = -1;
+				}
+			}
+			for (int w = 0; w < 2; w++)
+				if (pf1[w] >= 0 && f >= pf1[w] && f <= pf2[w])
+					for (int k = 0; k < pn[w]; k++)
+						MappedMemoryWriteByteNocache(pa[w][k], pv[w][k]);
+		}
 		YabauseExec();
+		{ extern void rstv_v1watch_frame(void); rstv_v1watch_frame(); }
 		// load before save: --loadstate F A --savestate F B re-saves what was just loaded (state round-trip check)
 		if (f == load_at)
 			printf("loadstate f%d %s: %d\n", f, load_path, rstv_state_load(load_path));

@@ -43,6 +43,7 @@ add_executable(${PROJECT_NAME}
   src/frontend/sampler.c
   src/frontend/ui.c
   src/frontend/menu.c
+  src/frontend/cheats.c
   src/frontend/emu.c
   src/frontend/audio.c
   src/frontend/resample.c
@@ -66,6 +67,10 @@ add_custom_target(rstv_version
 add_dependencies(${PROJECT_NAME} rstv_version)
 target_compile_definitions(${PROJECT_NAME} PRIVATE RSTV_ARM_MHZ=${RSTV_ARM_MHZ})
 target_compile_definitions(rstv_core PRIVATE RSTV_VDP1_STATS=1) # VDP1 time per path (perf log v1[k])
+option(RSTV_V1WATCH "diag: log suspicious VDP1 register changes to ux0:data/restv/v1watch.txt" OFF)
+if(RSTV_V1WATCH)
+  target_compile_definitions(rstv_core PRIVATE RSTV_V1WATCH_FILE="ux0:data/restv/v1watch.txt")
+endif()
 if(RSTV_LOG)
   target_compile_definitions(${PROJECT_NAME} PRIVATE RSTV_ENABLE_LOG)
   if(RSTV_LOG_HOST)

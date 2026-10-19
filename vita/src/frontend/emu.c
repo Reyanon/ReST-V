@@ -18,6 +18,7 @@
 #include "yui.h"
 
 #include "frontend/audio.h"
+#include "frontend/cheats.h"
 #include "platform/log.h"
 #include "video/video.h"
 
@@ -144,8 +145,11 @@ void rstv_emu_shutdown(void)
 
 void rstv_emu_run_frame(uint8_t p1, uint8_t p2, uint8_t system)
 {
+	extern void rstv_v1watch_frame(void);
 	StvIoSetInputs(p1, p2, system);
 	YabauseExec();
+	rstv_v1watch_frame();
+	rstv_cheats_frame();
 }
 
 void rstv_emu_reset(void)

@@ -68,6 +68,8 @@ typedef struct {
 	uint8_t *layer_px[NUM_BG], *spr_px, *pal_px, *line_px;
 	// frame constants (composite shader uniforms)
 	float layerOn[4], layerAlpha[4], layerShad[4], layerLs[4];
+	float mosaic[4];   // ADR-129: horizontal mosaic size per NBG (N3..N0), 1 = off (runtime value)
+	float mosaicOn[4]; // 1 where mosaic > 1 (specialized: one compose variant for every size)
 	float ccwA[4], ccwB[4], ccw0[4], ccw1[4]; // ADR-112: colour calculation window (rectangles W0/W1)
 	float misc[4];
 	float sprA[4], sprB[4], sprC[4], sprD[4], sprE[4];
@@ -324,7 +326,7 @@ enum {
 	U_layerOn, U_layerAlpha, U_layerShad, U_layerLs, U_misc,
 	U_sprA, U_sprB, U_sprC, U_sprD, U_sprE, U_prioLo, U_prioHi, U_ccLo, U_ccHi, U_mode,
 	U_offB, U_off3, U_off2, U_off1, U_off0, U_offr, U_offs, U_tSLut,
-	U_ccwA, U_ccwB, U_ccw0, U_ccw1,
+	U_ccwA, U_ccwB, U_ccw0, U_ccw1, U_mosaic, U_mosaicOn,
 	U_COUNT
 };
 _Static_assert(U_COUNT <= 40, "s_loc size");
@@ -333,7 +335,7 @@ static const char *s_uname[U_COUNT] = {
 	"layerOn", "layerAlpha", "layerShad", "layerLs", "misc",
 	"sprA", "sprB", "sprC", "sprD", "sprE", "prioLo", "prioHi", "ccLo", "ccHi", "mode",
 	"offB", "off3", "off2", "off1", "off0", "offr", "offs_", "tSLut",
-	"ccwA", "ccwB", "ccw0", "ccw1",
+	"ccwA", "ccwB", "ccw0", "ccw1", "mosaic", "mosaicOn",
 };
 
 static const char *s_vs =
@@ -384,13 +386,14 @@ static const char *s_fs =
 	"  return min(t + b, 255.0);\n"
 	"}\n"
 	"float trans(float m, float a) { return (m < 0.5) ? ((fmod(a, 64.0) < 63.0) ? 1.0 : 0.0) : ((a >= 128.0) ? 1.0 : 0.0); }\n"
+	"float mx(float x, float on, float m) { return (on > 0.5) ? floor(x / m) * m : x; }\n" // ADR-129 horizontal mosaic
 	"float4 main(float2 vPix : TEXCOORD0,\n"
 	"  uniform sampler2D tN3, uniform sampler2D tN2, uniform sampler2D tN1, uniform sampler2D tN0, uniform sampler2D tR0,\n"
 	"  uniform sampler2D tSpr, uniform sampler2D tPal, uniform sampler2D tLine,\n"
 	"  uniform float4 layerOn, uniform float4 layerAlpha, uniform float4 layerShad, uniform float4 layerLs, uniform float4 misc,\n"
 	"  uniform float4 sprA, uniform float4 sprB, uniform float4 sprC, uniform float4 sprD, uniform float4 sprE,\n"
 	"  uniform float4 prioLo, uniform float4 prioHi, uniform float4 ccLo, uniform float4 ccHi, uniform float4 mode,\n"
-	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1) : COLOR\n"
+	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1, uniform float4 mosaic, uniform float4 mosaicOn) : COLOR\n"
 	"{\n"
 	"  float x = floor(vPix.x);\n"
 	"  float y = floor(vPix.y);\n"
@@ -411,10 +414,10 @@ static const char *s_fs =
 	"  float4 lLs = fetch(tLine, float2(1.0, y), lsz);\n"
 	"  float3 back = offs(lBack.xyz, fetch(tLine, float2(2.0, y), lsz), fetch(tLine, float2(3.0, y), lsz));\n"
 	// candidates of the 6 background layers: key = priority * 8 + order (sprite 5, R0 4, N0 3, N1 2, N2 1, N3 0), -1 if none
-	"  float4 c3 = lay(fetch(tN3, float2(x, y), bsz));\n"
-	"  float4 c2 = lay(fetch(tN2, float2(x, y), bsz));\n"
-	"  float4 c1 = lay(fetch(tN1, float2(x, y), bsz));\n"
-	"  float4 c0 = lay(fetch(tN0, float2(x, y), bsz));\n"
+	"  float4 c3 = lay(fetch(tN3, float2(mx(x, mosaicOn.x, mosaic.x), y), bsz));\n"
+	"  float4 c2 = lay(fetch(tN2, float2(mx(x, mosaicOn.y, mosaic.y), y), bsz));\n"
+	"  float4 c1 = lay(fetch(tN1, float2(mx(x, mosaicOn.z, mosaic.z), y), bsz));\n"
+	"  float4 c0 = lay(fetch(tN0, float2(mx(x, mosaicOn.w, mosaic.w), y), bsz));\n"
 	"  float4 cr = lay(fetch(tR0, float2(x, y), bsz));\n"
 	"  float p3 = fmod(c3.w, 8.0) * layerOn.x, p2 = fmod(c2.w, 8.0) * layerOn.y;\n"
 	"  float p1 = fmod(c1.w, 8.0) * layerOn.z, p0 = fmod(c0.w, 8.0) * layerOn.w, pr = fmod(cr.w, 8.0) * misc.x;\n"
@@ -546,6 +549,7 @@ static const char *s_fs_fast =
 	"  return min(t + b, 1.0);\n"
 	"}\n"
 	"half trans(half m, half r, half q) { return (m < 0.5) ? ((r < 62.5) ? 1.0 : 0.0) : q; }\n"
+	"float2 mu(float2 uv, float x, float on, float m) { return (on > 0.5) ? float2((floor(x / m) * m + 0.5) / 512.0, uv.y) : uv; }\n" // ADR-129
 	"float4 main(float2 vPix : TEXCOORD0, float2 vUV : TEXCOORD1, float2 vL0 : TEXCOORD2, float2 vL1 : TEXCOORD3,\n"
 	"  uniform sampler2D tN3, uniform sampler2D tN2, uniform sampler2D tN1, uniform sampler2D tN0, uniform sampler2D tR0,\n"
 	"  uniform sampler2D tSpr, uniform sampler2D tPal, uniform sampler2D tLine, uniform sampler2D tSLut,\n"
@@ -554,7 +558,7 @@ static const char *s_fs_fast =
 	"  uniform float4 layerOn, uniform float4 layerAlpha, uniform float4 layerShad, uniform float4 layerLs, uniform float4 misc,\n"
 	"  uniform float4 sprA, uniform float4 sprB, uniform float4 sprC, uniform float4 sprD, uniform float4 sprE,\n"
 	"  uniform float4 prioLo, uniform float4 prioHi, uniform float4 ccLo, uniform float4 ccHi, uniform float4 mode,\n"
-	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1) : COLOR\n"
+	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1, uniform float4 mosaic, uniform float4 mosaicOn) : COLOR\n"
 	"{\n"
 	"  float x = floor(vPix.x);\n"
 	"  float y = floor(vPix.y);\n"
@@ -573,10 +577,10 @@ static const char *s_fs_fast =
 	"  half3 back = lB.xyz;\n"
 	"  if (offB.w > 0.5) back = saturate(back + offB.xyz / 255.0);\n"
 	"  half4 c3 = half4(0.0, 0.0, 0.0, 0.0), c2 = c3, c1 = c3, c0 = c3, cr = c3;\n"
-	"  if (layerOn.x > 0.5) c3 = tex2D(tN3, vUV);\n"
-	"  if (layerOn.y > 0.5) c2 = tex2D(tN2, vUV);\n"
-	"  if (layerOn.z > 0.5) c1 = tex2D(tN1, vUV);\n"
-	"  if (layerOn.w > 0.5) c0 = tex2D(tN0, vUV);\n"
+	"  if (layerOn.x > 0.5) c3 = tex2D(tN3, mu(vUV, x, mosaicOn.x, mosaic.x));\n"
+	"  if (layerOn.y > 0.5) c2 = tex2D(tN2, mu(vUV, x, mosaicOn.y, mosaic.y));\n"
+	"  if (layerOn.z > 0.5) c1 = tex2D(tN1, mu(vUV, x, mosaicOn.z, mosaic.z));\n"
+	"  if (layerOn.w > 0.5) c0 = tex2D(tN0, mu(vUV, x, mosaicOn.w, mosaic.w));\n"
 	"  if (misc.x > 0.5) cr = tex2D(tR0, vUV);\n"
 	"  half4 W = half4(c3.w, c2.w, c1.w, c0.w);\n"
 	"  half4 F = step(half4(0.5, 0.5, 0.5, 0.5), W);\n"
@@ -781,6 +785,7 @@ static const struct { int u; const char *name; const char *comps; } s_spec_list[
 	{ U_sprC, "sprC", "xz" }, { U_sprD, "sprD", "xyzw" }, { U_sprE, "sprE", "xyz" },
 	{ U_offB, "offB", "w" }, { U_off3, "off3", "w" }, { U_off2, "off2", "w" }, { U_off1, "off1", "w" },
 	{ U_off0, "off0", "w" }, { U_offr, "offr", "w" }, { U_offs, "offs_", "w" },
+	{ U_mosaicOn, "mosaicOn", "xyzw" },
 };
 
 static const float *uniform_values(const FrameSet *s, int u)
@@ -796,6 +801,7 @@ static const float *uniform_values(const FrameSet *s, int u)
 	case U_sprC: return s->sprC;
 	case U_sprD: return s->sprD;
 	case U_sprE: return s->sprE;
+	case U_mosaicOn: return s->mosaicOn;
 	default: return s->offu[u - U_offB];
 	}
 }
@@ -3386,6 +3392,11 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 		VIDSoftVdp2DrawScreens(); // for comparison: redraw via the CPU path (incl. offset and sprites, overwrites Titan buffers)
 	}
 	s->layerOn[0] = on[0]; s->layerOn[1] = on[1]; s->layerOn[2] = on[2]; s->layerOn[3] = on[3];
+	for (int L = 0; L < 4; L++) // ADR-129
+	{
+			s->mosaic[L] = rstv_layer_capture[L].captured && rstv_layer_capture[L].mosx > 1 ? (float)rstv_layer_capture[L].mosx : 1.0f;
+			s->mosaicOn[L] = s->mosaic[L] > 1.0f ? 1.0f : 0.0f;
+		}
 	s->layerAlpha[0] = layer_alpha(r, 0x8, r->CCRNB >> 8);
 	s->layerAlpha[1] = layer_alpha(r, 0x4, r->CCRNB);
 	s->layerAlpha[2] = layer_alpha(r, 0x2, r->CCRNA >> 8);
@@ -4058,6 +4069,8 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 	gx_set4(loc[U_ccwB], s->ccwB);
 	gx_set4(loc[U_ccw0], s->ccw0);
 	gx_set4(loc[U_ccw1], s->ccw1);
+	gx_set4(loc[U_mosaic], s->mosaic);
+	gx_set4(loc[U_mosaicOn], s->mosaicOn);
 	draw_quad(s->w, s->h);
 	gx_end();
 

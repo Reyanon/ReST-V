@@ -32,6 +32,8 @@ typedef struct {
 } StvGameInfo;
 // ADR-077: draw RBG0 at half width and stretch it (the rotation shader is the GPU's heaviest pass in sanjeon's 3D games)
 #define RSTV_HACK_RBG_HALF 1
+// do not start SCU DMAs whose source is a NULL-based address (scu.c rstv_null_dma; thunt/thuntk final boss)
+#define RSTV_HACK_NULL_DMA 2
 extern unsigned rstv_game_hacks; // hacks of the loaded game (STVSetIdleHacks)
 
 enum { RSTV_HLE_NONE, RSTV_HLE_MEMMOVE, RSTV_HLE_MEMSET8, RSTV_HLE_FILL16, RSTV_HLE_FILL32, RSTV_HLE_MEMCPY, RSTV_HLE_BSSCLR, RSTV_HLE_LZ, RSTV_HLE_SGLVTX, RSTV_HLE_TKVTX, RSTV_HLE_SJINTERP, RSTV_HLE_SGLPOLY, RSTV_HLE_SGLSPR, RSTV_HLE_SGLONSCR, RSTV_HLE_BSSCLR2, RSTV_HLE_DELAY, RSTV_HLE_DELAYR };

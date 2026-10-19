@@ -78,7 +78,7 @@ static const StvGame s_games[] = {
 		{ WORD_BLOB,   "mpr18638.11", 0x2800000, 0x0400000, 0xcaab531b },
 		{ WORD_BLOB,   "mpr18638.11", 0x1000000, 0x0400000, 0xcaab531b },
 		{ BLOB_END } } },
-	{ { "thunt", "sandor", "Puzzle & Action: Treasure Hunt (JUET 970901 V2.00E)", { 0x602A024, 0x6013EE4, 0x602AB64, 0x6011332 }, 0x602AAF8, 0, NULL, 0, 256 }, NULL, {
+	{ { "thunt", "sandor", "Puzzle & Action: Treasure Hunt (JUET 970901 V2.00E)", { 0x602A024, 0x6013EE4, 0x602AB64, 0x6011332 }, 0x602AAF8, 0, NULL, RSTV_HACK_NULL_DMA, 256 }, NULL, {
 		{ HEADER_BLOB, "th-ic7_2.stv", 0x0200000, 0x0080000, 0xc4e993de },
 		{ HEADER_BLOB, "th-ic7_1.stv", 0x0200001, 0x0080000, 0x1355cc18 },
 		{ WORD_BLOB,   "th-e-2.ic2",   0x0400000, 0x0400000, 0x47315694 },
@@ -86,7 +86,7 @@ static const StvGame s_games[] = {
 		{ WORD_BLOB,   "th-e-4.ic4",   0x0c00000, 0x0400000, 0xc672e40b },
 		{ WORD_BLOB,   "th-e-5.ic5",   0x1000000, 0x0400000, 0x3914b805 },
 		{ BLOB_END } } },
-	{ { "thuntk", "sandor", "Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K)", { 0x602A024, 0x6013EE4, 0x602AB64, 0x6011332 }, 0x602AAF8, 0, thuntk_hle, 0, 256 }, NULL, {
+	{ { "thuntk", "sandor", "Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K)", { 0x602A024, 0x6013EE4, 0x602AB64, 0x6011332 }, 0x602AAF8, 0, thuntk_hle, RSTV_HACK_NULL_DMA, 256 }, NULL, {
 		{ HEADER_BLOB, "2.ic13_2",      0x0200000, 0x0080000, 0x6cae2926 },
 		{ HEADER_BLOB, "1.ic13_1",      0x0200001, 0x0080000, 0x460727c8 },
 		{ BYTE_BLOB,   "bom210-10.ic2", 0x1c00000, 0x0400000, 0xf59d0827 },

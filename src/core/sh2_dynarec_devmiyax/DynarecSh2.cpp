@@ -54,6 +54,17 @@ extern "C" {
 
 CompileBlocks * CompileBlocks::instance_ = NULL;
 DynarecSh2 * DynarecSh2::CurrentContext = NULL;
+// diag (vdp1.cpp v1watch): PC / PR / R0..R15 of the recompiled CPU running now. 0 = none, 1 = master, 2 = slave
+extern "C" int rstv_dyn_where(u32 *pc, u32 *pr, u32 *r)
+{
+  DynarecSh2 *c = DynarecSh2::CurrentContext;
+  if (!c)
+    return 0;
+  *pc = c->GET_PC();
+  *pr = c->GET_PR();
+  memcpy(r, c->GetGenRegPtr(), 16 * sizeof(u32));
+  return c->IsSlave() ? 2 : 1;
+}
 #if !defined(_WINDOWS)
 #if defined(__arm__)
 void cacheflush(uintptr_t begin, uintptr_t end, int flag )

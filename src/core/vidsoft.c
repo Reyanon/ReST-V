@@ -1175,8 +1175,12 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
 
       if (cap)
       {
-         /* ReST-V: a constant horizontal zoom (no mosaic, no line zoom) is drawn by the GPU pixel path (ADR-037) */
-         const int zoom_ok = info->mosaicxmask <= 1 && info->coordincx >= 0.0f;
+         /* ReST-V: a constant horizontal zoom (no line zoom) is drawn by the GPU pixel path (ADR-037). Horizontal mosaic
+            is screen space (output pixel i shows pixel i / m * m): the layer is drawn without it and the compose shader
+            snaps x (ADR-129). Vertical mosaic is already in the row Y */
+         const int zoom_ok = info->coordincx >= 0.0f;
+         if (info->mosaicxmask > 1)
+            cap->mosx = info->mosaicxmask;
          if (zoom_ok && info->coordincx != 1.0f)
             cap->zx = info->coordincx;
          /* ReST-V (ADR-040): window 0/1 (no sprite window) become up to 2 visible runs per line, drawn as quads */

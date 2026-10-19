@@ -2395,7 +2395,15 @@ int getEatClock(u32 src, u32 dst) {
 
 }
 
+extern int rstv_dma_busy;
+static void DMATransferCycles0(Dmac * dmac, int cycles);
 void DMATransferCycles(Dmac * dmac, int cycles ){
+   const int prev = rstv_dma_busy;
+   rstv_dma_busy = 3;
+   DMATransferCycles0(dmac, cycles);
+   rstv_dma_busy = prev;
+}
+static void DMATransferCycles0(Dmac * dmac, int cycles ){
    int size;
    u32 i = 0;
    int count;
@@ -2527,7 +2535,15 @@ void DMATransferCycles(Dmac * dmac, int cycles ){
 
 //////////////////////////////////////////////////////////////////////////////
 
+static void DMATransfer0(u32 *CHCR, u32 *SAR, u32 *DAR, u32 *TCR, u32 *VCRDMA);
 void DMATransfer(u32 *CHCR, u32 *SAR, u32 *DAR, u32 *TCR, u32 *VCRDMA)
+{
+   const int prev = rstv_dma_busy;
+   rstv_dma_busy = 3;
+   DMATransfer0(CHCR, SAR, DAR, TCR, VCRDMA);
+   rstv_dma_busy = prev;
+}
+static void DMATransfer0(u32 *CHCR, u32 *SAR, u32 *DAR, u32 *TCR, u32 *VCRDMA)
 {
    int size;
    u32 i, i2;

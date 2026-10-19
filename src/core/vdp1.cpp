@@ -44,6 +44,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 
 #include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 #include "yabause.h"
 #include "vdp1.h"
 #include "debug.h"
@@ -431,7 +434,74 @@ extern YabEventQueue * vdp1_rcv_evqueue;
 
 //////////////////////////////////////////////////////////////////////////////
 
+// diag (thuntk VDP1 registers found as 0xFFFF): report writes of 0xFFFF to TVMR..ENDR, and register changes that did not
+// come through Vdp1WriteWord (checked once per frame). Harness: stderr. Vita build with RSTV_V1WATCH_FILE: appended to a file
+extern "C" int rstv_v1watch;
+#ifdef RSTV_V1WATCH_FILE
+int rstv_v1watch = 1;
+#else
+int rstv_v1watch;
+#endif
+static Vdp1 s_v1shadow;
+static int s_v1shadow_ok;
+static void v1watch_log(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+#ifdef RSTV_V1WATCH_FILE
+  FILE *f = fopen(RSTV_V1WATCH_FILE, "a");
+  if (f) {
+    vfprintf(f, fmt, ap);
+    fclose(f);
+  }
+#else
+  vfprintf(stderr, fmt, ap);
+#endif
+  va_end(ap);
+}
+extern "C" int rstv_dma_busy;
+#ifdef RSTV_DYNAREC
+extern "C" int rstv_dyn_where(u32 *pc, u32 *pr, u32 *r);
+#else
+static int rstv_dyn_where(u32 *, u32 *, u32 *) { return 0; }
+#endif
+static void v1watch_write(u32 addr, u16 val)
+{
+  static unsigned logged;
+  if (val != 0xFFFF || (addr & 0xFF) > 0xC || logged >= 64)
+    return;
+  logged++;
+  u32 pc = 0, pr = 0, r[16] = { 0 };
+  const int who = rstv_dyn_where(&pc, &pr, r);
+  v1watch_log("v1watch f%u %08X <- FFFF line %d dma %d dyn %d pc %08X pr %08X r0-7 %08X %08X %08X %08X %08X %08X %08X %08X"
+              " r8-15 %08X %08X %08X %08X %08X %08X %08X %08X | interp msh2 pc %08X pr %08X ssh2 pc %08X\n",
+              (unsigned)yabsys.frame_count, addr, yabsys.LineCount, rstv_dma_busy, who, pc, pr, r[0], r[1], r[2], r[3], r[4], r[5],
+              r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], MSH2->regs.PC, MSH2->regs.PR, SSH2->regs.PC);
+  if (logged <= 2) {
+    const scudmainfo_struct *d[3] = { &ScuRegs->dma0, &ScuRegs->dma1, &ScuRegs->dma2 };
+    for (int k = 0; k < 3; k++)
+      v1watch_log("  dma%d R %08X W %08X n %d ind %08X md %08X radd %u wadd %u\n", k, d[k]->ReadAddress, d[k]->WriteAddress,
+                  (int)d[k]->TransferNumber, d[k]->InDirectAdress, d[k]->ModeAddressUpdate, d[k]->ReadAdd, d[k]->WriteAdd);
+    v1watch_log("  regs D0R %08X D0W %08X D0C %08X D0AD %X D0EN %X D0MD %08X\n", ScuRegs->D0R, ScuRegs->D0W, ScuRegs->D0C,
+                ScuRegs->D0AD, ScuRegs->D0EN, ScuRegs->D0MD);
+  }
+}
+// once per frame: TVMR..ENDR must equal the values last written through Vdp1WriteWord
+extern "C" void rstv_v1watch_frame(void)
+{
+  if (!rstv_v1watch || !Vdp1Regs)
+    return;
+  if (s_v1shadow_ok && memcmp(&s_v1shadow, Vdp1Regs, 14)) {
+    const u16 *a = &s_v1shadow.TVMR, *b = &Vdp1Regs->TVMR;
+    v1watch_log("v1watch f%u regs changed outside writes: was %04X %04X %04X %04X %04X %04X %04X now %04X %04X %04X %04X %04X %04X %04X\n",
+                (unsigned)yabsys.frame_count, a[0], a[1], a[2], a[3], a[4], a[5], a[6], b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+  }
+  memcpy(&s_v1shadow, Vdp1Regs, sizeof(Vdp1));
+  s_v1shadow_ok = 1;
+}
 extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
+  if (rstv_v1watch)
+    v1watch_write(addr, val);
   addr &= 0xFF;
   switch(addr) {
     case 0x0:
@@ -503,6 +573,8 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       default:
          LOG("trying to write a Vdp1 read-only register - %08X\n", addr);
    }
+   if (rstv_v1watch)
+     memcpy(&s_v1shadow, Vdp1Regs, 14);
 }
 
 //////////////////////////////////////////////////////////////////////////////

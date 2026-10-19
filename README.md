@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="vita/sce_sys/icon0.png" width="128" alt="ReST-V icon">
+<img width="840" height="500" alt="bg" src="https://github.com/user-attachments/assets/218f16a4-4bf1-4485-bd99-a5bd9fed0398" />
 </p>
 
 <h1 align="center">ReST-V</h1>
@@ -7,7 +7,7 @@
 <p align="center">
   <b>Sega ST-V and System C / C2 arcade emulator for PlayStation Vita</b><br>
   Yabause based &middot; SH-2 dynarec for ARMv7 &middot; GPU VDP1/VDP2 rendering &middot; 174 sets<br>
-  <a href="https://www.patreon.com/Reyanon">Support on Patreon</a>
+  <a href="https://www.patreon.com/Reyanon">Support on Patreon</a> or <a href="https://ko-fi.com/reyanon">Ko-Fi</a>
 </p>
 
 ---
@@ -70,7 +70,7 @@ screen are simplified when that buys speed.
 
 **Frontend**
 - Game list with System C / System C2 / ST-V tabs and a Playable / All / Favorites filter.
-- Save states (10 slots plus quick save), button mapping with turbo, analog stick as lever.
+- Save states (10 slots plus quick save), button mapping with turbo, analog stick as lever, built-in cheats.
 - Display options: aspect ratio, filter, scanlines, border color or user artwork.
 - Per-game settings: save the current display and control settings for one game only.
 
@@ -380,10 +380,15 @@ Options opened from the game list edit the global settings.
 | Exit | L + R + START |
 
 The in-game menu provides: Resume, Reset, Save states (10 slots), Display (frame rate counter, aspect ratio,
-filter, scanlines, border), Controls (button mapping, turbo, analog stick), per-game settings and game selection.
+filter, scanlines, border), Controls (button mapping, turbo, analog stick), Cheats (games that have built-in cheats),
+per-game settings and game selection.
 
 **Turbo.** Pick one *Turbo key* and the game button it fires (*Turbo button*), plus the speed
 (15, 10 or 7.5 presses per second). While the turbo key is held, that game button fires repeatedly.
+
+**Cheats.** Built-in cheats are listed only for the games that have them. *Start stage* (Treasure Hunt, `thunt` and
+`thuntk`) starts a new game at stage 2, stage 3 or the final stage; it applies from the next game start, so pick it
+and then use *Reset game*. Cheat choices are not saved.
 
 **Per-game settings.** *Save game settings* stores the current display and control settings for the running
 set only (`<set>_game.cfg`); global settings are not touched. When a per-game file exists it is loaded
@@ -443,8 +448,13 @@ tools/         Build scripts, desktop harness, game table generators, hash and a
 
 ## 10. License and Credits
 
-**License.** ReST-V is derived from Yabause and is distributed under the
-[GNU General Public License, version 2](LICENSE). The original copyright headers are kept in all imported sources.
+**License.** ReST-V is distributed under the [GNU General Public License, version 3](LICENSE).
+- The Yabause / YabaSanshiro / Kronos code and the ReST-V code are GPL-2.0-or-later.
+- The MAME parts and ymfm are BSD-3-Clause, Musashi is MIT, JUnzip is public domain.
+- vitaShaRK, linked into the Vita build, is LGPL-3.0, so the combined program and the release packages
+  are distributed under GPL-3.0.
+
+The original copyright headers are kept in all imported sources.
 
 **Credits**
 - [Yabause](https://github.com/libretro/yabause) team and devMiyax ([YabaSanshiro](https://github.com/devmiyax/yabause)):
