@@ -36,7 +36,7 @@ typedef struct {
 #define RSTV_HACK_NULL_DMA 2
 extern unsigned rstv_game_hacks; // hacks of the loaded game (STVSetIdleHacks)
 
-enum { RSTV_HLE_NONE, RSTV_HLE_MEMMOVE, RSTV_HLE_MEMSET8, RSTV_HLE_FILL16, RSTV_HLE_FILL32, RSTV_HLE_MEMCPY, RSTV_HLE_BSSCLR, RSTV_HLE_LZ, RSTV_HLE_SGLVTX, RSTV_HLE_TKVTX, RSTV_HLE_SJINTERP, RSTV_HLE_SGLPOLY, RSTV_HLE_SGLSPR, RSTV_HLE_SGLONSCR, RSTV_HLE_BSSCLR2, RSTV_HLE_DELAY, RSTV_HLE_DELAYR };
+enum { RSTV_HLE_NONE, RSTV_HLE_MEMMOVE, RSTV_HLE_MEMSET8, RSTV_HLE_FILL16, RSTV_HLE_FILL32, RSTV_HLE_MEMCPY, RSTV_HLE_BSSCLR, RSTV_HLE_LZ, RSTV_HLE_SGLVTX, RSTV_HLE_TKVTX, RSTV_HLE_SJINTERP, RSTV_HLE_SGLPOLY, RSTV_HLE_SGLSPR, RSTV_HLE_SGLONSCR, RSTV_HLE_BSSCLR2, RSTV_HLE_DELAY, RSTV_HLE_DELAYR, RSTV_HLE_DELAYR2, RSTV_HLE_VFVTX, RSTV_HLE_VKVTX, RSTV_HLE_MEMMOVE2, RSTV_HLE_DELAYDT, RSTV_HLE_CPY16, RSTV_HLE_FHVTX, RSTV_HLE_FHROW, RSTV_HLE_FHFACE, RSTV_HLE_VKSORT, RSTV_HLE_FHPROJ, RSTV_HLE_FHSND, RSTV_HLE_PURGE, RSTV_HLE_FHRLE, RSTV_HLE_FHMOVE, RSTV_HLE_FHSET };
 typedef struct RstvHleHook {
 	u32 pc;
 	int kind;
@@ -65,6 +65,8 @@ int STVSaveState(FILE *fp);                          // ReST-V: "STV " chunk (I/
 int STVLoadState(FILE *fp, int version, int size);
 int rstv_state_save(const char *path); // 0 = ok; between frames only
 int rstv_state_load(const char *path);
+extern int rstv_coin_mailbox_latch; // ADR-151: sound RAM 0x4F1 keeps the SH-2 value until the SH-2 reads it
+
 #ifdef __cplusplus
 }
 #endif

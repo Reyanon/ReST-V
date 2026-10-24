@@ -109,7 +109,16 @@ int Vdp2GenerateCCode();
 
 
 void Vdp1_onHblank();
+#ifdef RSTV
+extern "C" void rstv_vdp1_vbe_erase(void); // vidsoft.c, ADR-133
+#endif
 
+#ifdef RSTV
+/* ReST-V: every caller (VDP1 framebuffer reads/writes, VBlankOUT) runs on the emulation thread, so the lock guards
+   nothing; pblbeach writes the framebuffer by DMA, 35k words a frame = 70k mutex calls (27ms on the Vita) */
+void VdpLockVram() {}
+void VdpUnLockVram() {}
+#else
 void VdpLockVram() {
   YabThreadLock(vrammutex);
 }
@@ -117,6 +126,7 @@ void VdpLockVram() {
 void VdpUnLockVram() {
   YabThreadUnLock(vrammutex);
 }
+#endif
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -223,6 +233,21 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+/* ReST-V (ADR-145): n longs from high work RAM (on-chip DMA run), as n Vdp2RamWriteLong calls (no wrap: the caller
+   keeps the run inside VDP2 VRAM and work RAM) */
+extern "C" void rstv_vdp2_write_longs_hw(u32 addr, u32 hwoff, u32 n) {
+  addr &= 0x7FFFF;
+  const u32 end = addr + 4 * n;
+  if (addr < 0x20000) A0_Updated = 1;
+  if (addr < 0x40000 && end > 0x20000) A1_Updated = 1;
+  if (addr < 0x60000 && end > 0x40000) B0_Updated = 1;
+  if (end > 0x60000) B1_Updated = 1;
+  for (u32 p = addr >> 12; p <= (end - 1) >> 12; p++)
+    rstv_vdp2_page_stamp[p] = rstv_vdp2_serial;
+  for (u32 k = 0; k < n; k++)
+    T1WriteLong(Vdp2Ram, addr + 4 * k, T2ReadLong(HighWram, (hwoff + 4 * k) & 0xFFFFF));
+}
 
 void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {
   addr &= 0x7FFFF;
@@ -1372,6 +1397,12 @@ void Vdp2VBlankOUT(void) {
 
   if (((Vdp1Regs->TVMR >> 3) & 0x01) == 1){  // VBlank Erace (VBE1)
     Vdp1External.vbalnk_erase = 1;
+#ifdef RSTV
+    /* ReST-V (ADR-133): VBE erases the displayed buffer in this V-blank. vidsoft erases at the next draw start, where
+       TVMR is read again: diehard / dnmtdeka set VBE only around the V-blank, so the intro never erased and every
+       frame of the helicopter stayed in the top lines */
+    rstv_vdp1_vbe_erase();
+#endif
   }else{
     Vdp1External.vbalnk_erase = 0;
   }

@@ -24,6 +24,9 @@ enum { RSTV_SCAN_OFF, RSTV_SCAN_CRT_SOFT, RSTV_SCAN_CRT_SHARP, RSTV_SCAN_PX2, RS
 enum { RSTV_SCAN_LIGHT, RSTV_SCAN_MEDIUM, RSTV_SCAN_HEAVY, RSTV_SCAN_STRENGTH_COUNT };
 // outside the game screen (4:3 / integer): black, artwork (ux0:data/restv/artwork/<set>.png|jpg|bmp), solid color
 enum { RSTV_BORDER_BLACK, RSTV_BORDER_ARTWORK, RSTV_BORDER_COLOR, RSTV_BORDER_COUNT };
+// screen rotation (ADR-190): Auto = vertical games upright on the landscape screen; Vertical L / R = upright with the Vita
+// turned left (right edge up) / right (left edge up), directions turned with it
+enum { RSTV_ROT_AUTO, RSTV_ROT_OFF, RSTV_ROT_VL, RSTV_ROT_VR, RSTV_ROT_COUNT };
 enum { RSTV_BCOL_NAVY, RSTV_BCOL_GRAY, RSTV_BCOL_MAROON, RSTV_BCOL_GREEN, RSTV_BCOL_PURPLE, RSTV_BCOL_BRICK, RSTV_BCOL_COUNT };
 // menu confirm button (the other one is back)
 enum { RSTV_CONFIRM_CROSS, RSTV_CONFIRM_CIRCLE, RSTV_CONFIRM_COUNT };
@@ -39,6 +42,7 @@ typedef struct {
 	int scan_strength; // RSTV_SCAN_LIGHT..HEAVY
 	int border;        // RSTV_BORDER_*
 	int border_color;  // RSTV_BCOL_*
+	int rotate;        // RSTV_ROT_*
 	int keymap[RSTV_ACT_COUNT]; // RSTV_KEY_* (buttons 3 and 4 may be RSTV_KEY_NONE)
 	int stick;         // RSTV_STICK_* (ReST-V: analog stick used as lever)
 	int turbo_key;     // Vita button that triggers turbo, RSTV_KEY_NONE = off
@@ -48,6 +52,8 @@ typedef struct {
 	int list_filter;   // RSTV_LIST_*
 } rstv_settings;
 extern rstv_settings g_set;
+// ADR-190: game direction = screen direction turned back by this (0, 90, 270 degrees clockwise); set by apply_video
+extern int rstv_input_rot;
 
 // frames per turbo period (press + release): Fast 4, Medium 6, Slow 8 (same as Reirem)
 static inline int rstv_turbo_period(int speed) { return speed == 0 ? 4 : speed == 1 ? 6 : 8; }
@@ -77,12 +83,15 @@ typedef enum {
 	RSTV_MENU_SAVE,        // save to current slot (menu stays open)
 	RSTV_MENU_LOAD,        // load current slot, then close
 	RSTV_MENU_SELECT_GAME, // relaunch the app to game select
+	RSTV_MENU_REFRESH,     // game list options: read the ROM folder again
 	RSTV_MENU_EXIT,
+	RSTV_MENU_TEST,        // close and press the board's TEST switch (ST-V BIOS test menu)
 } rstv_menu_result;
 
 void rstv_menu_init(const char *set, const char *title, int buttons); // after the game is known (buttons = number of game buttons)
 int rstv_menu_buttons(void); // button count of the current game (2-4)
-int rstv_menu_should_open(uint32_t buttons);              // 1 at the moment SELECT+START is pressed
+void rstv_kctrl_init(int restarted); // kernel helper for the PS button (may restart the app once after boot)
+int rstv_menu_should_open(uint32_t buttons);              // 1 at the moment SELECT+START or PS is pressed
 rstv_menu_result rstv_menu_update(uint32_t buttons);
 void rstv_menu_draw(void);  // redraws only when changed
 void rstv_menu_hide(void);
@@ -91,6 +100,7 @@ void rstv_state_slot_path(char *buf, int len, int slot); // slot -1 = quick (sta
 
 // loading screen (same look as Reirem rei_loading_progress): game name + bar (0-1000)
 void rstv_loading_title(const char *title);
+void rstv_loading_tick(void); // redraw the loading screen at its current value (ADR-193)
 void rstv_loading_progress(int permille);
 void rstv_loading_done(void);
 

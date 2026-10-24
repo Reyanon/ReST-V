@@ -1,7 +1,7 @@
 /*
   ReST-V: fast memory helpers for the devmiyax ARM dynarec (ADR-017).
   The block templates call the getmem and setmem pointers through function pointers (r0 = address, r1 = value).
-  These handle the cached high work RAM region 0x06000000-0x060FFFFF directly, send on-chip module
+  These handle the high work RAM region 0x06000000-0x060FFFFF (and its cache-through mirror 0x26000000) directly, send on-chip module
   addresses (0xFFFFFE00-) straight to Onchip* (as MappedMemory* does), and tail-call the
   original C functions (memGetX and memSetX in DynarecSh2CInterface.cpp) for everything else.
   Stores also go to the C function when the 32-byte chunk holds compiled code (rstv_code_chunk),
@@ -14,9 +14,11 @@
 .text
 .align 4
 
-/* not high work RAM: on-chip modules (0xFFFFFE00-0xFFFFFFFF) go straight to Onchip*, the rest to the C function */
+/* not high work RAM: on-chip modules (0xFFFFFE00-0xFFFFFFFF) go straight to Onchip*, the rest to the C function.
+   ADR-146: the cache-through mirror 0x26000000 is high work RAM too (fhboxers' sound driver reads its tables there) */
 .macro HIGH_CHECK slow onchip
   lsr r12, r0, #20
+  bic r12, r12, #0x200
   cmp r12, #0x060
   beq 1f
   cmn r0, #0x200
@@ -24,6 +26,13 @@
   bfc r0, #9, #23
   b \onchip
 1:
+  tst r0, #0x20000000         @ cache-through: 2 wait cycles, as memGet*/memSet* add them
+  beq 2f
+  ldr r12, [r7, #136]
+  ldr r3, [r12]
+  add r3, r3, #2
+  str r3, [r12]
+2:
 .endm
 
 .global rstv_memGetLong
@@ -150,6 +159,16 @@ rstv_chain:
   str r2, [r7, #144]
   ldr r0, =rstv_act_pc
   str r8, [r0]
+  ldr r0, =rstv_chain_trace_on  @ diag: first-seen chained PCs (rstv_chain_trace in DynarecSh2.cpp)
+  ldr r0, [r0]
+  cmp r0, #0
+  beq 8f
+  push {r0-r5, r12, lr}
+  mov r0, r8
+  mov r1, r7
+  bl rstv_chain_trace
+  pop {r0-r5, r12, lr}
+8:
   ldr r0, =rstv_dyn_chain
   ldr r1, [r0]
   add r1, r1, #1
@@ -157,7 +176,52 @@ rstv_chain:
   add r0, r2, #16             @ past the prologue (push, mov r7, ldr PC, ldr COUNT)
   bx r0
 9:
-  pop {r4-r10, pc}
+  pop {r3-r11, pc}
+
+@ ADR-135: rstv_chain without the sampler's block PC and the chain count (used unless the sampler or proffine is on)
+.global rstv_chain_fast
+.type rstv_chain_fast, %function
+rstv_chain_fast:
+  ldr r0, [r7, #136]
+  ldr r1, [r0]
+  cmp r1, #0
+  beq 1f
+  add r9, r9, r1
+  mov r1, #0
+  str r1, [r0]
+  str r9, [r7, #((16+3+4)*4)]
+1:
+  ldr r2, [r7, #128]
+  cmp r9, r2
+  bhs 9f
+  ldr r0, [r7, #(16*4)]
+  and r0, r0, #0xF0
+  ldr r1, [r7, #((16+3+5)*4)]
+  cmp r0, r1
+  blo 9f
+  ldr r3, [r7, #144]
+  add r3, r3, #1024 @ MAXBLOCKSIZE (ADR-085)
+  ldr r0, [r3, #12]
+  tst r0, #1
+  bne 9f
+  ldr r8, [r7, #((16+3+3)*4)]
+  lsr r0, r8, #20
+  cmp r0, #0x060
+  bne 9f
+  ubfx r0, r8, #1, #19
+  ldr r1, [r7, #140]
+  ldr r2, [r1, r0, lsl #2]
+  cmp r2, #0
+  beq 9f
+  add r3, r2, #1024 @ MAXBLOCKSIZE (ADR-085)
+  ldr r0, [r3, #12]
+  tst r0, #4
+  bne 9f
+  str r2, [r7, #144]
+  add r0, r2, #16
+  bx r0
+9:
+  pop {r3-r11, pc}
 
 @ ADR-048: slow path of a linked exit stub (r3 = the stub data: &rstv_link_gen, generation, PC, target block).
 @ Same as rstv_chain; when it goes on to the next block it also fills the stub so the next exit jumps directly.
@@ -214,11 +278,11 @@ rstv_chain_ic:
   add r0, r2, #16
   bx r0
 9:
-  pop {r4-r10, pc}
+  pop {r3-r11, pc}
 
 .global rstv_chain_off
 .type rstv_chain_off, %function
 rstv_chain_off:
-  pop {r4-r10, pc}
+  pop {r3-r11, pc}
 
 .ltorg

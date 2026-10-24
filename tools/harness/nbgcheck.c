@@ -264,7 +264,23 @@ static void check_quads(int L, const RstvLayerCapture *c, const struct PixelData
 	if (c->colornumber == 3)
 		rbgq_atlas_rgb_update(s_argb, 1024, Vdp2Ram, NULL);
 	const int qflags = c->zx != 0.0f ? NBGQ_SKIP_ZOOM | NBGQ_ZOOM_RUNS : 0; /* as gvdp2 (ADR-052) */
+	int tf0 = -1, tf1 = -1; // RSTV_TRACKPG "F0 F1": VRAM 4KB pages each layer reads (gvdp2 plane row dependencies)
+	if (getenv("RSTV_TRACKPG"))
+		sscanf(getenv("RSTV_TRACKPG"), "%d %d", &tf0, &tf1);
+	const int trk = (long long)s_frames >= tf0 && (long long)s_frames <= tf1;
+	if (trk) {
+		nbgq_track = 1;
+		memset(nbgq_track_pages, 0, sizeof(nbgq_track_pages));
+	}
 	const int n = nbgq_build(c, w, h, Vdp2Ram, s_quads, 16384, qflags);
+	if (trk) {
+		nbgq_track = 0;
+		printf("trackpg f%llu L%d cn %d n %d:", s_frames, L, c->colornumber, n);
+		for (int p = 0; p < 128; p++)
+			if (nbgq_track_pages[p >> 5] & (1u << (p & 31)))
+				printf(" %d", p);
+		printf("%c", 10);
+	}
 	if (n < 0) {
 		s_q_over++;
 		return;

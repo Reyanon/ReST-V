@@ -127,7 +127,7 @@
 		{ WORD_BLOB,  "mpr18970.4",    0x0c00000, 0x0400000, 0x8b7a509e },
 		{ WORD_BLOB,  "mpr18971.5",    0x1000000, 0x0400000, 0xc87c443b },
 		{ WORD_BLOB,  "mpr18972.6",    0x1400000, 0x0400000, 0x45c64fca },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000 },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0 }, { 0 }, 1 },
 	// stv_5838, stv, init_5838
 	{ { "decathlto", "decathlt", "DecAthlete (JUET 960424 V1.000)" }, NULL, {
 		{ HEADER_BLOB, "epr18967.13",   0x0000001, 0x0100000, 0xc0446674 },
@@ -138,7 +138,7 @@
 		{ WORD_BLOB,  "mpr18970.4",    0x0c00000, 0x0400000, 0x8b7a509e },
 		{ WORD_BLOB,  "mpr18971.5",    0x1000000, 0x0400000, 0xc87c443b },
 		{ WORD_BLOB,  "mpr18972.6",    0x1400000, 0x0400000, 0x45c64fca },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000 },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0 }, { 0 }, 1 },
 	// stv, stv, init_stv
 	{ { "dfeverg", NULL, "Dancing Fever Gold (J 000821 V2.001)" }, NULL, {
 		{ WORD_BLOB,  "13",            0x0000000, 0x0080000, 0xecd7ac4b },
@@ -162,7 +162,7 @@
 		{ WORD_BLOB,  "mpr19116.3",    0x0800000, 0x0400000, 0xaf9e627b },
 		{ WORD_BLOB,  "mpr19117.4",    0x0c00000, 0x0400000, 0x74520ff1 },
 		{ WORD_BLOB,  "mpr19118.5",    0x1000000, 0x0400000, 0x2c9702f0 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x6027c98, 0x0000d04, 0x60051f2 }, { 0x6027c98, 0x0000d04, 0x60051f2 } },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x6027c98, 0x0000d04, 0x60051f2, 0x6027ca4 }, { 0x6027c98, 0x0000d04, 0x60051f2 } },
 	// stv, stv, init_dnmtdeka
 	{ { "dnmtdeka", "diehard", "Dynamite Deka (J 960515 V1.000)" }, NULL, {
 		{ HEADER_BLOB, "fpr19114.13",   0x0000001, 0x0100000, 0x1fd22a5f },
@@ -172,7 +172,7 @@
 		{ WORD_BLOB,  "mpr19116.3",    0x0800000, 0x0400000, 0xaf9e627b },
 		{ WORD_BLOB,  "mpr19117.4",    0x0c00000, 0x0400000, 0x74520ff1 },
 		{ WORD_BLOB,  "mpr19118.5",    0x1000000, 0x0400000, 0x2c9702f0 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x6027c90, 0x0000d04, 0x60051f2 }, { 0x6027c90, 0x0000d04, 0x60051f2 } },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x6027c90, 0x0000d04, 0x60051f2, 0x6027c9c }, { 0x6027c90, 0x0000d04, 0x60051f2 } },
 	// stv, stv, init_stv
 	{ { "ejihon", NULL, "Ejihon Tantei Jimusho (J 950613 V1.000)" }, NULL, {
 		{ HEADER_BLOB, "epr18137.13",   0x0000001, 0x0080000, 0x151aa9bc },
@@ -408,7 +408,7 @@
 		{ WORD_BLOB,  "ic24",          0x0600000, 0x0200000, 0xa16902e3 },
 		{ WORD_BLOB,  "ic26",          0x0a00000, 0x0200000, 0xa5eab3f3 },
 		{ WORD_BLOB,  "ic28",          0x0e00000, 0x0200000, 0x34ed677a },
-		{ BLOB_END } }, 0x00000000, "nameclub.nv", 0x680a64bc },
+		{ BLOB_END } }, 0x00000000, "nameclub.nv", 0x680a64bc, 0, { 0 }, { 0 }, 2 },
 	// stv, stv, init_stv
 	{ { "nclubdis", NULL, "Name Club Disney (J 980614 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22",          0x0200000, 0x0200000, 0xcfd5eb54 },
@@ -428,7 +428,7 @@
 		{ WORD_BLOB,  "nclubv2.ic24",  0x0600000, 0x0200000, 0x1b7637de },
 		{ WORD_BLOB,  "nclubv2.ic26",  0x0a00000, 0x0200000, 0x630be99d },
 		{ WORD_BLOB,  "nclubv2.ic28",  0x0e00000, 0x0200000, 0x1a3ca5e2 },
-		{ BLOB_END } }, 0x00000000, "nclubv2.nv", 0x96d55fa9 },
+		{ BLOB_END } }, 0x00000000, "nclubv2.nv", 0x96d55fa9, 0, { 0 }, { 0 }, 2 },
 	// stv, stv, init_nameclv3
 	{ { "nclubv3", NULL, "Name Club Ver.3 (J 970723 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22",          0x0200000, 0x0200000, 0xb4008ed0 },
@@ -481,7 +481,7 @@
 		{ WORD_BLOB,  "mpr18854.3",    0x0800000, 0x0400000, 0x3113c8bc },
 		{ WORD_BLOB,  "mpr18855.4",    0x0c00000, 0x0400000, 0xdaf6ad0c },
 		{ WORD_BLOB,  "mpr18856.5",    0x1000000, 0x0400000, 0x214cef24 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x605eb78 }, { 0 } },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x605eb78, 0x605eaea, 0x605f862 }, { 0 } },
 	// stv, stv, init_stv
 	{ { "pckobe99", NULL, "Print Club 2 Kobe Luminaire '99 (Print Club Custom 3) (J 991203 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22.bin",      0x0200000, 0x0200000, 0x670296eb },
@@ -509,7 +509,7 @@
 		{ WORD_BLOB,  "pclblove.ic28", 0x0800000, 0x0200000, 0xa1336da7 },
 		{ WORD_BLOB,  "pclblove.ic30", 0x0a00000, 0x0200000, 0xec5b5e28 },
 		{ WORD_BLOB,  "pclblove.ic32", 0x0c00000, 0x0200000, 0x9a4109e5 },
-		{ BLOB_END } }, 0x00000000, "pclove.nv", 0x3c78e3bd },
+		{ BLOB_END } }, 0x00000000, "pclove.nv", 0x3c78e3bd, 0, { 0 }, { 0 }, 4 },
 	// stv_0231, stv, init_5838
 	{ { "pclove2", NULL, "Print Club LoveLove Ver 2 (J 970825 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22",          0x0200000, 0x0200000, 0xd7d968d6 },
@@ -518,7 +518,7 @@
 		{ WORD_BLOB,  "ic28",          0x0800000, 0x0200000, 0x463604a6 },
 		{ WORD_BLOB,  "ic30",          0x0a00000, 0x0200000, 0xec5b5e28 },
 		{ WORD_BLOB,  "ic32",          0x0c00000, 0x0200000, 0x9a4109e5 },
-		{ BLOB_END } }, 0x00000000, "pclove2.nv", 0x93b30600 },
+		{ BLOB_END } }, 0x00000000, "pclove2.nv", 0x93b30600, 0, { 0 }, { 0 }, 4 },
 	// stv, stv, init_stv
 	{ { "pclub2", NULL, "Print Club 2 Standard Ver1 (U 970921 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "pclub2_ic22",   0x0200000, 0x0200000, 0xd2ceade7 },
@@ -669,7 +669,7 @@
 		{ WORD_BLOB,  "lh28f016sut-10.ic28", 0x0800000, 0x0200000, 0xde38b841 },
 		{ WORD_BLOB,  "lh28f016sut-10.ic30", 0x0a00000, 0x0200000, 0x499edabf },
 		{ WORD_BLOB,  "lh28f016sut-10.ic32", 0x0c00000, 0x0200000, 0x9a4109e5 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000 },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0 }, { 0 }, 3 },
 	// stv, stv, init_stv
 	{ { "pclubol", NULL, "Print Club Olive (J 980717 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "pclubol_ic22",  0x0200000, 0x0200000, 0x668b1049 },
@@ -708,7 +708,7 @@
 		{ WORD_BLOB,  "pclub2_ic28",   0x0800000, 0x0200000, 0xf29f1ec9 },
 		{ WORD_BLOB,  "pclub2_ic30",   0x0a00000, 0x0200000, 0xa6dc82c8 },
 		{ WORD_BLOB,  "pclub2_ic32",   0x0c00000, 0x0200000, 0xf29f1ec9 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000 },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0 }, { 0 }, 4 },
 	// stv_0231, stv, init_5838
 	{ { "pclubsc6", NULL, "Print Club Sony Creative Ver.6 (J 971006 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22.bin",      0x0200000, 0x0200000, 0x754890c3 },
@@ -717,7 +717,7 @@
 		{ WORD_BLOB,  "ic28.bin",      0x0800000, 0x0200000, 0x79a159e6 },
 		{ WORD_BLOB,  "ic30.bin",      0x0a00000, 0x0200000, 0x6533f7fc },
 		{ WORD_BLOB,  "ic32.bin",      0x0c00000, 0x0200000, 0x048876e3 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000 },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0 }, { 0 }, 4 },
 	// stv, stv, init_stv
 	{ { "pclubyo", NULL, "Print Club Yoshimoto V1 (J 970208 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "pclbyov1.ic22", 0x0200000, 0x0200000, 0x769468d1 },
@@ -741,7 +741,7 @@
 		{ WORD_BLOB,  "ic26.bin",      0x0600000, 0x0200000, 0xb891c7ab },
 		{ WORD_BLOB,  "ic28.bin",      0x0800000, 0x0200000, 0x1a1c74cb },
 		{ WORD_BLOB,  "ic30.bin",      0x0a00000, 0x0200000, 0xb7b6fc61 },
-		{ BLOB_END } }, 0x00000000, "eeprom", 0x5aee29d0 },
+		{ BLOB_END } }, 0x00000000, "eeprom", 0x5aee29d0, 0, { 0 }, { 0 }, 3 },
 	// stv_0230, stv, init_5838
 	{ { "pcpooh3", NULL, "Print Club Winnie-the-Pooh Vol. 3 (J 980406 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "ic22.bin",      0x0200000, 0x0200000, 0xefc83c4f },
@@ -749,7 +749,7 @@
 		{ WORD_BLOB,  "ic26.bin",      0x0600000, 0x0200000, 0xdaf1a0d4 },
 		{ WORD_BLOB,  "ic28.bin",      0x0800000, 0x0200000, 0x3c0f040f },
 		{ WORD_BLOB,  "ic30.bin",      0x0a00000, 0x0200000, 0x6006d785 },
-		{ BLOB_END } }, 0x00000000, "eeprom", 0xe41d541b },
+		{ BLOB_END } }, 0x00000000, "eeprom", 0xe41d541b, 0, { 0 }, { 0 }, 3 },
 	// stv, stv, init_stv
 	{ { "prc28su", NULL, "Print Club 2 Vol. 8 '97 Summer (J 970616 V1.100)" }, NULL, {
 		{ WORD_BLOB,  "u22.bin",       0x0200000, 0x0200000, 0xb78cf122 },
@@ -799,7 +799,7 @@
 		{ WORD_BLOB,  "prc298au_ic32", 0x0c00000, 0x0200000, 0xa3fb81f5 },
 		{ WORD_BLOB,  "prc298au_ic34", 0x0e00000, 0x0200000, 0x04200dc9 },
 		{ WORD_BLOB,  "prc298au_ic36", 0x1000000, 0x0200000, 0x9a4109e5 },
-		{ BLOB_END } }, 0x00000000, "prc298au.nv", 0xb4440ff0 },
+		{ BLOB_END } }, 0x00000000, "prc298au.nv", 0xb4440ff0, 0, { 0x6004e30 }, { 0 } },
 	// stv, stv, init_stv
 	{ { "prc298sp", NULL, "Print Club 2 '98 Spring Ver (J 971017 V1.100)" }, NULL, {
 		{ WORD_BLOB,  "prc298sp_ic22", 0x0200000, 0x0200000, 0xcb0ec98a },
@@ -1065,7 +1065,7 @@
 		{ WORD_BLOB,  "mpr17949.5",    0x1000000, 0x0400000, 0xb2ecea25 },
 		{ WORD_BLOB,  "mpr17950.6",    0x1400000, 0x0400000, 0x5b1f981d },
 		{ WORD_BLOB,  "mpr17945.1",    0x1800000, 0x0200000, 0x03ede188 },
-		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x602c30c }, { 0x604c332 } },
+		{ BLOB_END } }, 0x00000000, "-", 0x00000000, 0, { 0x602c30c, 0x602fb7c, 0x602fc58, 0x602c2f4 }, { 0x604c332 } },
 	// stvmp, vmahjong, init_stv
 	{ { "vmahjong", NULL, "Virtual Mahjong (J 961214 V1.000)" }, NULL, {
 		{ WORD_BLOB,  "mpr19620.7",    0x0200000, 0x0200000, 0xc98de7e5 },

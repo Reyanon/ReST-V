@@ -14,6 +14,8 @@
 #include "platform/timer.h"
 
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/io/stat.h>
 
 #ifndef RSTV_LOG_HOST
 #define RSTV_LOG_HOST "255.255.255.255"
@@ -24,11 +26,36 @@
 
 static char s_net_mem[NET_MEM_SIZE] __attribute__((aligned(64)));
 static int s_sock = -1;
+static int s_ctl_inited;
 static int s_net_inited;
 static SceNetSockaddrIn s_addr;
 
+// diag: with ux0:data/restv/logfile every line also goes to ux0:data/restv/diag.txt (no rate limit)
+static SceUID s_diag_fd = -1, s_diag_mtx = -1;
+static char s_diag_buf[32 * 1024];
+static unsigned s_diag_len;
+
+/* diag file: write what is buffered (frame loop, exit) */
+void rstv_log_flush(void)
+{
+	if (s_diag_fd < 0 || !s_diag_len)
+		return;
+	sceKernelLockMutex(s_diag_mtx, 1, NULL);
+	sceIoWrite(s_diag_fd, s_diag_buf, s_diag_len);
+	s_diag_len = 0;
+	sceKernelUnlockMutex(s_diag_mtx, 1);
+}
+
 void rstv_log_init(void)
 {
+	if (s_diag_fd < 0) {
+		SceIoStat st;
+		if (sceIoGetstat("ux0:data/restv/logfile", &st) >= 0) {
+			s_diag_mtx = sceKernelCreateMutex("rstv_diaglog", 0, 0, NULL);
+			if (s_diag_mtx >= 0)
+				s_diag_fd = sceIoOpen("ux0:data/restv/diag.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777); // appended: the relaunch into the game list opens it again
+		}
+	}
 	if (s_sock >= 0)
 		return;
 	// ADR-087: send only to the PC address in ux0:data/restv/loghost (unicast). Logging off if missing.
@@ -62,7 +89,7 @@ void rstv_log_init(void)
 	if (r < 0 && r != (int)SCE_NET_ERROR_EBUSY)
 		return; // network unavailable: quietly disable logging
 	s_net_inited = (r >= 0);
-	sceNetCtlInit();
+	s_ctl_inited = sceNetCtlInit() >= 0;
 
 	s_sock = sceNetSocket("rstv_log", SCE_NET_AF_INET, SCE_NET_SOCK_DGRAM, SCE_NET_IPPROTO_UDP);
 	if (s_sock < 0)
@@ -86,11 +113,15 @@ void rstv_log_init(void)
 
 void rstv_log_shutdown(void)
 {
+	rstv_log_flush();
 	if (s_sock >= 0) {
 		sceNetSocketClose(s_sock);
 		s_sock = -1;
 	}
-	sceNetCtlTerm();
+	if (s_ctl_inited) { // only after sceNetCtlInit: without loghost the NetCtl module is never loaded (null import)
+		sceNetCtlTerm();
+		s_ctl_inited = 0;
+	}
 	if (s_net_inited) {
 		sceNetTerm();
 		s_net_inited = 0;
@@ -119,6 +150,16 @@ void rstv_log_printf(const char *fmt, ...)
 		n = sizeof(line) - 2;
 	line[n++] = '\n';
 
+	if (s_diag_fd >= 0) { // diag file (rstv_log_init): kept in memory, written 32KB at a time (a write per line slowed loading 4x)
+		sceKernelLockMutex(s_diag_mtx, 1, NULL);
+		if (s_diag_len + (unsigned)n > sizeof(s_diag_buf)) {
+			sceIoWrite(s_diag_fd, s_diag_buf, s_diag_len);
+			s_diag_len = 0;
+		}
+		memcpy(s_diag_buf + s_diag_len, line, (size_t)n);
+		s_diag_len += (unsigned)n;
+		sceKernelUnlockMutex(s_diag_mtx, 1);
+	}
 	// ADR-087: up to 30 lines/s (dropped lines are counted and reported on the next line). Called from several threads, so the count is approximate
 	static volatile uint32_t s_sec, s_cnt, s_drop;
 	const uint32_t sec = (uint32_t)(t / 1000000);
@@ -140,4 +181,7 @@ void rstv_log_printf(const char *fmt, ...)
 	sceNetSendto(s_sock, line, n, 0, (SceNetSockaddr *)&s_addr, sizeof(s_addr));
 }
 
+#else
+// (logging off: the core's diagnostic lines call this directly)
+void rstv_log_printf(const char *fmt, ...) { (void)fmt; }
 #endif // RSTV_ENABLE_LOG

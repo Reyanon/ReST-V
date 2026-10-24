@@ -495,7 +495,21 @@ typedef struct
 
 extern SH2_struct *MSH2;
 extern SH2_struct *SSH2;
+#if defined(RSTV) && defined(__arm__)
+/* ReST-V (ADR-136): the slave SH-2 can run on its own thread, so the "current CPU" is per thread: index 1 on the
+   thread whose thread pointer register (TPIDRURO) is rstv_slave_tp, 0 everywhere else (always 0 without that thread) */
+extern SH2_struct *rstv_cur_sh2[2];
+extern u32 rstv_slave_tp;
+static inline u32 rstv_thread_tp(void)
+{
+   u32 tp;
+   __asm__("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+   return tp;
+}
+#define CurrentSH2 (rstv_cur_sh2[rstv_thread_tp() == rstv_slave_tp])
+#else
 extern SH2_struct *CurrentSH2;
+#endif
 extern SH2Interface_struct *SH2Core;
 
 int SH2Init(int coreid);

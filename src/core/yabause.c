@@ -49,6 +49,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #endif
 #include <string.h>
 #include "yabause.h"
+#include "rstv_slave.h"
 #include "cheat.h"
 #include "cs0.h"
 #include "cs2.h"
@@ -495,7 +496,8 @@ void YabFlushBackups(void)
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseDeInit(void) {
-   
+   rstv_slave_shutdown(); /* ADR-136 */
+
    Vdp2DeInit();
    Vdp1DeInit();
    
@@ -557,6 +559,7 @@ void YabauseResetNoLoad(void) {
    Cs2Reset();
    ScuReset();
    ScspReset();
+   { extern void rstv_rax_reset(void); rstv_rax_reset(); } /* ADR-173 */
    Vdp1Reset();
    Vdp2Reset();
    SmpcReset();
@@ -601,6 +604,7 @@ void YabauseResetButton(void) {
 
 int YabauseExec(void) {
 	{ extern void rstv_dspjit_install(void); rstv_dspjit_install(); } // ADR-110: SCSP DSP code made by the sound thread
+	{ extern void rstv_rax_jit_install(void); rstv_rax_jit_install(); } // ADR-175: RAX DSP blocks made by the sound thread
 	//automatically advance lag frames, this should be optional later
 	//if (FrameAdvanceVariable > 0 && LagFrameFlag == 1){ 
 		//FrameAdvanceVariable = NeedAdvance; //advance a frame
@@ -668,6 +672,8 @@ void SyncCPUtoSCSP();
 extern int rstv_scsp_lag;
 /* ReST-V: per-frame section times for the spike line (ux0:data/restv/probe; clock reads cost, so off by default) */
 int rstv_probe_on;
+unsigned long long rstv_snd_wall_us; /* ReST-V: sound thread wall time of its frames (scsp.c) */
+volatile u64 rstv_snd_post_t; unsigned long long rstv_snd_lat_us, rstv_snd_gap_us; unsigned rstv_snd_posts; /* frame start posted -> sound thread awake */
 unsigned rstv_probe_us[12], rstv_probe_smpc_cmd, rstv_probe_smpc_us;
 int rstv_deciline_merge = 0;
 volatile int rstv_act;
@@ -752,6 +758,7 @@ int YabauseEmulate(void) {
    SSH2->pre_cycle = 0;
    SH2OnFrame(MSH2);
    SH2OnFrame(SSH2);
+   rstv_slave_frame_begin(); /* ADR-136: slave SH-2 thread (when on): this thread takes the I/O lock for the frame */
    u64 cpu_emutime = 0;
    while (!oneframeexec)
    {
@@ -781,21 +788,25 @@ int YabauseEmulate(void) {
         const u32 amari = sh2cycles - (step<< div);
 
         if( amari != 0 ){
+          if (rstv_slave_on && yabsys.IsSSH2Running) rstv_slave_post(amari);
           SH2Exec(MSH2, amari);
-          if (yabsys.IsSSH2Running)
+          if (yabsys.IsSSH2Running && !rstv_slave_on)
             SH2Exec(SSH2, amari);
         }
         for (i = amari; i < sh2cycles; i += step){ 
+            if (rstv_slave_on && yabsys.IsSSH2Running) rstv_slave_post(step);
             SH2Exec(MSH2, step);
-            if (yabsys.IsSSH2Running)
+            if (yabsys.IsSSH2Running && !rstv_slave_on)
                SH2Exec(SSH2, step);
         }
       }else{
         u64 pt = RSTV_PROF_TF();
+        if (rstv_slave_on && yabsys.IsSSH2Running)
+          rstv_slave_post(sh2cycles); /* ADR-136: the slave thread runs this slice alongside */
         rstv_act = 1;
         { extern int rstv_probe_on; extern unsigned rstv_probe_us[12]; const u64 q_ = rstv_probe_on ? RSTV_PROF_T() : 0; SH2Exec(MSH2, sh2cycles); if (rstv_probe_on) rstv_probe_us[0] += (unsigned)(RSTV_PROF_T() - q_); }
         RSTV_PROF_ADDF(RSTV_PROF_MSH2, pt);
-        if (yabsys.IsSSH2Running) {
+        if (yabsys.IsSSH2Running && !rstv_slave_on) {
           pt = RSTV_PROF_TF();
           rstv_act = 2;
           { extern int rstv_probe_on; extern unsigned rstv_probe_us[12]; const u64 q_ = rstv_probe_on ? RSTV_PROF_T() : 0; SH2Exec(SSH2, sh2cycles); if (rstv_probe_on) rstv_probe_us[1] += (unsigned)(RSTV_PROF_T() - q_); }
@@ -845,6 +856,7 @@ int YabauseEmulate(void) {
 #endif
             PROFILE_START("vblankin");
             // VBlankIN
+            rstv_slave_drain(); /* ADR-136: the slave's writes of this frame are all in before VDP1 and VDP2 use them */
             SmpcINTBACKEnd();
             u64 pv = RSTV_PROF_TF();
             rstv_act = 7;
@@ -855,15 +867,19 @@ int YabauseEmulate(void) {
             { extern int rstv_probe_on; extern unsigned rstv_probe_us[12]; const u64 q_ = rstv_probe_on ? RSTV_PROF_T() : 0; Vdp2VBlankIN(); if (rstv_probe_on) rstv_probe_us[2] += (unsigned)(RSTV_PROF_T() - q_); }
             RSTV_PROF_ADDF(RSTV_PROF_VDP, pv);
             pt_rest += RSTV_PROF_TF() - pv;
+            { extern void rstv_rax_frame_end(void); rstv_rax_frame_end(); } /* ADR-173: the RAX words written this frame */
 #if defined(ASYNC_SCSP)
+            rstv_act = 30; /* sampler: waiting for the sound thread's frame */
             SyncCPUtoSCSP();
 #endif
             PROFILE_STOP("vblankin");
+            rstv_act = 31;
             CheatDoPatches();
          }
          else if (yabsys.LineCount == yabsys.MaxLineCount)
          {
             // VBlankOUT
+            rstv_slave_drain(); /* ADR-136 */
             PROFILE_START("VDP1/VDP2");
             u64 pv = RSTV_PROF_TF();
             rstv_act = 8;
@@ -939,6 +955,7 @@ int YabauseEmulate(void) {
       RSTV_PROF_ADDF(RSTV_PROF_OTHER, pt_rest);
       PROFILE_STOP("Total Emulation");
    }
+   rstv_slave_frame_end(); /* ADR-136: drained, I/O lock released (states and the frontend run between frames) */
    M68KSync();
 
 #ifdef YAB_WANT_SSF
@@ -988,13 +1005,21 @@ int YabauseEmulate(void) {
 int rstv_scsp_lag = 0;
 static int rstv_scsp_lag_started = 0;
 static int rstv_scsp_quiesced = 0; /* the frame-end wait was already done by rstv_sound_quiesce */
+/* ADR-140: frames the sound thread may have pending (given, not yet finished). With 1 the SH-2 waited at every VBlank
+   for the previous sound frame: vfremix alternates 7 ms and 38 ms emulated frames, so the short ones waited about
+   5 ms for a 12 ms sound frame (2.7 ms a frame on average) */
+int rstv_scsp_depth = 2;
+static int rstv_scsp_out = 0;
 
 /* ReST-V save state: wait until the sound thread has finished the frame it was given (between frames only).
    The next SyncCPUtoSCSP skips its wait. */
 void rstv_sound_quiesce(void)
 {
   if (rstv_scsp_lag && g_scsp_main_mode == 0 && rstv_scsp_lag_started && !rstv_scsp_quiesced) {
-    YabWaitEventQueue(q_scsp_finish);
+    while (rstv_scsp_out > 0) {
+      YabWaitEventQueue(q_scsp_finish);
+      rstv_scsp_out--;
+    }
     rstv_scsp_quiesced = 1;
   }
 }
@@ -1004,14 +1029,26 @@ void SyncCPUtoSCSP() {
   if (rstv_scsp_lag && g_scsp_main_mode == 0) {
     if (rstv_scsp_lag_started && !rstv_scsp_quiesced) {
       u64 pt_ = RSTV_PROF_T();
-      YabWaitEventQueue(q_scsp_finish);
+      while (rstv_scsp_out >= (rstv_scsp_depth < 1 ? 1 : rstv_scsp_depth)) {
+        YabWaitEventQueue(q_scsp_finish);
+        rstv_scsp_out--;
+      }
       RSTV_PROF_ADD(RSTV_PROF_SND_WAIT, pt_);
     }
     rstv_scsp_quiesced = 0;
     saved_m68k_cycles = 0;
     setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
-    if (rstv_scsp_lag_started)
+    if (rstv_scsp_lag_started) {
+      const u64 t_ = RSTV_PROF_T();
+      if (rstv_snd_post_t)
+        rstv_snd_gap_us += t_ - rstv_snd_post_t;
+      rstv_snd_posts++;
+      rstv_snd_post_t = t_;
       YabAddEventQueue(q_scsp_frame_start, 0);
+    }
+    if (!rstv_scsp_lag_started)
+      rstv_scsp_out = 0; /* the thread runs its first frame without a start event (quiesce drains to 0 itself) */
+    rstv_scsp_out++;
     rstv_scsp_lag_started = 1;
     return;
   }
@@ -1029,6 +1066,10 @@ void SyncCPUtoSCSP() {
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseStartSlave(void) {
+   rstv_slave_drain(); /* ADR-136: the slave thread must be idle before its state changes */
+#if !defined(__vita__)
+   if (getenv("RSTV_SLAVELOG")) fprintf(stderr, "slave start f%u l%d%c", (unsigned)yabsys.frame_count, (int)yabsys.LineCount, 10);
+#endif
 
   LOG("YabauseStartSlave");
 
@@ -1079,6 +1120,10 @@ void YabauseStartSlave(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseStopSlave(void) {
+   rstv_slave_drain(); /* ADR-136 */
+#if !defined(__vita__)
+   if (getenv("RSTV_SLAVELOG")) fprintf(stderr, "slave stop f%u l%d%c", (unsigned)yabsys.frame_count, (int)yabsys.LineCount, 10);
+#endif
    SH2Reset(SSH2);
    yabsys.IsSSH2Running = 0;
 }

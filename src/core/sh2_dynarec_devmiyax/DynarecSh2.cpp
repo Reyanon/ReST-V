@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdio.h>
 extern "C" { extern int rstv_idle_hint_n[2]; extern int rstv_idle_auto; int rstv_idle_hint_at(int w, unsigned int addr); } // ADR-106
 #include <string.h>
+extern "C" { void rstv_log_printf(const char *fmt, ...); unsigned int rstv_dev_trap, rstv_dev_trace_from, rstv_dev_trace_to; int rstv_chain_trace_on; void rstv_chain_trace(unsigned int pc, void *state); } // diag: Vita UDP log, PC trap (pctrap)
 #if !defined(__APPLE__)
 #include <malloc.h>
 #endif
@@ -44,6 +45,8 @@ extern "C" {
 #include "../sh2int.h"
 #include "../stv.h"
 #endif
+static void rstv_trace_pc(u32 pc, u32 pr, const char *how); // diag (pctrap / RSTV_CHTRACE)
+static void rstv_trace_flush(void);
 #if defined(WEBINTERFACE)
 #define DEBUG_CPU
 #endif
@@ -53,11 +56,18 @@ extern "C" {
 //#define LOG printf
 
 CompileBlocks * CompileBlocks::instance_ = NULL;
-DynarecSh2 * DynarecSh2::CurrentContext = NULL;
+CompileBlocks * CompileBlocks::slave_instance_ = NULL;
+#if defined(RSTV)
+extern "C" void *SH2DynCompileFor(void *inst, u32 pc, void *parent) // ADR-138: main thread, for the slave thread
+{
+  return ((CompileBlocks *)inst)->CompileBlock(pc, (addrs *)parent);
+}
+#endif
+DynarecSh2 * DynarecSh2::cur_ctx_[2] = { NULL, NULL };
 // diag (vdp1.cpp v1watch): PC / PR / R0..R15 of the recompiled CPU running now. 0 = none, 1 = master, 2 = slave
 extern "C" int rstv_dyn_where(u32 *pc, u32 *pr, u32 *r)
 {
-  DynarecSh2 *c = DynarecSh2::CurrentContext;
+  DynarecSh2 *c = DynarecSh2::Cur();
   if (!c)
     return 0;
   *pc = c->GET_PC();
@@ -742,7 +752,7 @@ void CompileBlocks::Init()
 {
   // ReST-V: allocate the code region once (the original re-allocated on every reset)
   if (dCode == NULL)
-    dCode = (Block*)ALLOCATE(sizeof(Block)*NUMOFBLOCKS);
+    dCode = (Block*)ALLOCATE(sizeof(Block)*nblocks_);
   if (dCode == NULL) {
     fprintf(stderr, "dynarec: code region allocation failed\n");
     abort();
@@ -750,23 +760,26 @@ void CompileBlocks::Init()
 #if defined(RSTV)
   rstv_jit_code_write_begin();
 #endif
-  memset((void*)dCode, 0, sizeof(Block)*NUMOFBLOCKS);
+  memset((void*)dCode, 0, sizeof(Block)*nblocks_);
 
   memset(LookupTable, 0, sizeof(LookupTable));
   rstv_link_gen++;
   memset(LookupTableRom, 0, sizeof(LookupTableRom));
   memset(LookupTableLow, 0, sizeof(LookupTableLow));
+  for (int k = 0; k < 0x200; k++)
+    if (LookupTableCart[k])
+      memset(LookupTableCart[k], 0, 0x8000 * sizeof(Block *));
   memset(LookupTableC, 0, sizeof(LookupTableC));
 
   blockCount = 0;
   LastMakeBlock = 0;
 
   g_CompleBlock = dCode;
-  for (int i = 0; i < NUMOFBLOCKS; i++ ) {
+  for (int i = 0; i < nblocks_; i++ ) {
     g_CompleBlock[i].id = i;
   }
 #if defined(RSTV)
-  rstv_jit_code_write_end(dCode, sizeof(Block)*NUMOFBLOCKS);
+  rstv_jit_code_write_end(dCode, sizeof(Block)*nblocks_);
 #endif
   return;
 }
@@ -857,7 +870,6 @@ extern "C" { unsigned rstv_dyn_cyc[2]; extern volatile int rstv_act; }
 #define RSTV_ACT(x) (rstv_act = (x))
 extern "C" { unsigned rstv_dyn_exec, rstv_dyn_compile; extern volatile unsigned rstv_act_pc; unsigned rstv_comp_us[3]; }
 extern "C" { unsigned rstv_dyn_blk_bytes, rstv_dyn_blk_n, rstv_dyn_blk_max; }
-static unsigned rstv_dyn_blk_last; // size of the block just emitted (ADR-036: sync only the written bytes)
 extern "C" { void PageFlipCont(void); int rstv_dyn_cont = 1; unsigned rstv_dyn_cont_n; }
 #define PAGEFLIPCONT_SIZE 20
 // ReST-V (ADR-026): "rotcl Rq; div1 Rm,Rn" x32 (GCC/Hitachi software division) as one C call.
@@ -870,6 +882,76 @@ extern "C" { int rstv_dyn_divfx = 1; unsigned rstv_dyn_divfx_n; }
 // ReST-V (ADR-030): lazy PC / cycle update. Plain instructions do not get the "add r8,#2; add r9,#n" separator;
 // the sums are added before an instruction that reads r8 (MOVA, MOV.W/L @(disp,PC), SLEEP), before branches and at the block end.
 extern "C" { int rstv_dyn_lazy = 1; }
+// ReST-V (ADR-134): MOV.L/MOV.W @(disp,PC),Rn with the literal in high work RAM (block compiled with write tracking) or
+// in the BIOS become an immediate move: the literal joins the block's write tracking (a write to it drops the block).
+extern "C" { int rstv_dyn_litc = 1; unsigned rstv_dyn_litc_n; int rstv_dyn_lazyff = 1; }
+// ReST-V (ADR-135): register cache (rstv_rc.h); rstv_dyn_blkcap > 0 ends blocks after that many instructions (A/B checks)
+#include "rstv_rc.h"
+extern "C" { int rstv_chain_prof = 0; void rstv_chain_fast(void); }
+// ADR-136: I/O lock for a C++ scope (taken only while the slave SH-2 runs on its own thread)
+struct RstvIoGuard {
+  bool on;
+  RstvIoGuard() : on(rstv_slave_on != 0) { if (on) rstv_io_lock(); }
+  ~RstvIoGuard() { release(); }
+  void release() { if (on) { rstv_io_unlock(); on = false; } }
+};
+// ADR-135: back edge of a block that loops to its own start (and writes memory, so it is not an idle loop): the checks of
+// rstv_chain inline (memory wait cycles pending, cycles left, interrupt pending, block still the live one), then a
+// branch to the block body. Expects PC and COUNT stored and r8 = the block's PC. Any failed check leaves through rstv_chain.
+extern "C" { int rstv_dyn_selfloop = 1; unsigned rstv_dyn_selfloop_n; int rstv_dyn_rcbr = 1; }
+static u32 *rstv_loop_tail(u32 *w, const u8 *body, u32 start_addr)
+{
+  u32 *br[4];
+  *w++ = 0xE5971088; // ldr r1, [r7, #136]
+  *w++ = 0xE5911000; // ldr r1, [r1]
+  *w++ = 0xE3510000; // cmp r1, #0
+  br[0] = w; *w++ = 0x1A000000; // bne slow
+  *w++ = 0xE5972080; // ldr r2, [r7, #128]
+  *w++ = 0xE1590002; // cmp r9, r2
+  br[1] = w; *w++ = 0x2A000000; // bhs slow
+  *w++ = 0xE5971040; // ldr r1, [r7, #64] (SR)
+  *w++ = 0xE20110F0; // and r1, r1, #0xF0
+  *w++ = 0xE5972060; // ldr r2, [r7, #96] (ICOUNT)
+  *w++ = 0xE1510002; // cmp r1, r2
+  br[2] = w; *w++ = 0x3A000000; // blo slow
+  const u32 o = ((start_addr & 0xFFFFF) >> 1) * 4;
+  *w++ = 0xE597108C; // ldr r1, [r7, #140] (LookupTable)
+  *w++ = 0xE3002000 | (((o >> 12) & 15) << 16) | (o & 0xFFF); // movw r2, #o
+  if (o >> 16) *w++ = 0xE3402000 | (((o >> 28) & 15) << 16) | ((o >> 16) & 0xFFF);
+  *w++ = 0xE7911002; // ldr r1, [r1, r2]
+  *w++ = 0xE5972090; // ldr r2, [r7, #144] (curblock)
+  *w++ = 0xE1510002; // cmp r1, r2
+  br[3] = w; *w++ = 0x1A000000; // bne slow
+  *w = 0xEA000000 | (((u32)((const u8 *)body - (u8 *)w - 8) >> 2) & 0x00FFFFFF); w++; // b body
+  for (int k = 0; k < 4; k++)
+    *br[k] |= ((u32)(w - br[k] - 2)) & 0x00FFFFFF;
+  *w++ = 0xE597F084; // slow: ldr pc, [r7, #132]
+  return w;
+}
+extern "C" { int rstv_dyn_rc = 1; int rstv_dyn_blkcap = 0; unsigned rstv_dyn_rc_n, rstv_dyn_rc_miss[16]; unsigned long long rstv_icount[2]; }
+#if !defined(__vita__)
+// harness diag (RSTV_LITWATCH): folded literals, checked at every frame end against memory while their block is still live
+struct RstvLitW { u32 la, v, start, serial; Block *b; u8 isl; };
+static RstvLitW rstv_litw[65536];
+static int rstv_litw_n = -1;
+static u32 rstv_litw_serial[1 << 14]; // per block slot, bumped at every compile into it
+extern "C" void rstv_litwatch_check(u32 frame)
+{
+  if (rstv_litw_n <= 0)
+    return;
+  CompileBlocks *cb = CompileBlocks::getInstance();
+  int out = 0;
+  for (int k = 0; k < rstv_litw_n; k++) {
+    RstvLitW &e = rstv_litw[k];
+    Block *b = cb->LookupTable[(e.start & 0xFFFFF) >> 1];
+    if (!b || b != e.b || rstv_litw_serial[(b - cb->g_CompleBlock) & ((1 << 14) - 1)] != e.serial)
+      continue;
+    const u32 cur = e.isl ? T2ReadLong(HighWram, e.la & 0xFFFFF) : (u32)(s32)(s16)T2ReadWord(HighWram, e.la & 0xFFFFF);
+    if (cur != e.v && out++ < 8)
+      printf("litwatch f%u block %08x literal %08x folded %08x now %08x%c", frame, e.start, e.la, e.v, cur, 10);
+  }
+}
+#endif
 extern "C" void FASTCALL OnchipWriteLong(u32 addr, u32 val);
 extern "C" void rstv_divfx(u32 *R)
 {
@@ -956,7 +1038,7 @@ static int rstv_block_in_use(Block *b) {
 extern "C" { unsigned rstv_nested_us, rstv_nested_n; } // performance line: input-capture runs inside the other CPU
 extern "C" void SH2DynExecNested(SH2_struct *context, u32 cycles) {
   DynarecSh2 *pctx = (DynarecSh2 *)context->ext;
-  DynarecSh2 *prev = DynarecSh2::CurrentContext;
+  DynarecSh2 *prev = DynarecSh2::Cur();
   if (prev && rstv_running_n < 4)
     rstv_running[rstv_running_n++] = (Block *)prev->getDynaSh()->curblock;
   pctx->SetCurrentContext();
@@ -984,6 +1066,13 @@ extern "C" void SH2DynExecNested(SH2_struct *context, u32 cycles) {
 #endif
 Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
 {
+#if defined(RSTV)
+  // ADR-138: only the thread that opened the code region may write it (Vita, ADR-110): the slave thread has the main
+  // thread compile its blocks (rstv_slave_service) and waits
+  if (this == slave_instance_ && rstv_slave_on && rstv_thread_tp() == rstv_slave_tp)
+    return (Block *)rstv_slave_compile_proxy(this, pc, ParentT);
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
   compile_count_++;
 #if defined(RSTV)
   rstv_dyn_compile++;
@@ -1007,12 +1096,12 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   }else{
     blockCount = LastMakeBlock;
     LastMakeBlock++;
-    LastMakeBlock &= (NUMOFBLOCKS-1);
+    LastMakeBlock &= (nblocks_-1);
 #if defined(RSTV)
     if (rstv_block_in_use(&g_CompleBlock[blockCount])) {
       blockCount = LastMakeBlock;
       LastMakeBlock++;
-      LastMakeBlock &= (NUMOFBLOCKS-1);
+      LastMakeBlock &= (nblocks_-1);
     }
 #endif
   }
@@ -1044,6 +1133,11 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
         //LOG("%d, %08X is removed due to overflow", blockCount, g_CompleBlock[blockCount].b_addr);
         break;
       default:
+        if ((g_CompleBlock[blockCount].b_addr & 0x0E000000) == 0x02000000) { // ADR-143
+          const u32 o = g_CompleBlock[blockCount].b_addr & 0x01FFFFFF;
+          if (LookupTableCart[o >> 16] && LookupTableCart[o >> 16][(o & 0xFFFF) >> 1] == &g_CompleBlock[blockCount])
+            LookupTableCart[o >> 16][(o & 0xFFFF) >> 1] = NULL;
+        }
         break;
       }
     }
@@ -1058,6 +1152,9 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   const u64 rt1 = RSTV_PROF_T();
 #endif
   g_CompleBlock[blockCount].b_addr = pc;
+#if !defined(__vita__)
+  rstv_litw_serial[blockCount & ((1 << 14) - 1)]++;
+#endif
 
 
   //LOG("%d,%08X is compiled",blockCount,pc );
@@ -1066,9 +1163,9 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   const u64 rt2 = RSTV_PROF_T();
   RSTV_ACT(28);
   // ADR-036: make only the written code and the header coherent (was the whole 4KB block: about 50us per block)
-  if (emit_rc == 0 && rstv_dyn_blk_last > 0 && rstv_dyn_blk_last <= MAXBLOCKSIZE) {
+  if (emit_rc == 0 && blk_last_ > 0 && blk_last_ <= MAXBLOCKSIZE) {
     // the header (b_addr..flags) is data read by C code, not executed: no I-cache sync needed
-    rstv_jit_code_write_end(g_CompleBlock[blockCount].code, rstv_dyn_blk_last);
+    rstv_jit_code_write_end(g_CompleBlock[blockCount].code, blk_last_);
   } else
     rstv_jit_code_write_end(&g_CompleBlock[blockCount], sizeof(Block));
   const u64 rt3 = RSTV_PROF_T();
@@ -1183,12 +1280,17 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   std::unordered_map<u32, uintptr_t> addr_map;
   int rstv_continued = 0; // ReST-V (ADR-024): a BT/BF in this block did not end it
   u32 pend_pc = 0, pend_cyc = 0; // ReST-V (ADR-030): PC / cycle increments not emitted yet
+#if defined(RSTV) && !defined(AARCH64)
+  RstvRc rc;
+  rc.reset();
+  const bool rcon = rstv_dyn_rc && !debug_mode_;
+#define RSTV_RC_FLUSH() do { if (rcon) { rc.w = (u32 *)ptr; rc.flush(); ptr = (u8 *)rc.w; } } while (0)
+#endif
 
 #if defined(RSTV) && !defined(AARCH64)
   // ADR-043: build the block in ordinary (cached) memory and copy it to the code region once at the end;
   // the templates are patched in place (read-modify-write), which was slow on the JIT region
-  static u8 rstv_emit_buf[MAXBLOCKSIZE] __attribute__((aligned(16)));
-  startptr = ptr = rstv_emit_buf;
+  startptr = ptr = emit_buf_; // per instance (ADR-136: the slave may compile at the same time)
 #else
   startptr = ptr = page->code;
 #endif
@@ -1216,6 +1318,26 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   memcpy((void*)ptr, (void*)prologue, PROLOGSIZE);
   ptr += PROLOGSIZE;
   int MaxSize = 0;
+#if defined(RSTV) && !defined(AARCH64) && !defined(__vita__)
+  // harness (RSTV_ICOUNT): count ARM instructions of the block body and SH-2 instructions at every entry (64-bit sums)
+  static int icnt_on = -1;
+  if (icnt_on < 0) icnt_on = getenv("RSTV_ICOUNT") != NULL;
+  u32 *icnt_patch = NULL;
+  if (icnt_on && !debug_mode_) {
+    extern unsigned long long rstv_icount[2];
+    const u32 a = (u32)(uintptr_t)rstv_icount;
+    u32 *w = (u32 *)ptr;
+    *w++ = 0xE3000000 | (((a >> 12) & 15) << 16) | (a & 0xFFF);          // movw r0, #lo
+    *w++ = 0xE3400000 | (((a >> 28) & 15) << 16) | ((a >> 16) & 0xFFF);  // movt r0, #hi
+    icnt_patch = w;
+    *w++ = 0xE3003000;                                                   // movw r3, #arm count (patched)
+    *w++ = 0xE5901000; *w++ = 0xE5902004; *w++ = 0xE0911003; *w++ = 0xE2A22000; *w++ = 0xE5801000; *w++ = 0xE5802004;
+    *w++ = 0xE3003000;                                                   // movw r3, #sh2 count (patched)
+    *w++ = 0xE5901008; *w++ = 0xE590200C; *w++ = 0xE0911003; *w++ = 0xE2A22000; *w++ = 0xE5801008; *w++ = 0xE580200C;
+    ptr = (u8 *)w;
+  }
+  u8 *const icnt_body = ptr;
+#endif
 
   void * nomal_seperator;
   u32 nomal_seperator_size;
@@ -1254,6 +1376,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         page->flags |= BLOCK_NOCHAIN;
   if (rstv_once_fn && addr == rstv_once_fn)
     page->flags |= BLOCK_NOCHAIN;
+  { if (rstv_dev_trap && addr == rstv_dev_trap && !rstv_chain_trace_on) page->flags |= BLOCK_NOCHAIN; }
   for (int k = 0; k < rstv_hle_n; k++)
     if (rstv_hle[k].pc == addr)
       page->flags |= BLOCK_NOCHAIN;
@@ -1268,7 +1391,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
     if (hk >= 0) {
       // ADR-081: str r9,[r7,#COUNT]; mov r0,r7; movw/movt r10,fn; blx r10; ldr r9,[r7,#COUNT]; cmp r0,#0;
-      // ldrne pc,[r7,#132] (rstv_chain); pop {r4-r10,pc} (back to Execute: the original code runs)
+      // ldrne pc,[r7,#132] (rstv_chain); pop {r3-r11,pc} (back to Execute: the original code runs)
       const u32 fn = (u32)(uintptr_t)rstv_hle_stub_c;
       u32 *w = (u32 *)ptr;
       w[0] = 0xE587905C;
@@ -1279,7 +1402,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       w[5] = 0xE597905C;
       w[6] = 0xE3500000;
       w[7] = 0x1597F084;
-      w[8] = 0xE8BD87F0;
+      w[8] = 0xE8BD8FF8; // pop {r3-r11, pc} (ADR-135)
       ptr += 9 * 4;
       page->flags = BLOCK_HLESTUB;
       page->e_addr = addr;
@@ -1292,7 +1415,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
 #endif
       const unsigned sz = (unsigned)(ptr - startptr);
-      rstv_dyn_blk_last = sz;
+      blk_last_ = sz;
       memcpy(page->code, startptr, sz);
       return 0;
     }
@@ -1364,6 +1487,12 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       break; // no space is available
     }
 #if defined(RSTV) && !defined(AARCH64)
+    if (rcon && calsize + 16 + 2 * 68 + 192 >= MAXBLOCKSIZE)
+      break; // ADR-135: room for two cache write-backs (taken exit and block end) and a native bt/bf with its loop tail
+    if (rstv_dyn_blkcap > 0 && (int)instruction_counter >= rstv_dyn_blkcap)
+      break;
+#endif
+#if defined(RSTV) && !defined(AARCH64)
     // ADR-028: on-chip fixed-point divide sequence -> one call
     if (rstv_dyn_divfx && !debug_mode_ && (op & 0xFF00) == 0xD000 && calsize + 64 < MAXBLOCKSIZE) {
       static const u16 pat[6] = { 0x6249, 0x2052, 0x622F, 0x1024, 0x4428, 0x1045 };
@@ -1372,6 +1501,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       for (int k = 0; ok && k < 6; k++)
         ok = MappedMemoryReadWord(addr + 2 + k * 2, NULL) == pat[k];
       if (ok) {
+        RSTV_RC_FLUSH(); // the call reads and writes registers in the context
         u32 cyc = asm_list[dsh2_instructions[op]].cycle;
         for (int k = 0; k < 6; k++)
           cyc += asm_list[dsh2_instructions[pat[k]]].cycle;
@@ -1413,6 +1543,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       for (int k = 2; ok && k < 64; k++)
         ok = MappedMemoryReadWord(addr + k * 2, NULL) == ((k & 1) ? d1 : op);
       if (ok) {
+        RSTV_RC_FLUSH();
         const u32 packed = (((op >> 8) & 15) << 8) | (((d1 >> 4) & 15) << 4) | ((d1 >> 8) & 15);
         const u32 fn = (u32)(uintptr_t)rstv_div1x32;
         u32 *w = (u32 *)ptr;
@@ -1445,6 +1576,73 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
     }
 #endif
+
+    // ADR-134: PC-relative literal as an immediate
+    if (rstv_dyn_litc && !debug_mode_ && ((op & 0xF000) == 0xD000 || (op & 0xF000) == 0x9000) && calsize + 32 < MAXBLOCKSIZE) {
+      const int isl = (op & 0xF000) == 0xD000;
+      const u32 la = isl ? ((addr & ~3u) + 4 + (op & 0xFF) * 4) : (addr + 4 + (op & 0xFF) * 2);
+      const int hw = (la & 0xDFF00000) == 0x06000000 && ParentT && (start_addr & 0xDFF00000) == 0x06000000;
+#if !defined(__vita__)
+      static int dchk = -1; // RSTV_DYNCHK replays BIOS reads from the run's I/O log: a compile-time read is not in it
+      if (dchk < 0) dchk = getenv("RSTV_DYNCHK") != NULL;
+#else
+      const int dchk = 0;
+#endif
+      const int rom = !dchk && (la & 0xDFF00000) == 0x00000000 && (la & 0x000FFFFF) < 0x80000 && (start_addr & 0xDFF00000) == 0x00000000;
+      if (hw || rom) {
+        // the template's read cost the same wait cycles (memGetX: cache-through high RAM 2, BIOS as MappedMemory says)
+        // high work RAM straight from the array as memGetX reads it (MappedMemoryRead can answer from the SH-2 cache model)
+        u32 mc = 0, v;
+        if (hw) {
+          v = isl ? T2ReadLong(HighWram, la & 0xFFFFF) : (u32)(s32)(s16)T2ReadWord(HighWram, la & 0xFFFFF);
+          mc = (la & 0x20000000) ? 2 : 0;
+        } else
+          v = isl ? MappedMemoryReadLong(la, &mc) : (u32)(s32)(s16)MappedMemoryReadWord(la, &mc);
+        if (hw) {
+          const u32 sa = adress_mask(start_addr);
+          for (u32 a = la; a < la + (isl ? 4u : 2u); a += 2) {
+            addrs &pl = ParentT[adress_mask(a)];
+            if (pl.empty() || pl.back() != sa) pl.push_back(sa);
+            RSTV_MARK_CODE(a);
+          }
+        }
+#if !defined(__vita__)
+        if (rstv_litw_n < 0) rstv_litw_n = getenv("RSTV_LITWATCH") ? 0 : -2;
+        if (hw && rstv_litw_n >= 0) {
+          int k = 0;
+          while (k < rstv_litw_n && !(rstv_litw[k].start == start_addr && rstv_litw[k].la == la)) k++;
+          if (k < 65536) {
+            rstv_litw[k] = { la, v, start_addr, rstv_litw_serial[(page - g_CompleBlock) & ((1 << 14) - 1)], page, (u8)isl };
+            if (k == rstv_litw_n) rstv_litw_n++;
+          }
+        }
+#endif
+        const u32 rn = (op >> 8) & 15;
+        u32 *w = (u32 *)ptr;
+        int k = 0;
+        if (rcon) {
+          rc.w = w;
+          rc.lock = 0;
+          rc.movimm(rc.wr((int)rn), v);
+          k = (int)(rc.w - w);
+        } else {
+          w[k++] = 0xE3000000 | (((v >> 12) & 15) << 16) | (v & 0xFFF);                 // movw r0, #lo
+          if (v >> 16) w[k++] = 0xE3400000 | (((v >> 28) & 15) << 16) | ((v >> 16) & 0xFFF); // movt r0, #hi
+          w[k++] = 0xE5870000 | (rn << 2);                                              // str r0, [r7, #Rn]
+        }
+        instrSize[blockCount][count++] = k * 4;
+        ptr += k * 4;
+        pend_pc += 2;
+        pend_cyc += asm_list[i].cycle + mc;
+        if (!rstv_dyn_lazy)
+          rstv_flush();
+        addr += 2;
+        instruction_counter++;
+        asm_list[i].build_count++;
+        rstv_dyn_litc_n++;
+        continue;
+      }
+    }
 
     if (0x1b == op) { // SLEEP
       if (rstv_continued)
@@ -1502,17 +1700,90 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 
 
 #if defined(RSTV) && !defined(AARCH64)
+    int rc_br = 0, rc_cont = 0;
+    if (rcon) {
+      if ((op & 0xFD00) == 0x8900 && rstv_dyn_rcbr) {
+        // ADR-135: bt / bf. The target is a constant, so the lazy PC/cycle sums stay pending: the taken path stores the
+        // dirty cached registers, PC and COUNT (as the template + PageFlip did) and leaves; the not-taken path keeps the cache.
+        const bool bt = (op & 0xFF00) == 0x8900;
+        const u32 cyc = asm_list[i].cycle;
+        rc_cont = rstv_dyn_cont && !(page->flags & BLOCK_LOOP) && !(jumppc >= start_addr && jumppc < addr);
+        const int selfl = !rc_cont && rstv_dyn_selfloop && rstv_chain_on && !rstv_link_on && jumppc == start_addr &&
+          (start_addr >> 20) == 0x060 && !(page->flags & (BLOCK_LOOP | BLOCK_NOCHAIN)) && (write_memory_counter != 0 || rstv_continued);
+        u8 *const p0 = ptr;
+        rc.w = (u32 *)ptr;
+        rc.lock = 0;
+        int hs = rc.host[16];
+        if (hs < 0) {
+          rc.e(0xE5971040); // ldr r1, [r7, #64]
+          hs = 1;
+        }
+        rc.e(0xE3100001 | ((u32)hs << 16)); // tst hs, #1
+        u32 *skip = rc.w;
+        rc.e(bt ? 0x0A000000 : 0x1A000000); // not taken -> on
+        for (int g = 0; g < 17; g++)
+          if (rc.host[g] >= 0 && rc.dirty[g])
+            rc.str(rc.host[g], g);
+        if (selfl) {
+          rc.movimm(8, start_addr);
+          rc.e(0xE5878058); // str r8, [r7, #88]
+          rc.addimm(9, 9, (s32)(pend_cyc + cyc));
+          rc.e(0xE587905C); // str r9, [r7, #92]
+          rc.w = rstv_loop_tail(rc.w, startptr + PROLOGSIZE, start_addr);
+          rstv_dyn_selfloop_n++;
+        } else {
+          rc.movimm(0, jumppc);
+          rc.e(0xE5870058); // str r0, [r7, #88]
+          rc.addimm(9, 9, (s32)(pend_cyc + cyc));
+          rc.e(0xE587905C); // str r9, [r7, #92]
+          rc.e(0xE597F084); // ldr pc, [r7, #132]
+        }
+        RstvRc::patch(skip, rc.w);
+        ptr = (u8 *)rc.w;
+        instrSize[blockCount][count++] = (u32)(ptr - p0);
+        pend_pc += 2;
+        pend_cyc += cyc;
+        rc_br = 1;
+        rstv_dyn_rc_n++;
+      } else
+      if (asm_list[i].delay == 0 || asm_list[i].delay == 0xFF) {
+        u8 *const p0 = ptr;
+        rc.w = (u32 *)ptr;
+        if (rc.op(op, addr - 2)) {
+          ptr = (u8 *)rc.w;
+          instrSize[blockCount][count++] = (u32)(ptr - p0);
+          pend_pc += 2;
+          pend_cyc += asm_list[i].delay == 0xFF ? 1 : asm_list[i].cycle; // as the lazy template path (ADR-030, ADR-134)
+          if (!rstv_dyn_lazy)
+            rstv_flush();
+          rstv_dyn_rc_n++;
+          continue;
+        }
+        rstv_dyn_rc_miss[op >> 12]++;
+      }
+      if (!rc_br)
+        RSTV_RC_FLUSH(); // templates use the registers in the context (and r4-r6, r10 as scratch)
+    }
     // ADR-030: instructions that read r8 / branches see the exact PC and cycle count
     const int rstv_reads_pc = (op & 0xFF00) == 0xC700 || (op & 0xF000) == 0x9000 || (op & 0xF000) == 0xD000 || op == 0x001B;
-    if (asm_list[i].delay != 0 || rstv_reads_pc || !rstv_dyn_lazy || debug_mode_)
+    // ADR-134: the 0xFF class (STS/STC/LDS/LDC) does not read r8/r9 either: lazy like plain instructions
+    const int rstv_plain = asm_list[i].delay == 0 || (asm_list[i].delay == 0xFF && rstv_dyn_lazyff);
+    if (!rc_br && (!rstv_plain || rstv_reads_pc || !rstv_dyn_lazy || debug_mode_))
       rstv_flush();
-    if (asm_list[i].delay == 0 && !rstv_reads_pc && rstv_dyn_lazy && !debug_mode_) {
+    if (rc_br) {
+      if (rc_cont) {
+        rstv_continued = 1;
+        rstv_dyn_cont_n++;
+        continue;
+      }
+    } else
+    if (rstv_plain && !rstv_reads_pc && rstv_dyn_lazy && !debug_mode_) {
       memcpy((void*)ptr, (void*)(asm_list[i].func), *(asm_list[i].size));
       instrSize[blockCount][count++] = *(asm_list[i].size);
       opcodePass(&asm_list[i], op, ptr);
       ptr += *(asm_list[i].size);
       pend_pc += 2;
-      pend_cyc += asm_list[i].cycle;
+      pend_cyc += asm_list[i].delay == 0xFF ? 1 : asm_list[i].cycle; // the 0xFF class always took the separator's 1 cycle
     } else
 #endif
     // Regular Opcode ( No Delay Branch )
@@ -1577,7 +1848,27 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #else
         const int cont = 0;
 #endif
-        const u32 flipsize = cont ? PAGEFLIPCONT_SIZE : DELAYJUMPSIZE;
+        u32 flipsize = cont ? PAGEFLIPCONT_SIZE : DELAYJUMPSIZE;
+#if defined(RSTV) && !defined(AARCH64)
+        const int selfl = !cont && rstv_dyn_selfloop && !debug_mode_ && rstv_chain_on && !rstv_link_on && jumppc == start_addr &&
+          (start_addr >> 20) == 0x060 && !(page->flags & (BLOCK_LOOP | BLOCK_NOCHAIN)) && (write_memory_counter != 0 || rstv_continued) &&
+          (ptr - startptr) + *(asm_list[i].size) + nomal_seperator_size + 128 + EPILOGSIZE + 16 < MAXBLOCKSIZE;
+        if (selfl) {
+          // ADR-135: taken -> straight back to the body; not taken -> leave as PageFlip does
+          u32 *w = (u32 *)(ptr + *(asm_list[i].size) + nomal_seperator_size), *w0 = w;
+          *w++ = 0xE3700001; // cmn r0, #1
+          *w++ = 0x1A000002; // bne taken
+          *w++ = 0xE5878058; // str r8, [r7, #88]
+          *w++ = 0xE587905C; // str r9, [r7, #92]
+          *w++ = 0xE597F084; // ldr pc, [r7, #132]
+          *w++ = 0xE1A08000; // taken: mov r8, r0
+          *w++ = 0xE5878058;
+          *w++ = 0xE587905C;
+          w = rstv_loop_tail(w, startptr + PROLOGSIZE, start_addr);
+          flipsize = (u32)((u8 *)w - (u8 *)w0);
+          rstv_dyn_selfloop_n++;
+        } else
+#endif
         memcpy((void*)(ptr + *(asm_list[i].size) + nomal_seperator_size), cont ? (void*)PageFlipCont : (void*)PageFlip, flipsize);
         instrSize[blockCount][count++] = *(asm_list[i].size) + nomal_seperator_size + flipsize;
         opcodePass(&asm_list[i], op, ptr);
@@ -1668,7 +1959,19 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
       else {
         memcpy((void*)(ptr + offset), (void*)seperator_delay_after, SEPERATORSIZE_DELAY_AFTER);
-        instrSize[blockCount][count++] = offset + SEPERATORSIZE_DELAY_AFTER;
+        u32 after = SEPERATORSIZE_DELAY_AFTER;
+#if defined(RSTV) && !defined(AARCH64)
+        // ADR-135: a delayed branch back to the block start (the not-taken bt/s, bf/s path left before the delay slot)
+        if (rstv_dyn_selfloop && !debug_mode_ && rstv_chain_on && !rstv_link_on && jumppc == start_addr && (start_addr >> 20) == 0x060 &&
+            !(page->flags & (BLOCK_LOOP | BLOCK_NOCHAIN)) && (write_memory_counter != 0 || rstv_continued) &&
+            (ptr - startptr) + offset + SEPERATORSIZE_DELAY_AFTER + 112 + EPILOGSIZE + 16 < MAXBLOCKSIZE) {
+          u32 *w = (u32 *)(ptr + offset + SEPERATORSIZE_DELAY_AFTER - 4); // in place of its ldr pc, [r7, #132]
+          w = rstv_loop_tail(w, startptr + PROLOGSIZE, start_addr);
+          after = (u32)((u8 *)w - (ptr + offset));
+          rstv_dyn_selfloop_n++;
+        }
+#endif
+        instrSize[blockCount][count++] = offset + after;
         opcodePass(&asm_list[j], temp, ptr);
 #if defined(AARCH64)
         u32 * counterpos = (u32*)(ptr + *(asm_list[j].size) + delayslot_seperator_counter_offset);
@@ -1677,7 +1980,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         u8 * counterpos = ptr + *(asm_list[j].size) + delayslot_seperator_counter_offset;
         *counterpos = cycle;
 #endif
-        ptr += *(asm_list[j].size) + SEPERATORSIZE_DELAY_AFTER;
+        ptr += *(asm_list[j].size) + after;
       }
     }
 
@@ -1722,10 +2025,18 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   }
   page->e_addr = addr-2;
 #if defined(RSTV) && !defined(AARCH64)
+  RSTV_RC_FLUSH();
   rstv_flush();
 #endif
   memcpy((void*)ptr, (void*)epilogue, EPILOGSIZE);
   ptr += EPILOGSIZE;
+#if defined(RSTV) && !defined(AARCH64) && !defined(__vita__)
+  if (icnt_patch) {
+    const u32 na = (u32)(ptr - icnt_body) / 4, ns = instruction_counter;
+    icnt_patch[0] |= ((na >> 12) & 15) << 16 | (na & 0xFFF);
+    icnt_patch[7] |= ((ns >> 12) & 15) << 16 | (ns & 0xFFF);
+  }
+#endif
 #if defined(RSTV) && !defined(AARCH64)
   if (rstv_link_on && !debug_mode_) {
     if (rstv_link_stubs_fit(startptr, ptr, MAXBLOCKSIZE - (int)(ptr - startptr)) >= 0)
@@ -1743,7 +2054,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     // ReST-V: block size statistics (log every 256 compiles)
     const unsigned sz = (unsigned)(ptr - startptr);
     rstv_dyn_blk_bytes += sz; rstv_dyn_blk_n++; if (sz > rstv_dyn_blk_max) rstv_dyn_blk_max = sz;
-    rstv_dyn_blk_last = sz;
+    blk_last_ = sz;
 #if !defined(AARCH64)
     RSTV_ACT(29);
     memcpy(page->code, startptr, sz);
@@ -1801,7 +2112,10 @@ DynarecSh2::DynarecSh2() {
   m_pDynaSh2->setmemword = (uintptr_t)memSetWord;
   m_pDynaSh2->setmemlong = (uintptr_t)memSetLong;
 #if defined(RSTV) && defined(__arm__)
-  m_pDynaSh2->chain = rstv_chain_on ? (uintptr_t)rstv_chain : (uintptr_t)rstv_chain_off;
+  {
+    extern int rstv_chain_prof; // ADR-135: the profiling chain only for the sampler / fine profile
+    m_pDynaSh2->chain = !rstv_chain_on ? (uintptr_t)rstv_chain_off : rstv_chain_prof ? (uintptr_t)rstv_chain : (uintptr_t)rstv_chain_fast;
+  }
   m_pDynaSh2->macl_fn = (uintptr_t)rstv_macl_helper;
   {
     extern int rstv_jit_keep_open;
@@ -1893,7 +2207,8 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
 #if defined(RSTV)
   // ADR-050: the CPU stopped at an idle-loop head and no unmasked interrupt is pending: the loop would only spin.
   // Skip up to rstv_sleep_max slices (then run the loop once again: it may wait for memory, not only an interrupt)
-  if (rstv_sleep_ && rstv_sleep_n_ < rstv_sleep_max && (GET_SR() & 0xF0) >= GET_ICOUNT()) {
+  // ADR-136: not for the slave on its own thread (it then missed the master's handshake flags: diehard stalled)
+  if (rstv_sleep_ && rstv_sleep_n_ < rstv_sleep_max && (GET_SR() & 0xF0) >= GET_ICOUNT() && !(is_slave_ && rstv_slave_on)) {
     rstv_sleep_n_++;
     rstv_sleep_slices++;
     if (Count > pre_exe_count_) {
@@ -1903,6 +2218,8 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
       pre_exe_count_ = 0;
     } else
       pre_exe_count_ -= Count;
+    if (is_slave_ && rstv_slave_on)
+      rstv_slave_set_idle(1); // ADR-136: the main thread need not wake the slave thread for every slice
     return;
   }
   rstv_sleep_ = 0;
@@ -1952,8 +2269,21 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
 
 #if defined(RSTV)
   rstv_dyn_cyc[is_slave_ ? 1 : 0] += m_pDynaSh2->SysReg[4] - rstv_skipped; // cycles really run (performance line)
+  if (is_slave_ && rstv_slave_on)
+    rstv_slave_set_idle(rstv_skipped != 0 || rstv_sleep_ != 0);
 #endif
   CurrentSH2->cycles = m_pDynaSh2->SysReg[4];
+#if defined(RSTV) && !defined(__vita__)
+  { // harness diag: RSTV_SLICELOG=from,to -> master slice ends (PC, cycles run) in those frames
+    static int sf = -2, st;
+    if (sf == -2) { const char *e = getenv("RSTV_SLICELOG"); sf = -1; if (e) sscanf(e, "%d,%d", &sf, &st); }
+    if (sf >= 0 && !is_slave_ && (int)yabsys.frame_count >= sf && (int)yabsys.frame_count <= st)
+    { const u32 *Q = GetGenRegPtr();
+      printf("sl f%d l%d pc %08x c %u/%u sr %03x r %08x %08x %08x %08x %08x %08x %08x %08x pr %08x\n", (int)yabsys.frame_count,
+             (int)yabsys.LineCount, GET_PC(), (unsigned)m_pDynaSh2->SysReg[4], targetcnt, (unsigned)GET_SR() & 0x3F3, Q[0], Q[1], Q[2],
+             Q[3], Q[4], Q[5], Q[6], Q[7], GET_PR()); }
+  }
+#endif
   //if (Count == 1) {
   //  one_step_ = true;
   //  pre_exe_count_ = 0;
@@ -2111,6 +2441,9 @@ extern "C" {
 }
 int DynarecSh2::RstvTierRun()
 {
+#if defined(RSTV)
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
   static int init;
   if (!init) {
     init = 1;
@@ -2172,6 +2505,8 @@ static const RstvCodeSig rstv_hle_sig[7] = {
   { 6, 0x9af6a5ffu, -1, -1 },
 };
 static const int rstv_hle_len[7] = { 0, 36, 13, 12, 12, 14, 6 };
+// ADR-148: another compiler's byte memmove (pblbeach 06076CC8 / 06076D0C): cmp/eq r5,r4 / bt / cmp/hs r5,r4 ...
+static const RstvCodeSig rstv_mm2_sig = { 33, 0x2329a317u, -1, -1 };
 // ADR-047: SGL vertex transform loop (sasissu / sanjeon 0606ECB6 .. 0606ED4C)
 static const RstvCodeSig rstv_sgl_vtx2_sig = { 398, 0x452d1e96u, -1, -1 };
 static const RstvCodeSig rstv_sgl_vtx_sig = { 364, 0x32c0b60eu, -1, -1 };
@@ -2199,6 +2534,8 @@ typedef struct { u8 *m; u32 o, a; u8 t1; } RstvHleSide;
 extern u8 *Vdp1Ram, *Vdp2Ram;
 extern "C" u8 *rstv_cart_rom(void);
 extern "C" u8 *rstv_sound_ram(u32 off, u32 n);
+extern "C" u8 *rstv_sound_ram_any(int *mem4b);
+extern "C" int rstv_coin_mailbox_latch; // ADR-151: astrass sound RAM writes go through SoundRamWriteByte
 static int rstv_hle_side(RstvHleSide *x, u32 a, u32 n, int ro = 0)
 {
   x->a = a;
@@ -2280,9 +2617,13 @@ static int rstv_hle_checked(unsigned *gen, u32 a, const RstvCodeSig *sig)
 {
   if (*gen == rstv_hle_codegen)
     return 1;
+  if (*gen == (rstv_hle_codegen ^ 0x80000000u))
+    return 0; // ADR-141: did not match since the last code change: not hashed again on every call
   rstv_hle_items[7]++;
-  if (!rstv_hle_match(a, sig))
+  const int ok = rstv_hle_match(a, sig);
+  if (!ok && ((a & 0x0FF00000) != 0x06000000 || (a & 0xFFFFF) + sig->n * 2 > 0x100000))
     return 0;
+  // the range is watched whether it matched or not (a failed one is compared again once that code is written)
   for (u32 c = a & ~31u; c < a + (u32)sig->n * 2; c += 32) {
     RSTV_MARK_CODE(c);
     rstv_hle_chunk[(c & 0xFFFFF) >> 5] = 1;
@@ -2299,6 +2640,10 @@ static int rstv_hle_checked(unsigned *gen, u32 a, const RstvCodeSig *sig)
       rstv_hle_rng[k][1] = r1;
       rstv_hle_nrng++;
     }
+  }
+  if (!ok) {
+    *gen = rstv_hle_codegen ^ 0x80000000u;
+    return 0;
   }
   *gen = rstv_hle_codegen;
   return 1;
@@ -2473,11 +2818,82 @@ static int rstv_delayr_check(u32 pc)
   return n;
 }
 
+// ADR-109 follow-up 2: `add #-1,rN / tst rN,rN / bf .-4` (fhboxers slave, about 60k iterations a frame); returns n or -1
+static int rstv_delayr2_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 6 > 0x100000)
+    return -1;
+  const u16 w0 = T2ReadWord(HighWram, a), w1 = T2ReadWord(HighWram, a + 2), w2 = T2ReadWord(HighWram, a + 4);
+  const int n = (w0 >> 8) & 15;
+  if ((w0 & 0xF0FF) != 0x70FF || w1 != (0x2008 | (n << 8) | (n << 4)) || w2 != 0x8BFC)
+    return -1;
+  return n;
+}
+
+// ADR-160: `dt rN / bf .-2` (vfkids slave, about 50k iterations a frame); returns n or -1
+static int rstv_delaydt_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 4 > 0x100000)
+    return -1;
+  const u16 w0 = T2ReadWord(HighWram, a), w1 = T2ReadWord(HighWram, a + 2);
+  if ((w0 & 0xF0FF) != 0x4010 || w1 != 0x8BFD)
+    return -1;
+  return (w0 >> 8) & 15;
+}
+
+// ADR-162: word copy loop `mov.w @Rm+,Rx / mov.w Rx,@Rn / dt Rc / add #2,Rn / bf .-8` (kiwames: cartridge ROM to
+// sound RAM, up to 60k words a frame); returns x | m << 4 | n << 8 | c << 12, or -1
+static int rstv_cpy16_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 10 > 0x100000)
+    return -1;
+  const u16 w0 = T2ReadWord(HighWram, a), w1 = T2ReadWord(HighWram, a + 2), w2 = T2ReadWord(HighWram, a + 4);
+  const u16 w3 = T2ReadWord(HighWram, a + 6), w4 = T2ReadWord(HighWram, a + 8);
+  const int x = (w0 >> 8) & 15, m = (w0 >> 4) & 15, n = (w1 >> 8) & 15, c = (w2 >> 8) & 15;
+  if ((w0 & 0xF00F) != 0x6005 || (w1 & 0xF00F) != 0x2001 || ((w1 >> 4) & 15) != x || (w2 & 0xF0FF) != 0x4010 ||
+      w3 != (0x7002 | (n << 8)) || w4 != 0x8BFA)
+    return -1;
+  if (x == m || x == n || x == c || m == n || m == c || n == c)
+    return -1;
+  return x | m << 4 | n << 8 | c << 12;
+}
+
+// ADR-189: the cache purge by lines in its two forms (any game): 1 = do-while (fhboxers), 2 = while (pblbeach), 0 = no.
+// mov.l @(lit), r3 / r2 with the literals 1FFFFFF0 and 40000000, then the exact loop. Checked on every call (15 words)
+static int rstv_purge_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 30 > 0x100000 || (pc & 1))
+    return 0;
+  u16 w[15];
+  for (int i = 0; i < 15; i++)
+    w[i] = T2ReadWord(HighWram, a + i * 2);
+  if ((w[0] & 0xFF00) != 0xD300 || (w[1] & 0xFF00) != 0xD200)
+    return 0;
+  const u32 l3 = ((pc + 4) & ~3u) + (w[0] & 0xFF) * 4, l2 = ((pc + 6) & ~3u) + (w[1] & 0xFF) * 4;
+  if ((l3 & 0xFFFFF) + 4 > 0x100000 || (l2 & 0xFFFFF) + 4 > 0x100000 ||
+      T2ReadLong(HighWram, l3 & 0xFFFFF) != 0x1FFFFFF0u || T2ReadLong(HighWram, l2 & 0xFFFFF) != 0x40000000u)
+    return 0;
+  static const u16 f1[10] = { 0x2439, 0x242b, 0x6643, 0x365c, 0xe700, 0x2472, 0x7410, 0x3462, 0x8bfb, 0x000b };
+  static const u16 f2[12] = { 0x2439, 0x242b, 0x6743, 0x375c, 0x3472, 0x8d04, 0xe600, 0x2462, 0x7410, 0x3472, 0x8bfb, 0x000b };
+  if (!memcmp(w + 2, f1, sizeof(f1)))
+    return 1;
+  if (!memcmp(w + 2, f2, sizeof(f2)))
+    return 2;
+  return 0;
+}
+
 // ADR-045: library routines found by their code (position independent bodies), any game: checked the first time a
 // high work RAM PC is not compiled. Found PCs join rstv_hle[] and a bit map (the dispatcher looks them up there).
 static int rstv_hle_bits_n = -1;
 static int rstv_hle_detect(u32 pc)
 {
+#if defined(RSTV)
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
   if ((pc & 0x0FF00000) != 0x06000000)
     return 0;
   const u16 w0 = T2ReadWord(HighWram, pc & 0xFFFFF);
@@ -2491,9 +2907,15 @@ static int rstv_hle_detect(u32 pc)
   else if (w0 == 0x6362) kind = rstv_bss2_check(pc) ? RSTV_HLE_BSSCLR2 : 0;
   else if (w0 == 0x62f2) kind = rstv_delay_check(pc) ? RSTV_HLE_DELAY : 0;
   else if ((w0 & 0xF00F) == 0x2008) kind = rstv_delayr_check(pc) >= 0 ? RSTV_HLE_DELAYR : 0;
+  else if ((w0 & 0xF0FF) == 0x70FF) kind = rstv_delayr2_check(pc) >= 0 ? RSTV_HLE_DELAYR2 : 0;
+  else if (w0 == 0x3450) kind = rstv_hle_match(pc, &rstv_mm2_sig) ? RSTV_HLE_MEMMOVE2 : 0;
+  else if ((w0 & 0xF0FF) == 0x4010) kind = rstv_delaydt_check(pc) >= 0 ? RSTV_HLE_DELAYDT : 0;
+  else if ((w0 & 0xF00F) == 0x6005) kind = rstv_cpy16_check(pc) >= 0 ? RSTV_HLE_CPY16 : 0;
+  else if ((w0 & 0xFF00) == 0xD300) kind = rstv_purge_check(pc) ? RSTV_HLE_PURGE : 0;
   if (!kind)
     return 0;
-  if (kind != RSTV_HLE_LZ && kind != RSTV_HLE_BSSCLR && kind != RSTV_HLE_BSSCLR2 && kind != RSTV_HLE_DELAY && kind != RSTV_HLE_DELAYR &&
+  if (kind != RSTV_HLE_LZ && kind != RSTV_HLE_BSSCLR && kind != RSTV_HLE_BSSCLR2 && kind != RSTV_HLE_DELAY && kind != RSTV_HLE_DELAYR && kind != RSTV_HLE_DELAYR2 &&
+      kind != RSTV_HLE_MEMMOVE2 && kind != RSTV_HLE_DELAYDT && kind != RSTV_HLE_CPY16 && kind != RSTV_HLE_PURGE &&
       !rstv_hle_match(pc, &rstv_hle_sig[kind]))
     return 0;
   if (rstv_hle_n >= RSTV_MAX_HLE)
@@ -2527,7 +2949,8 @@ static inline int rstv_hw_in(u32 a, u32 n) { return (a & 0x0FF00000) == 0x060000
 // back 12 a pass), r6 = matrix 3 x 4, r11 = output (walks back 16 a pass), r9 = count. Returns the exit PC.
 // SGL keeps |x|, |y| <= 512 (0606EAC0 / 0606EB8C): halve both until inside, then 4 bisection steps along the larger one.
 // a = x (r3 or r2), b = y (r5); r0, r1, r4, r7 are its scratch registers (their final values are visible to the game).
-static void rstv_sgl_clip(u32 *pa, u32 *pb, u32 *pr0, u32 *pr1, u32 *pr4, u32 *pr7, u32 lim)
+// Returns T as the SH-2 code leaves it (tst r1,r1 -> 1; else the bit the last delay-slot shar shifted out, ADR-141)
+static int rstv_sgl_clip(u32 *pa, u32 *pb, u32 *pr0, u32 *pr1, u32 *pr4, u32 *pr7, u32 lim)
 {
   s32 a = (s32)*pa, b = (s32)*pb, r0 = (s32)lim, r1 = 0;
   while (a > r0) { r1 = 1; a >>= 1; b >>= 1; }
@@ -2540,31 +2963,33 @@ static void rstv_sgl_clip(u32 *pa, u32 *pb, u32 *pr0, u32 *pr1, u32 *pr4, u32 *p
   while (!(b >= r0)) { r1 = 1; a >>= 1; b >>= 1; }
   if (r1 == 0) {
     *pa = (u32)a; *pb = (u32)b; *pr0 = (u32)r0; *pr1 = 0;
-    return;                                    // r4, r7 untouched
+    return 1;                                  // r4, r7 untouched
   }
   s32 r4 = a, r7 = b;
   r0 = a < 0 ? -a : a;
   r1 = b < 0 ? -b : b;
   const int bmaj = r1 >= r0;
   r0 = 4;
+  int T;
   if (!bmaj) {
     if (a >= 0) {
       r1 = (s32)lim;
-      do { const s32 t = (s32)((u32)a + (u32)r4); if (!(t > r1)) { b = (s32)((u32)b + (u32)r7); a = t; } r7 >>= 1; r0--; r4 >>= 1; } while (r0);
+      do { const s32 t = (s32)((u32)a + (u32)r4); if (!(t > r1)) { b = (s32)((u32)b + (u32)r7); a = t; } r7 >>= 1; r0--; T = r4 & 1; r4 >>= 1; } while (r0);
     } else {
       r1 = -(s32)lim;
-      do { const s32 t = (s32)((u32)a + (u32)r4); if (t >= r1) { b = (s32)((u32)b + (u32)r7); a = t; } r7 >>= 1; r0--; r4 >>= 1; } while (r0);
+      do { const s32 t = (s32)((u32)a + (u32)r4); if (t >= r1) { b = (s32)((u32)b + (u32)r7); a = t; } r7 >>= 1; r0--; T = r4 & 1; r4 >>= 1; } while (r0);
     }
   } else {
     if (b >= 0) {
       r1 = (s32)lim;
-      do { const s32 t = (s32)((u32)b + (u32)r7); if (!(t > r1)) { a = (s32)((u32)a + (u32)r4); b = t; } r4 >>= 1; r0--; r7 >>= 1; } while (r0);
+      do { const s32 t = (s32)((u32)b + (u32)r7); if (!(t > r1)) { a = (s32)((u32)a + (u32)r4); b = t; } r4 >>= 1; r0--; T = r7 & 1; r7 >>= 1; } while (r0);
     } else {
       r1 = -(s32)lim;
-      do { const s32 t = (s32)((u32)b + (u32)r7); if (t >= r1) { a = (s32)((u32)a + (u32)r4); b = t; } r4 >>= 1; r0--; r7 >>= 1; } while (r0);
+      do { const s32 t = (s32)((u32)b + (u32)r7); if (t >= r1) { a = (s32)((u32)a + (u32)r4); b = t; } r4 >>= 1; r0--; T = r7 & 1; r7 >>= 1; } while (r0);
     }
   }
   *pa = (u32)a; *pb = (u32)b; *pr0 = (u32)r0; *pr1 = (u32)r1; *pr4 = (u32)r4; *pr7 = (u32)r7;
+  return T;
 }
 
 // two copies of the routine in sasissu / sanjeon (different work area offsets, different ending)
@@ -2576,11 +3001,15 @@ struct RstvSglDesc {
   u32 epi_pc;                        // epi 1: the bra target
 };
 // ADR-100: twcup98 has the same two copies (the same SGL code at other addresses: master 0605CD86, slave 060631DE)
-static const RstvSglDesc rstv_sgl_desc[4] = {
+// ADR-141: ffreveng (and ffrevng10) has them too: master 0603C24A, slave 06041FAE
+#define RSTV_SGL_NDESC 6
+static const RstvSglDesc rstv_sgl_desc[RSTV_SGL_NDESC] = {
   { 0x0606ECB6, 0x0606EAC0, 0x0606ED94, &rstv_sgl_vtx_sig, 0x90, 0x92, 0x388, 0x378, 0, 0 },
   { 0x060726FA, 0x060724C4, 0x060727DC, &rstv_sgl_vtx2_sig, 0x94, 0x96, 0x38C, 0x37C, 1, 0x06072814 },
   { 0x0605CD86, 0x0605CB90, 0x0605CE64, &rstv_sgl_vtx_sig, 0x90, 0x92, 0x388, 0x378, 0, 0 },
   { 0x060631DE, 0x06062FA8, 0x060632C0, &rstv_sgl_vtx2_sig, 0x94, 0x96, 0x38C, 0x37C, 1, 0x060632F8 },
+  { 0x0603C24A, 0x0603C054, 0x0603C328, &rstv_sgl_vtx_sig, 0x90, 0x92, 0x388, 0x378, 0, 0 },
+  { 0x06041FAE, 0x06041D78, 0x06042090, &rstv_sgl_vtx2_sig, 0x94, 0x96, 0x38C, 0x37C, 1, 0x060420C8 },
 };
 extern "C" void rstv_div64_ext(s64 dividend, s32 divisor, s64 *q, s32 *r);
 // ADR-047: the SGL vertex routine from its loop head (0606ECB6) to its return, clip helpers included.
@@ -2721,7 +3150,7 @@ int DynarecSh2::RstvHleSglVtx(const RstvSglDesc *dsc, u32 *cyc_out)
   r4 &= r0;
   T = r4 & 1; r4 = (u32)((s32)r4 >> 1);
   if (T) {                                     // bra 0606EB8C .. bra 0606ED86
-    rstv_sgl_clip(&r2, &r5, &r0, &r1, &r4, &r7, lim);
+    T = rstv_sgl_clip(&r2, &r5, &r0, &r1, &r4, &r7, lim);
     cyc += 40;
   }
   r5 <<= 16;                                   // 0606ED86 / 060727CA
@@ -2885,6 +3314,605 @@ int DynarecSh2::RstvHleSglOnScr(u32 *cyc_out)
   R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7;
   SET_MACH((u32)(mac >> 32)); SET_MACL((u32)mac);
   SET_SR((sr & ~1u) | T);
+  *cyc_out = cyc;
+  return 1;
+}
+
+// ADR-139: vfremix vertex loop (master 060247F2, slave 06024CA2: the same code 0x4B0 apart). Entry at the loop head:
+// r8 = count, r9 = output (16 bytes a vertex), r14 = vertices (x, y, z longs), r11 = screen x centre, r13:r12 = dividend.
+// Literals: [head + 0x106] -> pointer to the matrix 3 x (x, y, z, t)... stored as 9 coefficients then 3 translations,
+// [head + 0x10A] = divisor bias. Per vertex: z = row 2 (coefficients 6..8) + t[11]; the division r13:r12 / (|z| + bias)
+// starts; x = row 0 + t[9], y = row 1 + t[10]; q = quotient; screen x = ((s16)hi(x * q)) * 2 + r11, screen y =
+// 27 - (s16)hi(y * q). Output: x, y, z longs, screen x, y words. Exits at head + 0x84 with T = 1 (dt r8).
+static const RstvCodeSig rstv_vf_vtx_sig = { 66, 0xd3b5947du, -1, -1 };
+int DynarecSh2::RstvHleVfVtx(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 sr = GET_SR();
+  if (sr & 2)
+    return 0; // S bit: saturating MAC, not handled
+  const u32 head = GET_PC();
+  const u32 n = R[8];
+  if (n == 0 || n > 4096)
+    return 0;
+  const u32 lit_m = (head + 2 + 4 + 0x100) & ~3u, lit_b = (head + 0x26 + 4 + 0xE0) & ~3u; // mov.l @(disp,pc) at head+2, head+0x26
+  if (!rstv_hw_in(lit_m, 4) || !rstv_hw_in(lit_b, 4))
+    return 0;
+  const u32 pm = rstv_hw_rd(lit_m), bias = rstv_hw_rd(lit_b);
+  if (!rstv_hw_in(pm, 4))
+    return 0;
+  const u32 m = rstv_hw_rd(pm);
+  u32 v = R[14], o = R[9];
+  if (!rstv_hw_in(m, 48) || !rstv_hw_in(v, 12 * n) || !rstv_hw_in(o, 16 * n))
+    return 0;
+  // the output must not overlap what the loop reads later (vertices, matrix): the SH-2 order is not reproduced
+  const u32 v0 = v & 0xFFFFF, o0 = o & 0xFFFFF, m0 = m & 0xFFFFF;
+  if ((o0 < v0 + 12 * n && v0 < o0 + 16 * n) || (o0 < m0 + 48 && m0 < o0 + 16 * n))
+    return 0;
+  s32 M[12];
+  for (int k = 0; k < 12; k++)
+    M[k] = (s32)rstv_hw_rd(m + 4 * k);
+  const u32 r11 = R[11], r12 = R[12], r13 = R[13];
+  Onchip_struct *oc = &ctx_->onchip;
+  u32 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0;
+  s64 mac = 0;
+#define VFXT(hi, lo) (((u32)(hi) << 16) | ((u32)(lo) >> 16))
+  for (u32 i = 0; i < n; i++) {
+    const s32 x0 = (s32)rstv_hw_rd(v), y0 = (s32)rstv_hw_rd(v + 4), z0 = (s32)rstv_hw_rd(v + 8);
+    mac = (s64)M[6] * x0 + (s64)M[7] * y0 + (s64)M[8] * z0;   // row 2
+    r7 = (u32)(mac >> 32);
+    r6 = VFXT(r7, (u32)mac) + (u32)M[11];
+    rstv_hw_wr(o + 8, r6);
+    if ((s32)r6 < 0)
+      r6 = (u32)-(s32)r6;
+    r6 += bias;
+    // DVSR = r6, DVDNTH = r13, DVDNTL = r12 (starts the 64/32 division)
+    {
+      const s64 dividend = (s64)(((u64)r13 << 32) | r12);
+      s64 q;
+      s32 rm;
+      if ((s32)r6 != 0 && !(dividend == (s64)0x8000000000000000ULL && (s32)r6 == -1) &&
+          (rstv_div64_ext(dividend, (s32)r6, &q, &rm), q == (s64)(s32)q)) {
+        oc->DVSR = r6;
+        oc->DVDNTL = oc->DVDNTUL = (u32)q;
+        oc->DVDNTH = oc->DVDNTUH = (u32)rm;
+      } else {
+        OnchipWriteLong(0x100, r6);
+        OnchipWriteLong(0x110, r13);
+        OnchipWriteLong(0x114, r12);
+      }
+    }
+    mac = (s64)M[0] * x0 + (s64)M[1] * y0 + (s64)M[2] * z0;   // row 0
+    r7 = (u32)(mac >> 32);
+    r4 = VFXT(r7, (u32)mac) + (u32)M[9];
+    mac = (s64)M[3] * x0 + (s64)M[4] * y0 + (s64)M[5] * z0;   // row 1
+    rstv_hw_wr(o, r4);
+    r7 = (u32)(mac >> 32);
+    r5 = VFXT(r7, (u32)mac) + (u32)M[10];
+    rstv_hw_wr(o + 4, r5);
+    const s32 q = (s32)oc->DVDNTUL;                             // mov.l @(0x1C, r10)
+    mac = (s64)(s32)r4 * q;
+    r2 = (u32)(mac >> 32);
+    r0 = ((u32)(s32)(s16)r2 << 1) + r11;
+    mac = (s64)(s32)r5 * q;
+    T2WriteWord(HighWram, (o + 12) & 0xFFFFF, (u16)r0);
+    r3 = (u32)(mac >> 32);
+    r1 = (u32)(s32)(s16)r3;
+    r0 = 27 - r1;
+    T2WriteWord(HighWram, (o + 14) & 0xFFFFF, (u16)r0);
+    o += 16;
+    v += 12;
+  }
+#undef VFXT
+  R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7;
+  R[8] = 0; R[9] = o; R[10] = 0xFFFFFF00; R[14] = v;
+  SET_MACH((u32)(mac >> 32)); SET_MACL((u32)mac);
+  SET_SR(sr | 1);
+  *cyc_out = 91 * n - 1; // 66 instructions, mac.l 3, dmuls.l 4, taken bf/s 2 (recompiler costs)
+  return 1;
+}
+
+// ADR-144: vfkids vertex loop 0602A912 (master and slave). At the loop head: r6 + 32 = matrix (rows of 3 longs and a
+// 16-bit offset, 16 bytes apart: X at +0, Y at +16, Z at +32), r14 = vertices (x, y, z longs), r12 = output (8 bytes a
+// vertex), r13 = count, r4 = 0x1000, r9 = scale table, r10 = ~7. Per vertex: z = hi(Z . v) + (s16)Z[3]; table entry
+// t = r9 + ((z >= r4 ? (z >> 2) + 2 r4 - (r4 >> 2) : z << 1) & r10); x, y the same with rows X, Y; out + 4 =
+// z << 16 | x & 0xFFFF; out = (lo(x * t[0]) >> 16) << 16 | lo(y * t[1]) >> 16. Exits at head + 0x76 (rts) with T = 1.
+static const RstvCodeSig rstv_vk_vtx_sig = { 59, 0x42959c9au, -1, -1 };
+int DynarecSh2::RstvHleVkVtx(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 sr = GET_SR();
+  if (sr & 2)
+    return 0; // S bit: saturating MAC
+  const u32 n = R[13];
+  if (n == 0 || n > 4096)
+    return 0;
+  const u32 m = R[6], r4 = R[4], r9 = R[9], r10 = R[10];
+  u32 v = R[14], o = R[12];
+  if (!rstv_hw_in(m, 48) || !rstv_hw_in(v, 12 * n) || !rstv_hw_in(o, 8 * n))
+    return 0;
+  const u32 v0 = v & 0xFFFFF, o0 = o & 0xFFFFF, m0 = m & 0xFFFFF;
+  if ((o0 < v0 + 12 * n && v0 < o0 + 8 * n) || (o0 < m0 + 48 && m0 < o0 + 8 * n))
+    return 0;
+  s32 MX[3], MY[3], MZ[3];
+  for (int k = 0; k < 3; k++) {
+    MX[k] = (s32)rstv_hw_rd(m + 4 * k);
+    MY[k] = (s32)rstv_hw_rd(m + 16 + 4 * k);
+    MZ[k] = (s32)rstv_hw_rd(m + 32 + 4 * k);
+  }
+  const s32 ox = (s16)T2ReadWord(HighWram, (m + 12) & 0xFFFFF), oy = (s16)T2ReadWord(HighWram, (m + 28) & 0xFFFFF),
+            oz = (s16)T2ReadWord(HighWram, (m + 44) & 0xFFFFF);
+  // the table entries every vertex reads must be in work RAM and away from the output (checked before any write)
+  for (u32 i = 0; i < n; i++) {
+    const u32 vi = v + 12 * i;
+    const s32 x0 = (s32)rstv_hw_rd(vi), y0 = (s32)rstv_hw_rd(vi + 4), z0 = (s32)rstv_hw_rd(vi + 8);
+    const u32 z = (u32)(((s64)MZ[0] * x0 + (s64)MZ[1] * y0 + (s64)MZ[2] * z0) >> 32) + (u32)oz;
+    const u32 t = r9 + ((((s32)z >= (s32)r4) ? (z >> 2) + 2 * r4 - (r4 >> 2) : z << 1) & r10);
+    if (!rstv_hw_in(t, 8))
+      return 0;
+    const u32 t0 = t & 0xFFFFF;
+    if (o0 < t0 + 8 && t0 < o0 + 8 * n)
+      return 0;
+  }
+  u32 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r5 = 0, r7 = 0, r11 = 0;
+  s64 mac = 0;
+  for (u32 i = 0; i < n; i++) {
+    const s32 x0 = (s32)rstv_hw_rd(v), y0 = (s32)rstv_hw_rd(v + 4), z0 = (s32)rstv_hw_rd(v + 8);
+    r11 = (u32)(((s64)MZ[0] * x0 + (s64)MZ[1] * y0 + (s64)MZ[2] * z0) >> 32) + (u32)oz;
+    r0 = r9 + ((((s32)r11 >= (s32)r4) ? (r11 >> 2) + 2 * r4 - (r4 >> 2) : r11 << 1) & r10);
+    r1 = (u32)(((s64)MX[0] * x0 + (s64)MX[1] * y0 + (s64)MX[2] * z0) >> 32) + (u32)ox;
+    mac = (s64)MY[0] * x0 + (s64)MY[1] * y0 + (s64)MY[2] * z0;
+    r5 = (r11 << 16) | (r1 & 0xFFFF);
+    rstv_hw_wr(o + 4, r5);
+    r7 = (u32)oy;
+    r2 = (u32)(mac >> 32) + r7;
+    r3 = rstv_hw_rd(r0);
+    mac = (s64)(s32)r1 * (s32)r3;
+    r1 = (u32)mac >> 16;
+    r3 = rstv_hw_rd(r0 + 4);
+    mac = (s64)(s32)r2 * (s32)r3;
+    r2 = (r1 << 16) | ((u32)mac >> 16);
+    rstv_hw_wr(o, r2);
+    o += 8;
+    v += 12;
+  }
+  R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[5] = r5; R[7] = r7; R[11] = r11; R[12] = o; R[13] = 0; R[14] = v;
+  SET_MACH((u32)(mac >> 32)); SET_MACL((u32)mac);
+  SET_SR(sr | 1);
+  *cyc_out = 80 * n;
+  return 1;
+}
+
+// ADR-168: fhboxers reads its models from cartridge ROM: read-only sources may be high work RAM or cart ROM
+static inline int rstv_ro_in(u32 a, u32 n)
+{
+  if (rstv_hw_in(a, n))
+    return 1;
+  const u32 b = a & 0x0FFFFFFF;
+  return (a >> 29) <= 1 && b >= 0x02000000 && b + n <= 0x04F00000 && rstv_cart_rom() != NULL;
+}
+static inline u32 rstv_ro_rd(u32 a)
+{
+  return (a & 0x0FF00000) == 0x06000000 ? rstv_hw_rd(a) : T1ReadLong(rstv_cart_rom(), (a & 0x0FFFFFFF) - 0x02000000);
+}
+static inline u16 rstv_ro_rdw(u32 a)
+{
+  return (a & 0x0FF00000) == 0x06000000 ? T2ReadWord(HighWram, a & 0xFFFFF) : T1ReadWord(rstv_cart_rom(), (a & 0x0FFFFFFF) - 0x02000000);
+}
+// a written high work RAM range [o, o + on) against a source: overlap only when the source is high work RAM too
+static inline int rstv_ro_overlap(u32 o, u32 on, u32 a, u32 n)
+{
+  if ((a & 0x0FF00000) != 0x06000000)
+    return 0;
+  const u32 o0 = o & 0xFFFFF, a0 = a & 0xFFFFF;
+  return o0 < a0 + n && a0 < o0 + on;
+}
+
+// ADR-168: fhboxers vertex routine 060EB284 (leaf, saves MAC and r8-r14 on the stack). r4 = count, r5 = vertices
+// (x, y, z longs, 12 bytes apart), r6 = offset (3 longs), r7 = output (32 bytes a vertex: 0, x, y, z), [sp] = object
+// with 3 rows at +0x18, 20 bytes apart (3 coefficients and a translation). mid(a * b) = bits 16..47 of the product
+// (dmuls.l, xtrct). x = sum mid(row0 * v) + t0 + off0, y = off1 - (sum mid(row1 * v) + t1), z = sum mid(row2 * v) +
+// t2 + off2. Ends with rts: r0 = output end, r1 r2 = row 2 [0] [1], r3 = off2, r4 = r7 = 0, r5 = vertices end, T = 1.
+static const RstvCodeSig rstv_fh_vtx_sig = { 106, 0x9a87350cu, -1, -1 };
+int DynarecSh2::RstvHleFhVtx(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 n = R[4];
+  if (n == 0 || n > 4096)
+    return 0;
+  const u32 sp = R[15];
+  if (!rstv_hw_in(sp - 36, 40))
+    return 0;
+  const u32 m = rstv_hw_rd(sp) + 0x18, v = R[5], off = R[6], o = R[7];
+  if (!rstv_ro_in(m, 56) || !rstv_ro_in(v, 12 * n) || !rstv_ro_in(off, 12) || !rstv_hw_in(o, 32 * n))
+    return 0;
+  // the output must not overlap anything the loop reads, nor the saved registers
+  if (rstv_ro_overlap(o, 32 * n, m, 56) || rstv_ro_overlap(o, 32 * n, v, 12 * n) || rstv_ro_overlap(o, 32 * n, off, 12) ||
+      rstv_ro_overlap(o, 32 * n, sp - 36, 40))
+    return 0;
+  s32 M[3][4];
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++)
+      M[r][c] = (s32)rstv_ro_rd(m + 20 * r + 4 * c);
+  const u32 f0 = rstv_ro_rd(off), f1 = rstv_ro_rd(off + 4), f2 = rstv_ro_rd(off + 8);
+  // the pushes (the values stay below the stack pointer)
+  rstv_hw_wr(sp - 4, GET_MACH());
+  rstv_hw_wr(sp - 8, GET_MACL());
+  for (int k = 0; k < 7; k++)
+    rstv_hw_wr(sp - 12 - 4 * k, R[14 - k]);
+#define FH_MID(a, b) ((u32)(((s64)(a) * (s32)(b)) >> 16))
+  u32 vi = v, oi = o;
+  for (u32 i = 0; i < n; i++, vi += 12, oi += 32) {
+    const s32 x = (s32)rstv_ro_rd(vi), y = (s32)rstv_ro_rd(vi + 4), z = (s32)rstv_ro_rd(vi + 8);
+    const u32 px = FH_MID(M[0][0], x) + FH_MID(M[0][1], y) + FH_MID(M[0][2], z) + (u32)M[0][3] + f0;
+    const u32 py = f1 - (FH_MID(M[1][0], x) + FH_MID(M[1][1], y) + FH_MID(M[1][2], z) + (u32)M[1][3]);
+    const u32 pz = FH_MID(M[2][0], x) + FH_MID(M[2][1], y) + FH_MID(M[2][2], z) + (u32)M[2][3] + f2;
+    rstv_hw_wr(oi + 4, px);
+    rstv_hw_wr(oi + 8, py);
+    rstv_hw_wr(oi + 12, pz);
+    rstv_hw_wr(oi, 0);
+  }
+#undef FH_MID
+  R[0] = oi; R[1] = (u32)M[2][0]; R[2] = (u32)M[2][1]; R[3] = f2; R[4] = 0; R[5] = vi; R[7] = 0;
+  SET_SR(GET_SR() | 1);
+  *cyc_out = 27 + 101 * n; // 13 + 82 n + 11 instructions, dmuls.l 4, sts.l mac 2, taken bf/s and rts 2
+  return 1;
+}
+
+// ADR-168: fhboxers rows routine 060EABC4 (and its copy 060EAC3C; leaf, saves MAC and r8-r14). r4 = output base
+// (vertex i at r4 + 0xC0 + 0x130 i), r5 = count, r6 = matrix (3 rows at +0x18, 20 bytes apart), r7 = vectors (3 longs,
+// 12 bytes apart). Per row: clrmac, three mac.l, then bits 16..47 of the 64-bit sum (xtrct); out = x, -y, z.
+// Ends with rts: r0 = 0, r1 = MACH of the last row, r4 = output end, r5 = 0, r7 = vectors end, T = 1.
+static const RstvCodeSig rstv_fh_row_sig = { 59, 0x7eab5d4cu, -1, -1 };
+// ADR-183: fhboxers slave sound driver channel loop 0600BAE0..0600BC1B (blocks, the rest of the loop, its literals)
+static const RstvCodeSig rstv_fh_snd_sig = { 158, 0xe8fee171u, -1, -1 };
+// ADR-187: fhboxers sprite decoder 0604D8D4 (whole routine, 59 words)
+static const RstvCodeSig rstv_fh_rle_sig = { 59, 0xbbac74f3u, -1, -1 };
+// ADR-188: fhboxers byte memmove 0604BCF8 (36 words) and byte memset 0604BD40 (13 words)
+static const RstvCodeSig rstv_fh_move_sig = { 36, 0xac861708u, -1, -1 };
+static const RstvCodeSig rstv_fh_set_sig = { 13, 0x07d75e63u, -1, -1 };
+static inline u32 rstv_hw_wait(u32 a) { return (a & 0x20000000) ? 2 : 0; } // cache-through high work RAM
+// One pass of the decoder: r4 = destination (VDP1 RAM), r5 = source (cart ROM or work RAM), r6 = added to the
+// destination after every 16 bytes of output. Words: negative = one pixel written twice; else a run: low byte = count,
+// high byte = index of the first table word (table = the source start), each written twice. Ends when 128 or more
+// pixel pairs are out. dry: only checks (reads in range, destinations in VDP1 RAM, no zero count). Returns 0 if not
+// possible; else the final registers and cycles (instruction cycles as the recompiler counts them + memory waits).
+struct RstvFhRle { u32 r0, r1, r2, r3, r4, r5, cyc, lo, hi; };
+static int rstv_fh_rle(u32 r4, u32 r5, u32 r6, u32 r1, u32 r2, u32 r3, int dry, RstvFhRle *o)
+{
+  const u32 r11 = r5;
+  u32 r0 = 0, r13 = 0, r14 = 0, cyc = 13, lo = 0xFFFFFFFFu, hi = 0;
+  int n = 0;
+  auto rd = [&](u32 a, u32 *v) -> int {
+    if (!rstv_ro_in(a, 2) || (a & 1))
+      return 0;
+    *v = (u32)(s32)(s16)rstv_ro_rdw(a);
+    cyc += (a & 0x0FF00000) == 0x06000000 ? ((a & 0x20000000) ? 2 : 0) : 24;
+    return 1;
+  };
+  auto wr = [&](u32 a, u32 v) -> int {
+    if ((a & 0x0FF80000) != 0x05C00000 || (a >> 29) > 1 || (a & 1))
+      return 0;
+    const u32 x = a & 0x7FFFF;
+    if (!dry)
+      T1WriteWord(Vdp1Ram, x, (u16)v);
+    if (x < lo) lo = x;
+    if (x > hi) hi = x;
+    cyc += 2;
+    return 1;
+  };
+  for (;;) {
+    if (++n > 4096 || !rd(r5, &r0))
+      return 0;
+    r5 += 2;
+    cyc += 5; // mov.w @r5+, cmp/pz, bt
+    if ((s32)r0 < 0) {
+      if (!wr(r4, r0) || !wr(r4 + 2, r0))
+        return 0;
+      r14++;
+      r13 += 2;
+      cyc += 4; // mov.w, add, mov.w, cmp/gt
+      if (!(0x80 > (s32)r14)) { cyc += 3; break; } // bf/s taken + add r13
+      cyc += 2 + 1; // bf/s not taken + add r13, cmp/eq
+      r4 += 4;
+      if (r13 != 16) { cyc += 3; continue; } // bf/s taken + add r4
+      cyc += 2 + 1 + 3; // bf/s not taken + add r4, mov, bra + add r6
+      r13 = 0;
+      r4 += r6;
+      continue;
+    }
+    r1 = r0;
+    r0 = (r1 >> 8) & 0xFF;
+    r0 += r0;
+    r1 &= 0xFF;
+    r14 += r1;
+    r3 = r1;
+    cyc += 7;
+    if (!r3)
+      return 0; // dt would wrap
+    do {
+      if (!rd(r0 + r11, &r2) || !wr(r4, r2) || !wr(r4 + 2, r2))
+        return 0;
+      r4 += 2;
+      r13 += 2;
+      cyc += 6; // mov.w @(r0, r11), mov.w, add, mov.w, add, cmp/eq
+      r4 += 2;
+      if (r13 != 16)
+        cyc += 3; // bf/s taken + add r4
+      else {
+        cyc += 2 + 2; // bf/s not taken + add r4, add r6, mov
+        r4 += r6;
+        r13 = 0;
+      }
+      r3--;
+      r0 += 2;
+      cyc += 1 + (r3 ? 3 : 2); // dt, bf/s + add r0
+      if (++n > 4096)
+        return 0;
+    } while (r3);
+    cyc += 4; // cmp/gt, bt
+    if (!(0x80 > (s32)r14))
+      break;
+  }
+  cyc += 10; // mov r5, r0, pops, rts
+  o->r0 = r5; o->r1 = r1; o->r2 = r2; o->r3 = r3; o->r4 = r4; o->r5 = r5; o->cyc = cyc; o->lo = lo; o->hi = hi;
+  return 1;
+}
+int DynarecSh2::RstvHleFhRow(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  if (GET_SR() & 2)
+    return 0; // S bit: saturating mac.l
+  const u32 n = R[5];
+  if (n == 0 || n > 4096)
+    return 0;
+  const u32 sp = R[15], m = R[6] + 0x18, v = R[7], o = R[4] + 0xC0;
+  if (!rstv_hw_in(sp - 36, 36) || !rstv_ro_in(m, 52) || !rstv_ro_in(v, 12 * n) || !rstv_hw_in(o, 0x130 * (n - 1) + 12))
+    return 0;
+  // outputs (12 bytes at a 0x130 stride) must not touch the matrix, the vectors or the saved registers
+  for (u32 i = 0; i < n; i++) {
+    const u32 a = o + 0x130 * i;
+    if (rstv_ro_overlap(a, 12, m, 52) || rstv_ro_overlap(a, 12, v, 12 * n) || rstv_ro_overlap(a, 12, sp - 36, 36))
+      return 0;
+  }
+  s32 M[3][3];
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++)
+      M[r][c] = (s32)rstv_ro_rd(m + 20 * r + 4 * c);
+  rstv_hw_wr(sp - 4, GET_MACH());
+  rstv_hw_wr(sp - 8, GET_MACL());
+  for (int k = 0; k < 7; k++)
+    rstv_hw_wr(sp - 12 - 4 * k, R[14 - k]);
+  u32 vi = v, oi = o;
+  s64 mac = 0;
+  for (u32 i = 0; i < n; i++, vi += 12, oi += 0x130) {
+    const s32 x = (s32)rstv_ro_rd(vi), y = (s32)rstv_ro_rd(vi + 4), z = (s32)rstv_ro_rd(vi + 8);
+    u32 p[3];
+    for (int r = 0; r < 3; r++) {
+      mac = (s64)M[r][0] * x + (s64)M[r][1] * y + (s64)M[r][2] * z;
+      p[r] = (u32)(mac >> 16);
+    }
+    rstv_hw_wr(oi, p[0]);
+    rstv_hw_wr(oi + 4, 0u - p[1]);
+    rstv_hw_wr(oi + 8, p[2]);
+  }
+  R[0] = 0; R[1] = (u32)(mac >> 32); R[4] = oi - 0xC0; R[5] = 0; R[7] = vi;
+  SET_SR(GET_SR() | 1);
+  *cyc_out = 22 + 58 * n; // 9 + 39 n + 10 instructions, mac.l 3, sts.l mac 2, taken bf/s and rts 2
+  return 1;
+}
+
+// ADR-168: fhboxers face routine 060EACB4 (and its copy 060EADE0; leaf, saves MAC and r8-r14). r4 = face record,
+// r5 = 4 vertex indices (s16, r5 += 8), r6 = vertex table (32 bytes an entry, x y z at +4), r7 = eye (x y z at +4),
+// [sp] = normal (3 longs), [sp + 4] = flag. The indices go to record + 0x64 as words. Flag <= 0: d = sum mid(
+// (v0 - eye) * normal) (dmuls.l, xtrct per term); d >= 0 -> returns 1 (back face). Else r0 = d (or -1 when flag > 0):
+// record + 0xAC = the 4 entry pointers, + 0x18 / 0x2C / 0x40 = the x / y / z of the 4 vertices, + 0xBC = sum of z,
+// + 0x58 = normal; returns r0.
+static const RstvCodeSig rstv_fh_face_sig = { 150, 0x0e8798b6u, -1, -1 };
+int DynarecSh2::RstvHleFhFace(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 sp = R[15], r4 = R[4], r5 = R[5], r6 = R[6], r7 = R[7];
+  if (!rstv_hw_in(sp - 36, 44) || !rstv_ro_in(r5, 8) || !rstv_hw_in(r4 + 0x18, 0xAC) || !rstv_ro_in(r7 + 4, 12))
+    return 0;
+  const u32 nrm = rstv_hw_rd(sp), flag = rstv_hw_rd(sp + 4);
+  if (!rstv_ro_in(nrm, 12))
+    return 0;
+  s32 w[4];
+  u32 ent[4];
+  for (int k = 0; k < 4; k++) {
+    w[k] = (s16)rstv_ro_rdw(r5 + 2 * k);
+    ent[k] = r6 + ((u32)w[k] << 5);
+    if (!rstv_ro_in(ent[k] + 4, 12))
+      return 0;
+  }
+  // reads and writes below run in the routine's order (the normal is usually inside the record it overwrites)
+  rstv_hw_wr(sp - 4, GET_MACH());
+  rstv_hw_wr(sp - 8, GET_MACL());
+  for (int k = 0; k < 7; k++)
+    rstv_hw_wr(sp - 12 - 4 * k, R[14 - k]);
+  for (int k = 3; k >= 0; k--)
+    T2WriteWord(HighWram, (r4 + 0x64 + 2 * k) & 0xFFFFF, (u16)w[k]);
+  u32 res = 0xFFFFFFFFu, cyc;
+  if ((s32)flag <= 0) {
+    const s32 dx = (s32)(rstv_ro_rd(ent[0] + 4) - rstv_ro_rd(r7 + 4)), dy = (s32)(rstv_ro_rd(ent[0] + 8) - rstv_ro_rd(r7 + 8)),
+              dz = (s32)(rstv_ro_rd(ent[0] + 12) - rstv_ro_rd(r7 + 12));
+#define FH_MID(a, b) ((u32)(((s64)(a) * (s32)(b)) >> 16))
+    res = FH_MID(dx, rstv_ro_rd(nrm)) + FH_MID(dy, rstv_ro_rd(nrm + 4)) + FH_MID(dz, rstv_ro_rd(nrm + 8));
+#undef FH_MID
+    if ((s32)res >= 0) {
+      R[0] = 1; R[1] = (u32)w[1]; R[2] = (u32)w[2]; R[3] = (u32)w[3]; R[4] = r4 + 0x64; R[5] = r5 + 8;
+      SET_SR(GET_SR() | 1);
+      *cyc_out = 85;
+      return 1;
+    }
+    cyc = 148;
+  } else
+    cyc = 116;
+  for (int k = 0; k < 4; k++)
+    rstv_hw_wr(r4 + 0xAC + 4 * k, ent[k]);
+  u32 zs = 0;
+  for (int k = 0; k < 4; k++) {
+    const u32 p = ent[k] + 4, x = rstv_ro_rd(p), y = rstv_ro_rd(p + 4), z = rstv_ro_rd(p + 8);
+    rstv_hw_wr(r4 + 0x18 + 4 * k, x);
+    rstv_hw_wr(r4 + 0x2C + 4 * k, y);
+    rstv_hw_wr(r4 + 0x40 + 4 * k, z);
+    zs += z;
+  }
+  rstv_hw_wr(r4 + 0xBC, zs);
+  const u32 n0 = rstv_ro_rd(nrm), n1 = rstv_ro_rd(nrm + 4), n2 = rstv_ro_rd(nrm + 8);
+  rstv_hw_wr(r4 + 0x58, n0);
+  rstv_hw_wr(r4 + 0x5C, n1);
+  rstv_hw_wr(r4 + 0x60, n2);
+  R[0] = res; R[1] = n1; R[2] = n2; R[3] = (u32)w[3] << 5; R[4] = r4 + 0x58; R[5] = r5 + 8;
+  // T from the last shll (index 3 shifted by 4 -> bit 31 = the sign of the s16 index)
+  SET_SR((GET_SR() & ~1u) | (w[3] < 0 ? 1u : 0u));
+  *cyc_out = cyc;
+  return 1;
+}
+
+// ADR-174: fhboxers projection 060EB4A4 (b = 0) / 060EB500 (b = 1), leaf: pushes MACH / MACL, starts the on-chip
+// division DVDNTH:DVDNTL = 1:0 by DVSR = [r4 + 0x28], x' = mid([r4] * [r5]), y' = mid([r4 + 0x14] * [r5 + 4]), reads the
+// quotient q, [r6].w = (mid(q * x') >> 16) + [r7], [r6 + 2].w = (... y') + [r7 + 4], pops MAC, rts. The copy at
+// 060EB500 builds the second result from r0 = 0xFFFFFF00 (xtrct r1,r0), as the game does; final registers differ too.
+// r6 is usually in VDP1 VRAM (the command table): the two words go through the mapped writes.
+static const RstvCodeSig rstv_fh_proj_sig[2] = { { 41, 0x5d1977d2u, -1, -1 }, { 41, 0x3434226du, -1, -1 } };
+int DynarecSh2::RstvHleFhProj(int b, u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 sp = R[15], a = R[4], v = R[5], o = R[6], t = R[7];
+  const u32 lit = b ? 0x060EB554u : 0x060EB4F8u; // DVDNTH, DVDNTL literals
+  if (!rstv_hw_in(sp - 8, 8) || !rstv_ro_in(a, 0x2C) || !rstv_ro_in(v, 8) || !rstv_ro_in(t, 8) || (o & 1) ||
+      (!rstv_hw_in(o, 4) && ((o & 0x0FF80000) != 0x05C00000 || (o >> 29) > 1)))
+    return 0;
+  if (rstv_hw_rd(0x060EB7D0) != 0xFFFFFF00u)
+    return 0;
+  // the pushed MAC words must not be read back as inputs
+  if (rstv_ro_overlap(sp - 8, 8, a, 0x2C) || rstv_ro_overlap(sp - 8, 8, v, 8) || rstv_ro_overlap(sp - 8, 8, t, 8))
+    return 0;
+  const u32 mach = GET_MACH(), macl = GET_MACL();
+  rstv_hw_wr(sp - 4, mach);
+  rstv_hw_wr(sp - 8, macl);
+  OnchipWriteLong(0x100, rstv_ro_rd(a + 0x28));
+  OnchipWriteLong(0x110, rstv_hw_rd(lit));
+  OnchipWriteLong(0x114, rstv_hw_rd(lit + 4));
+  const s64 p0 = (s64)(s32)rstv_ro_rd(v) * (s32)rstv_ro_rd(a);
+  const u32 x = (u32)((u64)p0 >> 16);                   // xtrct: mach low 16 : macl high 16
+  const s64 p1 = (s64)(s32)rstv_ro_rd(v + 4) * (s32)rstv_ro_rd(a + 0x14);
+  const u32 y = (u32)((u64)p1 >> 16);
+  const u32 q = ctx_->onchip.DVDNTL;                    // mov.l @(0x14,r0)
+  const s64 p2 = (s64)(s32)q * (s32)x;
+  const u32 r3m = (u32)((u64)p2 >> 16);
+  const s64 p3 = (s64)(s32)q * (s32)y;
+  u32 r0, r4;
+  if (!b) {
+    r0 = (u32)((u64)p3 >> 16);
+    r4 = (u32)((u64)p3 >> 32);                          // mach
+  } else {
+    r0 = ((u32)((u64)p3 >> 32) << 16) | (0xFFFFFF00u >> 16);
+    r4 = (u32)p3;                                       // macl
+  }
+  const u32 r1 = rstv_ro_rd(t), r2 = rstv_ro_rd(t + 4);
+  const u32 r3 = (r3m >> 16) + r1;
+  r0 = (r0 >> 16) + r2;
+  u32 c = 0;
+  MappedMemoryWriteWord(o, (u16)r3, &c);
+  MappedMemoryWriteWord(o + 2, (u16)r0, &c);
+  R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4;
+  SET_MACH(mach); SET_MACL(macl);
+  *cyc_out = 52;
+  return 1;
+}
+
+// ADR-172: vfkids polygon sort, inner pass 0605B3D4 .. 0605B426 (slave). r8 = list (node: key word at +0x1E, low byte
+// used; next at +0x20), r12 = bucket table (256 longs), r10 = the outer table entry, r11 = output (pointer at +8, 12
+// bytes apart). Each node goes to the head of bucket key (r7 = max key * 4, r6 = min), [r10] = 0, then the buckets from
+// max down to min are emitted (each list in order) and cleared. Reads and writes run in the code's order; every node,
+// the table and the output are checked to be in high work RAM, apart from each other, before the first write.
+static const RstvCodeSig rstv_vk_sort_sig = { 42, 0xa0342581u, -1, -1 };
+int DynarecSh2::RstvHleVkSort(u32 *cyc_out)
+{
+  u32 *R = GetGenRegPtr();
+  const u32 head = R[8], r10 = R[10], r11 = R[11], r12 = R[12];
+  if (head == 0 || !rstv_hw_in(r12, 0x400) || !rstv_hw_in(r10, 4))
+    return 0;
+  // pre-pass (read only): the list, its length
+  static u32 nodes[4096];
+  u32 n = 0;
+  for (u32 p = head; p; ) {
+    if (n == 4096 || !rstv_hw_in(p + 0x1E, 6))
+      return 0;
+    nodes[n++] = p;
+    p = rstv_hw_rd(p + 0x20);
+  }
+  if (!rstv_hw_in(r11 + 8, 12 * n))
+    return 0;
+  // the buckets the pass uses must start empty (else the emitted lists would reach nodes not checked here)
+  u32 kmin = 255, kmax = 0;
+  for (u32 i = 0; i < n; i++) {
+    const u32 k = T2ReadWord(HighWram, (nodes[i] + 0x1E) & 0xFFFFF) & 0xFF;
+    if (k < kmin) kmin = k;
+    if (k > kmax) kmax = k;
+  }
+  for (u32 k = kmin; k <= kmax; k++)
+    if (rstv_hw_rd(r12 + 4 * k))
+      return 0;
+  const u32 t0 = r12 & 0xFFFFF, o0 = (r11 + 8) & 0xFFFFF, o1 = o0 + 12 * n, q0 = r10 & 0xFFFFF;
+  if ((o0 < t0 + 0x400 && t0 < o1) || (q0 < t0 + 0x400 && t0 < q0 + 4) || (q0 < o1 && o0 < q0 + 4))
+    return 0;
+  for (u32 i = 0; i < n; i++) {
+    const u32 a = (nodes[i] + 0x1E) & 0xFFFFF;
+    if ((a < t0 + 0x400 && t0 < a + 6) || (a < o1 && o0 < a + 6) || (a < q0 + 4 && q0 < a + 6))
+      return 0;
+  }
+  u32 r0 = 0, r1 = 0, r2 = 0, r6 = 0xFFFFFFFFu, r7 = 0, r8 = head, cyc = 2;
+  do {
+    r0 = (u32)(T2ReadWord(HighWram, (r8 + 0x1E) & 0xFFFFF) & 0xFF) << 2;
+    r2 = rstv_hw_rd(r8 + 0x20);
+    r1 = rstv_hw_rd(r12 + r0);
+    if (!(r7 >= r0))
+      r7 = r0;
+    rstv_hw_wr(r8 + 0x20, r1);
+    if (r6 > r0)
+      r6 = r0;
+    rstv_hw_wr(r12 + r0, r8);
+    r8 = r2;
+    cyc += 17;
+  } while (r2 != 0);
+  rstv_hw_wr(r10, r2);
+  r8 = r12 + r7;
+  r7 = ((r7 - r6) >> 2) + 1;
+  u32 o = r11;
+  cyc += 6;
+  for (;;) {
+    r6 = rstv_hw_rd(r8);
+    if (r6 != 0) {
+      r7--;
+      do {
+        rstv_hw_wr(o + 8, r6);
+        r6 = rstv_hw_rd(r6 + 0x20);
+        o += 12;
+        cyc += 6;
+      } while (r6 != 0);
+      rstv_hw_wr(r8, r6);
+      const int more = r7 != 0;
+      r8 -= 4;
+      cyc += 6;
+      if (more)
+        continue;
+      break;
+    }
+    r7--;
+    const int more = r7 != 0;
+    r8 -= 4;
+    cyc += 7;
+    if (!more) {
+      cyc += 2;
+      break;
+    }
+  }
+  R[0] = r0; R[1] = r1; R[2] = r2; R[6] = r6; R[7] = r7; R[8] = r8; R[11] = o;
+  SET_SR(GET_SR() | 1);
   *cyc_out = cyc;
   return 1;
 }
@@ -4008,10 +5036,14 @@ int DynarecSh2::RstvHleSglSpr(u32 *cyc_out, u32 *npc)
 
 int DynarecSh2::RstvHleCheck(int kind)
 {
-  static u8 *hw0, *lw0, *hw1, *lw1;
+#if defined(RSTV)
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
+  static u8 *hw0, *lw0, *hw1, *lw1, *v0, *v1; // ADR-187: VDP1 RAM too
   static unsigned nchk, nbad;
   if (!hw0) {
     hw0 = (u8 *)malloc(0x100000); lw0 = (u8 *)malloc(0x100000); hw1 = (u8 *)malloc(0x100000); lw1 = (u8 *)malloc(0x100000);
+    v0 = (u8 *)malloc(0x80000); v1 = (u8 *)malloc(0x80000);
     if (opcodes[0x0009] == NULL)
       SH2Interpreter.Init();
   }
@@ -4020,7 +5052,7 @@ int DynarecSh2::RstvHleCheck(int kind)
   memcpy(r0, R, sizeof(r0));
   c0[0] = GET_SR(); c0[1] = GET_GBR(); c0[2] = GET_VBR(); c0[3] = GET_MACH(); c0[4] = GET_MACL(); c0[5] = GET_PR(); c0[6] = GET_PC();
   c0[7] = m_pDynaSh2->SysReg[4];
-  memcpy(hw0, HighWram, 0x100000); memcpy(lw0, LowWram, 0x100000);
+  memcpy(hw0, HighWram, 0x100000); memcpy(lw0, LowWram, 0x100000); memcpy(v0, Vdp1Ram, 0x80000);
   SH2_struct *sh = ctx_;
   const Onchip_struct oc0 = sh->onchip;
   if (!RstvHle(kind))
@@ -4029,10 +5061,10 @@ int DynarecSh2::RstvHleCheck(int kind)
   memcpy(r1, R, sizeof(r1));
   c1[0] = GET_SR(); c1[3] = GET_MACH(); c1[4] = GET_MACL(); c1[5] = GET_PR(); c1[6] = GET_PC();
   const u32 cyc1 = m_pDynaSh2->SysReg[4];
-  memcpy(hw1, HighWram, 0x100000); memcpy(lw1, LowWram, 0x100000);
+  memcpy(hw1, HighWram, 0x100000); memcpy(lw1, LowWram, 0x100000); memcpy(v1, Vdp1Ram, 0x80000);
   const Onchip_struct oc1 = sh->onchip;
   // back to the start, run the interpreter to the same exit
-  memcpy(HighWram, hw0, 0x100000); memcpy(LowWram, lw0, 0x100000);
+  memcpy(HighWram, hw0, 0x100000); memcpy(LowWram, lw0, 0x100000); memcpy(Vdp1Ram, v0, 0x80000);
   sh->onchip = oc0;
   SH2_struct *saved_cur = CurrentSH2;
   const sh2regs_struct saved_regs = sh->regs;
@@ -4066,11 +5098,13 @@ int DynarecSh2::RstvHleCheck(int kind)
     if (memcmp(HighWram + a, hw1 + a, 4)) { bad = 1; mn += snprintf(msg + mn, sizeof(msg) - mn, " H%05x %08x/%08x", a, T2ReadLong(HighWram, a), T2ReadLong(hw1, a)); }
   for (u32 a = 0; a < 0x100000 && mn < 400; a += 4)
     if (memcmp(LowWram + a, lw1 + a, 4)) { bad = 1; mn += snprintf(msg + mn, sizeof(msg) - mn, " L%05x", a); }
+  for (u32 a = 0; a < 0x80000 && mn < 400; a += 4)
+    if (memcmp(Vdp1Ram + a, v1 + a, 4)) { bad = 1; mn += snprintf(msg + mn, sizeof(msg) - mn, " V%05x", a); }
   if (bad) {
     nbad++;
     if (nbad <= 20)
       printf("hlechk BAD f%d k%d pc %08x steps %d:%s\n", (int)yabsys.frame_count, kind, c0[6], steps, msg);
-  } else if ((nchk & 1023) == 1)
+  } else if ((nchk & 63) == 1)
     printf("hlechk ok %u (bad %u) f%d k%d steps %d\n", nchk, nbad, (int)yabsys.frame_count, kind, steps);
   // continue from the interpreter's result
   memcpy(R, sh->regs.R, sizeof(r0));
@@ -4084,6 +5118,9 @@ int DynarecSh2::RstvHleCheck(int kind)
 
 int DynarecSh2::RstvHle(int kind)
 {
+#if defined(RSTV)
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
   if (!rstv_hle_on)
     return 0;
 #if !defined(__vita__)
@@ -4095,7 +5132,7 @@ int DynarecSh2::RstvHle(int kind)
       mask = e ? (int)strtol(e, NULL, 0) : -1;
       log = getenv("RSTV_HLELOG") != NULL;
     }
-    if (!((mask >> kind) & 1))
+    if (kind < 32 && !(((unsigned)mask >> kind) & 1))
       return 0;
     if (log)
       printf("hle f%d k%d pc %08x r4 %08x r5 %08x r6 %08x r7 %08x pr %08x\n", (int)yabsys.frame_count, kind, GET_PC(),
@@ -4106,10 +5143,28 @@ int DynarecSh2::RstvHle(int kind)
   if (kind == RSTV_HLE_SGLPOLY) {
     // ADR-100: sanjeon / sasissu 0607284E, twcup98 slave 06063332 (the same module moved)
     // ADR-101: twcup98 master 0605C04E (another build of the loop, its colour stage in the slave module)
-    static unsigned g0[2], g1[2], g2[2], gm[5], gn[2];
+    // ADR-141: the module elsewhere in other SGL games (elandore, znpwfv, ffreveng): the offset follows from the hook PC
+    static unsigned g0[8], g1[8], g2[8], gm[5], gn[8];
+    static u32 dyn_pc[6];
+    static int ndyn;
     const int pm = pc == 0x0605C04E;
-    const int pi = (pc == 0x06063332 || pm) ? 1 : 0;
-    rstv_poly_d = pi ? 0x06063332u - 0x0607284Eu : 0;
+    int pi;
+    if (pc == 0x0607284E)
+      pi = 0;
+    else if (pc == 0x06063332 || pm)
+      pi = 1;
+    else {
+      int k = 0;
+      while (k < ndyn && dyn_pc[k] != pc)
+        k++;
+      if (k == ndyn) {
+        if (ndyn == 6)
+          return 0;
+        dyn_pc[ndyn++] = pc;
+      }
+      pi = 2 + k;
+    }
+    rstv_poly_d = pm ? 0x06063332u - 0x0607284Eu : pc - 0x0607284Eu;
     rstv_poly_m = pm;
     if (pm ? (!rstv_hle_checked(&gm[0], 0x0605C04E, &rstv_polym_main_sig) ||
               !rstv_hle_checked(&gm[1], 0x0605C14C, &rstv_polym_table_sig) ||
@@ -4117,7 +5172,7 @@ int DynarecSh2::RstvHle(int kind)
               !rstv_hle_checked(&gm[3], 0x0605C94C, &rstv_polym_shade_sig) ||
               !rstv_hle_checked(&gm[4], 0x0605CF5C, &rstv_polym_near_sig) || !rstv_hle_checked(&gn[1], RSTV_PA(0x06072A0C), &rstv_poly_near_sig) ||
               !rstv_hle_checked(&g2[1], RSTV_PA(0x06073394), &rstv_poly_stage_sig)) :
-        ((pc != 0x0607284E && pc != 0x06063332) || !rstv_hle_checked(&g0[pi], RSTV_PA(0x0607284E), &rstv_poly_main_sig) ||
+        (!rstv_hle_checked(&g0[pi], RSTV_PA(0x0607284E), &rstv_poly_main_sig) ||
         !rstv_hle_checked(&g1[pi], RSTV_PA(0x06072924), &rstv_poly_sort_sig) ||
         !rstv_hle_checked(&g2[pi], RSTV_PA(0x06073394), &rstv_poly_stage_sig) ||
         !rstv_hle_checked(&gn[pi], RSTV_PA(0x06072A0C), &rstv_poly_near_sig))) {
@@ -4174,6 +5229,321 @@ int DynarecSh2::RstvHle(int kind)
     rstv_hle_runs++;
     return 1;
   }
+  if (kind == RSTV_HLE_VFVTX) {
+    static unsigned gv[2];
+    const int si = pc == 0x06024CA2;
+    if ((pc != 0x060247F2 && !si) || !rstv_hle_checked(&gv[si], pc, &rstv_vf_vtx_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleVfVtx(&cyc))
+      return 0;
+    SET_PC(pc + 0x84);
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_VKVTX) {
+    static unsigned gk;
+    if (pc != 0x0602A912 || !rstv_hle_checked(&gk, pc, &rstv_vk_vtx_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleVkVtx(&cyc))
+      return 0;
+    SET_PC(pc + 0x76);
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHVTX) {
+    static unsigned gf;
+    if (pc != 0x060EB284 || !rstv_hle_checked(&gf, pc, &rstv_fh_vtx_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleFhVtx(&cyc))
+      return 0;
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHROW) {
+    static unsigned gr[2];
+    const int c = pc == 0x060EAC3C;
+    if ((pc != 0x060EABC4 && !c) || !rstv_hle_checked(&gr[c], pc, &rstv_fh_row_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleFhRow(&cyc))
+      return 0;
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHFACE) {
+    static unsigned gfc[2];
+    const int c = pc == 0x060EADE0;
+    if ((pc != 0x060EACB4 && !c) || !rstv_hle_checked(&gfc[c], pc, &rstv_fh_face_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleFhFace(&cyc))
+      return 0;
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHPROJ) {
+    static unsigned gp[2];
+    const int b = pc == 0x060EB500;
+    if ((pc != 0x060EB4A4 && !b) || !rstv_hle_checked(&gp[b], pc, &rstv_fh_proj_sig[b]))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleFhProj(b, &cyc))
+      return 0;
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHSND) {
+    // ADR-183: fhboxers' slave sound driver 0600BA98 walks its 32 channels hundreds of times a frame (the tempo counts
+    // the walks). Per channel: block 0600BAE0 tests the flag byte [r10 + r13 + r12] (set: a call, left to the SH-2
+    // code); block 0600BB0A tests the state byte [r14]: >= 0 idle, else the tempo step: [r14 + 1E] += [r14 + 1C] (u16),
+    // and only a sum >= 0EBA goes on to the channel code (left to the SH-2 code); block 0600BBB8 selects the next
+    // channel's slot monitor (w [r8] = ch << 11), steps r13, r14 and dt r9. Those blocks run here with the cycles the
+    // recompiler charges (bt 3 either way; bf/s taken 2 with its delay slot, not taken 1 with the slot left to the next
+    // block), stopping where the chained code would (slice end after a block). Only the last monitor select is
+    // written: the register has no other effect.
+    static unsigned gs;
+    static int ca = 11, cb = 7, ct = 26, cc = 20, cx = 18;
+#if !defined(__vita__)
+    static int env = 0;
+    if (!env) {
+      env = 1;
+      if (getenv("RSTV_FHSNDCYC")) sscanf(getenv("RSTV_FHSNDCYC"), "%d,%d,%d,%d,%d", &ca, &cb, &ct, &cc, &cx);
+    }
+#endif
+    if (pc != 0x0600BAE0 || !rstv_hle_checked(&gs, pc, &rstv_fh_snd_sig))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    if (R[8] != 0x25B00408 || R[9] == 0 || R[13] > 31)
+      return 0;
+    const u32 lit = 0x060905C0; // literal at 0600BC18 (inside the signature)
+    const u32 c0 = m_pDynaSh2->SysReg[4], ex = m_pDynaSh2->exitcount;
+    u32 cnt = c0, r0 = R[0], r2 = R[2], r3 = R[3], r9 = R[9], r13 = R[13], r14 = R[14], T = GET_SR() & 1, stop = 0x0600BAE0;
+    int sel = 0;
+    for (;;) {
+      if (cnt != c0 && cnt >= ex)
+        break;
+      const u32 fa = R[10] + r13 + R[12];
+      if ((fa & 0xDFF00000) != 0x06000000 || (r14 & 0xDFF00000) != 0x06000000 || (r14 & 0xFFFFF) > 0xFFFE0)
+        break;
+      if (T2ReadByte(HighWram, fa & 0xFFFFF))
+        break; // flag set: the SH-2 code
+      const s32 b = (s8)T2ReadByte(HighWram, r14 & 0xFFFFF);
+      u32 sum = 0;
+      int tick = 0;
+      if (b < 0) {
+        sum = (u32)(s32)(s16)T2ReadWord(HighWram, (r14 + 0x1E) & 0xFFFFF) + T2ReadWord(HighWram, (r14 + 0x1C) & 0xFFFFF);
+        tick = (s32)(sum & 0xFFFF) >= 0x0EBA; // tempo tick: block 0600BB0A on is the SH-2 code
+      }
+      cnt += (u32)ca; // 0600BAE0: mov.b @r3 (cache-through: 2 more), tst, bt taken
+      r3 = fa; r0 = 0; T = 1;
+      if (cnt >= ex || tick) { stop = 0x0600BB0A; break; }
+      if (b >= 0) {
+        cnt += (u32)cb; // 0600BB0A: mov.b @r14, cmp/pz, bt taken
+        r2 = (u32)b;
+      } else {
+        cnt += (u32)ct; // 0600BB0A..BB26: tempo step, cmp/ge, bf/s taken, mov.w r0, @(1E, r14)
+        const u32 mc = memcycle_;
+        memSetWord(r14 + 0x1E, (u16)sum);
+        memcycle_ = mc; // its wait is in ct
+        r0 = sum; r2 = 0x0EBA; r3 = sum & 0xFFFF; T = 0;
+      }
+      if (cnt >= ex) { stop = 0x0600BBB8; break; }
+      r0 = r13 + 1; r13 = r0 & 31; sel = 1;
+      r3 = lit; r14 = (r13 << 5) + lit;
+      r9--; T = r9 == 0;
+      if (!r9) { cnt += (u32)cx; stop = 0x0600BBDC; break; } // bf/s not taken: the delay slot starts the next block
+      cnt += (u32)cc; // 0600BBB8: next channel, monitor select, dt r9, bf/s 0600BAE0 taken, add r12, r14
+      r14 += R[12];
+    }
+    if (cnt == c0)
+      return 0;
+    if (sel)
+      memSetWord(R[8], (u16)(r13 << 11));
+    R[0] = r0; R[2] = r2; R[3] = r3; R[9] = r9; R[13] = r13; R[14] = r14;
+    SET_SR((GET_SR() & ~1u) | T);
+    SET_PC(stop);
+    m_pDynaSh2->SysReg[4] = cnt;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHRLE) {
+    // ADR-187: see rstv_fh_rle. Checked dry first (no partial writes), then run; the pushes of r8-r14 are written too
+    static unsigned gr;
+    if (pc != 0x0604D8D4 || !rstv_hle_checked(&gr, pc, &rstv_fh_rle_sig))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 sp = R[15];
+    if (!rstv_hw_in(sp - 28, 28) || (sp & 3))
+      return 0;
+    RstvFhRle o;
+    if (!rstv_fh_rle(R[4], R[5], R[6], R[1], R[2], R[3], 1, &o))
+      return 0;
+    rstv_fh_rle(R[4], R[5], R[6], R[1], R[2], R[3], 0, &o);
+    if (o.hi >= o.lo)
+      rstv_vdp1_ram_touch(o.lo, o.hi - o.lo + 2);
+    for (int k = 0; k < 7; k++)
+      rstv_hw_wr(sp - 4 - 4 * k, R[14 - k]);
+    R[0] = o.r0; R[1] = o.r1; R[2] = o.r2; R[3] = o.r3; R[4] = o.r4; R[5] = o.r5;
+    SET_SR(GET_SR() & ~1u);
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += o.cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHMOVE) {
+    // ADR-188: memmove(r4, r5, r6) byte by byte (forward when r4 < r5, else from the end), high work RAM only. Leaves
+    // r0 = r4, r5 = r6, r7 = 0, r1 r2 (forward) or r3 (backward) = last byte (sign extended) and address, T = 1;
+    // r13 pushed and popped. Cycles as the recompiler counts the paths (+ cache-through waits)
+    static unsigned gm;
+    if (pc != 0x0604BCF8 || !rstv_hle_checked(&gm, pc, &rstv_fh_move_sig))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 d = R[4], s = R[5], n = R[6], sp = R[15];
+    if (!rstv_hw_in(sp - 4, 4) || (sp & 3) || n > 0x10000 || (n && (!rstv_hw_in(d, n) || !rstv_hw_in(s, n))))
+      return 0;
+    rstv_hw_wr(sp - 4, R[13]);
+    u32 cyc;
+    if (d == s)
+      cyc = 1 + 1 + 3 + 4;
+    else if (!(d >= s)) { // forward
+      cyc = 8 + 5 + 4 + (n ? 3 : 0);
+      for (u32 k = 0; k < n; k++) {
+        const u8 b = T2ReadByte(HighWram, (s + k) & 0xFFFFF);
+        T2WriteByte(HighWram, (d + k) & 0xFFFFF, b);
+        R[1] = (u32)(s32)(s8)b;
+        R[2] = d + k;
+        cyc += (k + 1 < n ? 8 : 7) + rstv_hw_wait(s) + rstv_hw_wait(d);
+      }
+      R[5] = n; R[7] = 0;
+    } else { // backward
+      cyc = 9 + 5 + 2 + 4;
+      for (u32 k = n; k-- > 0;) {
+        const u8 b = T2ReadByte(HighWram, (s + k) & 0xFFFFF);
+        T2WriteByte(HighWram, (d + k) & 0xFFFFF, b);
+        R[3] = (u32)(s32)(s8)b;
+        cyc += (k ? 7 : 6) + rstv_hw_wait(s) + rstv_hw_wait(d);
+      }
+      R[5] = n; R[7] = 0;
+    }
+    if (n)
+      rstv_hle_notify(d, n);
+    R[0] = d;
+    SET_SR(GET_SR() | 1u);
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FHSET) {
+    // ADR-188: memset(r4, r5, r6) byte by byte, high work RAM only. Leaves r0 = r4, r2 = r5 & FF (if any), r3 = 0,
+    // r7 = r6, T = 1
+    static unsigned gs2;
+    if (pc != 0x0604BD40 || !rstv_hle_checked(&gs2, pc, &rstv_fh_set_sig))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 d = R[4], n = R[6];
+    if (n > 0x10000 || (n && !rstv_hw_in(d, n)))
+      return 0;
+    u32 cyc = n ? 3 + 2 + 7 * (n - 1) + 6 + 3 + n * rstv_hw_wait(d) : 9;
+    if (n) {
+      for (u32 k = 0; k < n; k++)
+        T2WriteByte(HighWram, (d + k) & 0xFFFFF, (u8)R[5]);
+      rstv_hle_notify(d, n);
+      R[2] = R[5] & 0xFF;
+    }
+    R[0] = d; R[3] = 0; R[7] = n;
+    SET_SR(GET_SR() | 1u);
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_PURGE) {
+    // ADR-184/189: cache purge by lines: r4 = (r4 & 1FFFFFF0) | 40000000, a long 0 to every 16-byte line of the purge
+    // area up to r4 + r5. Purge-area stores do nothing here (MappedMemoryWriteLong drops them, no wait cycles), so only
+    // registers and cycles remain, charged per block as the recompiler does, stopping at the loop head when the slice
+    // ends between blocks. Form 1 (do-while, fhboxers): 7 + 6 for the first block with the first line, 6 per line
+    // (self loop at +14), 3 for the rts ending the last block. Form 2 (while, pblbeach): 8 to the bt/s, 7 for the
+    // block at +16 (mov #0, r6 and the first line), 6 per line (self loop at +18), 3 for the rts; no line: 10 + 3.
+    const int form = rstv_purge_check(pc);
+    if (!form)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 a0 = (R[4] & 0x1FFFFFF0u) | 0x40000000u, end = a0 + R[5];
+    if (end < a0)
+      return 0;
+    const u32 ex = m_pDynaSh2->exitcount, c0 = m_pDynaSh2->SysReg[4];
+    u32 cnt, k, n, head;
+    R[2] = 0x40000000u; R[3] = 0x1FFFFFF0u;
+    if (form == 1) {
+      n = R[5] ? (R[5] + 15) >> 4 : 1;
+      cnt = c0 + 13; k = 1; head = pc + 14;
+      R[6] = end; R[7] = 0;
+    } else {
+      n = (R[5] + 15) >> 4;
+      R[7] = end;
+      // a slice that ends after the first block is left to the SH-2 code: resuming at the delay slot (+16) or the rts
+      // after a native stop cost one cycle less than after the compiled branch (ARM harness: pblbeach diverged)
+      if (c0 + (n ? 8 : 10) >= ex)
+        return 0;
+      if (!n) { // bt/s taken (10), the rts block (3)
+        R[6] = 0; R[4] = a0;
+        SET_SR(GET_SR() | 1u);
+        SET_PC(GET_PR());
+        m_pDynaSh2->SysReg[4] = c0 + 13;
+        rstv_hle_runs++;
+        return 1;
+      }
+      cnt = c0 + 8 + 7; k = 1; head = pc + 18;
+      R[6] = 0;
+    }
+    while (k < n && cnt < ex) {
+      cnt += 6;
+      k++;
+    }
+    R[4] = a0 + (k << 4);
+    if (k == n) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(GET_PR());
+      cnt += 3;
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(head);
+    }
+#if !defined(__vita__)
+    if (getenv("RSTV_PURGELOG"))
+      printf("purge f%d l%d pc %08x form %d c0 %u ex %u n %u k %u -> pc %08x c %u r4 %08x\n", (int)yabsys.frame_count,
+             (int)yabsys.LineCount, pc, form, c0, ex, n, k, GET_PC(), cnt, R[4]);
+#endif
+    m_pDynaSh2->SysReg[4] = cnt;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_VKSORT) {
+    static unsigned gv;
+    if (pc != 0x0605B3D4 || !rstv_hle_checked(&gv, pc, &rstv_vk_sort_sig))
+      return 0;
+    u32 cyc = 0;
+    if (!RstvHleVkSort(&cyc))
+      return 0;
+    SET_PC(0x0605B426);
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
   if (kind == RSTV_HLE_TKVTX) {
     static unsigned gt;
     if (pc != 0x0602FEF8 || !rstv_hle_checked(&gt, pc, &rstv_tk_vtx_sig))
@@ -4188,11 +5558,46 @@ int DynarecSh2::RstvHle(int kind)
   }
   if (kind == RSTV_HLE_SGLVTX) {
     int di = 0;
-    while (di < 4 && rstv_sgl_desc[di].head != pc)
+    while (di < RSTV_SGL_NDESC && rstv_sgl_desc[di].head != pc)
       di++;
-    const RstvSglDesc *dsc = di < 4 ? &rstv_sgl_desc[di] : NULL;
-    static unsigned gs[4];
-    if (!dsc || !rstv_hle_checked(&gs[di], dsc->code, dsc->sig))
+    const RstvSglDesc *dsc = di < RSTV_SGL_NDESC ? &rstv_sgl_desc[di] : NULL;
+    static unsigned gs[RSTV_SGL_NDESC];
+    // ADR-141: other games have the same module elsewhere: the descriptor follows from the hook PC (the loop head) when
+    // the code before it matches either copy (both start with the same loop; the copies differ before and after it)
+    static RstvSglDesc dyn[4];
+    static unsigned gd[4];
+    static int ndyn;
+    if (!dsc) {
+      di = 0;
+      while (di < ndyn && dyn[di].head != pc)
+        di++;
+      // a PC whose code matches neither copy is not hashed again until code changes (a hash a call: decathlt 48 -> 27 fps)
+      static u32 nomatch_pc[8], nomatch_gen[8];
+      for (int k = 0; k < 8; k++)
+        if (nomatch_pc[k] == pc && nomatch_gen[k] == rstv_hle_codegen)
+          return 0;
+      if (di == ndyn) {
+        if (ndyn == 4)
+          return 0;
+        RstvSglDesc d;
+        unsigned t1 = 0, t2 = 0; // (checked: the ranges are watched, so a later write retries a PC that did not match)
+        if (rstv_hle_checked(&t1, pc - 0x1F6, &rstv_sgl_vtx_sig))
+          d = { pc, pc - 0x1F6, pc + 0xDE, &rstv_sgl_vtx_sig, 0x90, 0x92, 0x388, 0x378, 0, 0 };
+        else if (rstv_hle_checked(&t2, pc - 0x236, &rstv_sgl_vtx2_sig))
+          d = { pc, pc - 0x236, pc + 0xE2, &rstv_sgl_vtx2_sig, 0x94, 0x96, 0x38C, 0x37C, 1, pc + 0x11A };
+        else {
+          static int nk;
+          nomatch_pc[nk & 7] = pc;
+          nomatch_gen[nk & 7] = rstv_hle_codegen;
+          nk++;
+          return 0;
+        }
+        dyn[ndyn++] = d;
+      }
+      dsc = &dyn[di];
+      if (!rstv_hle_checked(&gd[di], dsc->code, dsc->sig))
+        return 0;
+    } else if (!rstv_hle_checked(&gs[di], dsc->code, dsc->sig))
       return 0;
     u32 cyc = 0;
     const int npc = RstvHleSglVtx(dsc, &cyc);
@@ -4248,6 +5653,106 @@ int DynarecSh2::RstvHle(int kind)
     rstv_hle_runs++;
     return 1;
   }
+  if (kind == RSTV_HLE_DELAYR2) {
+    // decrement, then test: 5 cycles per iteration that branches back (bf taken 3), 3 for the last one
+    const int rn = rstv_delayr2_check(pc);
+    if (rn < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 v = R[rn];
+    const u64 todo = v ? (u64)v : 0x100000000ull; // iterations until the decrement gives 0
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+    const u64 can = left > 0 ? ((u64)left + 4) / 5 : 1;
+    const u64 n = todo < can ? todo : can;
+    R[rn] = v - (u32)n;
+    if (n == todo) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(pc + 6);
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(pc);
+    }
+    m_pDynaSh2->SysReg[4] += (u32)(n * 5) - (n == todo ? 2u : 0u);
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_CPY16) {
+    // ADR-162: as many iterations as the block loop would run in the slice (7 cycles each, 5 for the last), word by
+    // word in order (overlap as the SH-2 sees it). Only when both sides are plain memory with a host pointer
+    const int rg = rstv_cpy16_check(pc);
+    if (rg < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const int rx = rg & 15, rm = (rg >> 4) & 15, rn = (rg >> 8) & 15, rc = (rg >> 12) & 15;
+    const u32 v = R[rc];
+    const u64 todo = v ? (u64)v : 0x100000000ull;
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+    const u64 can = left > 0 ? ((u64)left + 6) / 7 : 1;
+    const u32 n = (u32)(todo < can ? todo : can);
+    if (n > 0x40000 || (R[rm] & 1) || (R[rn] & 1) || rstv_coin_mailbox_latch)
+      return 0;
+    RstvHleSide src, dst;
+    if (!rstv_hle_side(&src, R[rm], n * 2, 1) || !src.m)
+      return 0;
+    // sound RAM: the games also store through its mirrors (kiwames 0x25A598D8 with 256 KB), masked like SoundRamWriteWord
+    const u32 db = R[rn] & 0x0FFFFFFF;
+    int mem4b = 0;
+    u8 *sram = (R[rn] >> 29) <= 1 && db >= 0x05A00000 && db + n * 2 <= 0x05B00000 ? rstv_sound_ram_any(&mem4b) : NULL;
+    if (!sram && (!rstv_hle_side(&dst, R[rn], n * 2) || !dst.m))
+      return 0;
+    u16 w = 0;
+    for (u32 i = 0; i < n * 2; i += 2) {
+      w = (u16)(rstv_hle_rd(&src, i) << 8 | rstv_hle_rd(&src, i + 1));
+      if (sram) {
+        u32 off = (db - 0x05A00000 + i) & 0xFFFFF;
+        if (mem4b ? off > 0x7FFFF : (off &= 0x3FFFF, 0))
+          continue;
+        T2WriteWord(sram, off, w);
+      } else {
+        rstv_hle_wr(&dst, i, (u8)(w >> 8));
+        rstv_hle_wr(&dst, i + 1, (u8)w);
+      }
+    }
+    rstv_hle_notify(R[rn], n * 2);
+    R[rx] = (u32)(s32)(s16)w;
+    R[rm] += n * 2;
+    R[rn] += n * 2;
+    R[rc] = v - n;
+    if (n == todo) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(pc + 10);
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(pc);
+    }
+    m_pDynaSh2->SysReg[4] += n * 7 - (n == todo ? 2u : 0u);
+    rstv_hle_runs++;
+    rstv_hle_bytes += n * 2;
+    return 1;
+  }
+  if (kind == RSTV_HLE_DELAYDT) {
+    // ADR-160: dt 1 + bf taken 3 cycles per iteration that branches back, dt + bf not taken 2 for the last one
+    const int rn = rstv_delaydt_check(pc);
+    if (rn < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 v = R[rn];
+    const u64 todo = v ? (u64)v : 0x100000000ull; // iterations until the decrement gives 0
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+    const u64 can = left > 0 ? ((u64)left + 3) / 4 : 1;
+    const u64 n = todo < can ? todo : can;
+    R[rn] = v - (u32)n;
+    if (n == todo) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(pc + 4);
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(pc);
+    }
+    m_pDynaSh2->SysReg[4] += (u32)(n * 4) - (n == todo ? 2u : 0u);
+    rstv_hle_runs++;
+    return 1;
+  }
   if (kind == RSTV_HLE_DELAY) {
     // ADR-109: see rstv_delay_check. The block loop runs whole iterations while the count is below the slice end, so
     // run the same number here (ceil(left / per)) and charge the same cycles; the counter ends where the code leaves it
@@ -4275,6 +5780,58 @@ int DynarecSh2::RstvHle(int kind)
     }
     m_pDynaSh2->SysReg[4] += (u32)(n * RSTV_DELAY_CYC) - (v ? 0 : RSTV_DELAY_NT);
     rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_MEMMOVE2) {
+    // ADR-148: memmove(r4 dst, r5 src, r6 n) by bytes, forward when dst < src, else backward; returns r0 = dst.
+    // Leaves T = 1, r7 = 0; r5 = n; r1 = dst + n (forward) or dst; r3 = the last byte moved (sign extended) if n > 0
+    static u32 mpc[8];
+    static unsigned mgen[8];
+    int k = 0;
+    while (k < 8 && mpc[k] && mpc[k] != pc)
+      k++;
+    if (k == 8)
+      return 0;
+    mpc[k] = pc;
+    if (!rstv_hle_checked(&mgen[k], pc, &rstv_mm2_sig))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 d = R[4], sp = R[5], n = R[6];
+    if (n > 0x100000)
+      return 0;
+    RstvHleSide xd, xs;
+    if (!rstv_hle_side(&xd, d, n) || !rstv_hle_side(&xs, sp, n, 1))
+      return 0;
+    u32 cyc = 4;
+    if (d != sp) {
+      R[7] = 0;
+      R[5] = n;
+      R[1] = d;
+      if (n && d < sp) {
+        u8 last = 0;
+        for (u32 i = 0; i < n; i++) {
+          last = rstv_hle_rd(&xs, i);
+          rstv_hle_wr(&xd, i, last);
+        }
+        R[3] = (u32)(s32)(s8)last;
+        R[1] = d + n;
+      } else if (n) {
+        u8 last = 0;
+        for (u32 i = n; i-- > 0;) {
+          last = rstv_hle_rd(&xs, i);
+          rstv_hle_wr(&xd, i, last);
+        }
+        R[3] = (u32)(s32)(s8)last;
+      }
+      cyc = 10 + n * 7;
+    }
+    R[0] = d;
+    SET_SR(GET_SR() | 1u);
+    rstv_hle_notify(d, n);
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += cyc;
+    rstv_hle_runs++;
+    rstv_hle_bytes += n;
     return 1;
   }
   if (kind == RSTV_HLE_BSSCLR2) {
@@ -4427,6 +5984,9 @@ int DynarecSh2::RstvHle(int kind)
 // ADR-081: the original code of a hook PC, compiled outside LookupTable (the table holds its native-call block)
 Block *DynarecSh2::RstvHleOrigBlock(u32 pc)
 {
+#if defined(RSTV)
+  RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
+#endif
   static Block *orig[RSTV_MAX_HLE];
   static unsigned orig_gen[RSTV_MAX_HLE];
   int k = 0;
@@ -4469,7 +6029,8 @@ int DynarecSh2::RstvHleStub()
 extern "C" int rstv_hle_stub_c(void *genreg)
 {
   (void)genreg;
-  return DynarecSh2::CurrentContext->RstvHleStub();
+  RstvIoGuard g; // ADR-136
+  return DynarecSh2::Cur()->RstvHleStub();
 }
 
 inline int DynarecSh2::Execute(){
@@ -4572,7 +6133,7 @@ inline int DynarecSh2::Execute(){
 #if !defined(__vita__)
           static int rstv_hlechk = -1;
           static unsigned rstv_hlechk_n;
-          if (rstv_hlechk < 0) rstv_hlechk = getenv("RSTV_HLECHK") ? atoi(getenv("RSTV_HLECHK")) : 0;
+          if (rstv_hlechk < 0) { rstv_hlechk = getenv("RSTV_HLECHK") ? atoi(getenv("RSTV_HLECHK")) : 0; if (rstv_hlechk > 0) rstv_hle_stub_on = 0; } // every call through here
           const int rstv_hok = (rstv_hlechk > 0 && (rstv_hlechk_n++ % (unsigned)rstv_hlechk) == 0) ? RstvHleCheck(rstv_hle[k].kind) :
             RstvHle(rstv_hle[k].kind);
 #else
@@ -4638,6 +6199,22 @@ inline int DynarecSh2::Execute(){
 
       // Cache
     default:
+      if ((GET_PC() & 0x0E000000) == 0x02000000) { // ADR-143: cartridge ROM
+        Block **slot = m_pCompiler->CartSlot(GET_PC());
+        pBlock = slot ? *slot : NULL;
+        if (pBlock && pBlock->b_addr != GET_PC())
+          pBlock = NULL; // (the same address through another mirror: compile for this one)
+        if (pBlock == NULL) {
+          pBlock = m_pCompiler->CompileBlock(GET_PC());
+          if (pBlock == NULL) {
+            Undecoded();
+            return IN_INFINITY_LOOP;
+          }
+          if (slot)
+            *slot = pBlock;
+        }
+        break;
+      }
       pBlock = m_pCompiler->CompileBlock(GET_PC());
       if (pBlock == NULL) {
         Undecoded();
@@ -4687,8 +6264,8 @@ inline int DynarecSh2::Execute(){
     if (bt_f == -2) { const char *e = getenv("RSTV_BTRACE"); bt_f = -1; if (e) sscanf(e, "%d,%d,%d", &bt_f, &bt_l0, &bt_l1); }
     if (bt_f >= 0 && (int)yabsys.frame_count == bt_f && (int)yabsys.LineCount >= bt_l0 && (int)yabsys.LineCount <= bt_l1) {
       const u32 *R = GetGenRegPtr();
-      printf("bt l%d %s %08x pr %08x r0 %08x r1 %08x r4 %08x r5 %08x r6 %08x r8 %08x sr %03x\n", (int)yabsys.LineCount, is_slave_ ? "S" : "M", GET_PC(), GET_PR(),
-             R[0], R[1], R[4], R[5], R[6], R[8], (unsigned)GET_SR());
+      printf("bt l%d %s %08x pr %08x r0 %08x r1 %08x r4 %08x r5 %08x r6 %08x r8 %08x sr %03x c %u\n", (int)yabsys.LineCount, is_slave_ ? "S" : "M", GET_PC(), GET_PR(),
+             R[0], R[1], R[4], R[5], R[6], R[8], (unsigned)GET_SR(), (unsigned)m_pDynaSh2->SysReg[4]);
     }
   }
 #endif
@@ -4742,6 +6319,33 @@ inline int DynarecSh2::Execute(){
   if ((GET_SR() & 0xF0) < GET_ICOUNT()) {
     this->CheckInterupt();
   }
+#if defined(RSTV)
+  if (__builtin_expect((rstv_dev_trace_to | rstv_dev_trap) != 0, 0)) { // one test when the diag is off
+    // diag (ux0:data/restv/pctrap = hex PC): registers and stack when the master reaches that block (first 8 times)
+    static int trap_n;
+    // pctrap "PC FROM TO": also every master block PC seen for the first time in frames FROM..TO (path, with nochain)
+    extern unsigned int rstv_dev_trace_from, rstv_dev_trace_to;
+    if (rstv_dev_trace_to && yabsys.frame_count > rstv_dev_trace_to)
+      rstv_trace_flush();
+    if (rstv_dev_trace_to && !is_slave_ && yabsys.frame_count >= rstv_dev_trace_from && yabsys.frame_count <= rstv_dev_trace_to) {
+      rstv_trace_pc(m_pDynaSh2->SysReg[3], GET_PR(), "x");
+    }
+    if (rstv_dev_trap && !is_slave_ && m_pDynaSh2->SysReg[3] == rstv_dev_trap && trap_n < 8 &&
+        yabsys.frame_count >= rstv_dev_trace_from) {
+      trap_n++;
+      const u32 sp = m_pDynaSh2->GenReg[15];
+      rstv_log_printf("pctrap f%u l%d pr %08x r4 %08x r5 %08x r6 %08x r7 %08x r14 %08x sp %08x: %08x %08x %08x %08x %08x %08x",
+        (unsigned)yabsys.frame_count, yabsys.LineCount, GET_PR(), m_pDynaSh2->GenReg[4], m_pDynaSh2->GenReg[5],
+        m_pDynaSh2->GenReg[6], m_pDynaSh2->GenReg[7], m_pDynaSh2->GenReg[14], sp, MappedMemoryReadLongNocache(sp), MappedMemoryReadLongNocache(sp + 4),
+        MappedMemoryReadLongNocache(sp + 8), MappedMemoryReadLongNocache(sp + 12), MappedMemoryReadLongNocache(sp + 16), MappedMemoryReadLongNocache(sp + 20));
+      for (u32 a = 0x06000700; a < 0x06000760; a += 32)
+        rstv_log_printf("pctrap mem %08x: %08x %08x %08x %08x %08x %08x %08x %08x", a, MappedMemoryReadLongNocache(a),
+          MappedMemoryReadLongNocache(a + 4), MappedMemoryReadLongNocache(a + 8), MappedMemoryReadLongNocache(a + 12),
+          MappedMemoryReadLongNocache(a + 16), MappedMemoryReadLongNocache(a + 20), MappedMemoryReadLongNocache(a + 24),
+          MappedMemoryReadLongNocache(a + 28));
+    }
+  }
+#endif
 
   if (!m_pCompiler->debug_mode_ && (pBlock->flags&BLOCK_LOOP) ){
     if (m_pDynaSh2->SysReg[3] < pBlock->e_addr && m_pDynaSh2->SysReg[3] >= pBlock->b_addr) {
@@ -4839,7 +6443,15 @@ int DynarecSh2::CheckInterupt(){
 
   
     
+  // ADR-136: lock order I/O lock, then the queue lock (taking the interrupt writes the stack through the memory functions)
+  const int rstv_io = rstv_slave_on;
+  if (rstv_io) rstv_io_lock();
   RSTV_ILOCK();  
+  if (m_IntruptTbl.size() == 0) { // emptied by another thread meanwhile
+    RSTV_IUNLOCK();
+    if (rstv_io) rstv_io_unlock();
+    return 0;
+  }
   dlstIntct::iterator pos = m_IntruptTbl.begin();
   if( InterruptRutine((*pos).Vector, (*pos).level ) != 0 ) {
     m_IntruptTbl.pop_front();
@@ -4849,10 +6461,69 @@ int DynarecSh2::CheckInterupt(){
       m_pDynaSh2->SysReg[5] = 0x0000;
     }
     RSTV_IUNLOCK();
+    if (rstv_io) rstv_io_unlock();
     return 1;
   }
   RSTV_IUNLOCK();
+  if (rstv_io) rstv_io_unlock();
   return 0;
+}
+
+static u8 rstv_trace_seen[0x80000 >> 3];
+static char *rstv_trace_buf;
+static unsigned rstv_trace_len;
+// the trace goes to a file once the window ends (the UDP log dropped most of it)
+static void rstv_trace_flush(void)
+{
+  static int done;
+  if (done || !rstv_trace_buf)
+    return;
+  done = 1;
+#if defined(__vita__)
+  FILE *f = fopen("ux0:data/restv/pctrace.txt", "w");
+#else
+  FILE *f = fopen("/tmp/pctrace.txt", "w");
+#endif
+  if (f) {
+    fwrite(rstv_trace_buf, 1, rstv_trace_len, f);
+    fclose(f);
+  }
+  rstv_log_printf("pctrace: %u bytes written", rstv_trace_len);
+}
+static void rstv_trace_pc(u32 pc, u32 pr, const char *how)
+{
+  const u32 k = ((pc >> 1) ^ (pc >> 21)) & 0x7FFFF;
+  if (!(rstv_trace_seen[k >> 3] & (1 << (k & 7)))) {
+    rstv_trace_seen[k >> 3] |= 1 << (k & 7);
+    static char *buf;
+    static unsigned len;
+    enum { CAP = 512 * 1024 };
+    if (!buf)
+      buf = (char *)malloc(CAP);
+    if (buf && len < CAP - 64)
+      len += snprintf(buf + len, CAP - len, "f%u l%d %08x pr %08x %s\n", (unsigned)yabsys.frame_count, yabsys.LineCount, pc, pr, how);
+    rstv_trace_buf = buf; rstv_trace_len = len;
+    if (len >= CAP - 64) rstv_trace_flush();
+  }
+}
+// diag: called by rstv_chain (profiling variant) for every chained block while tracing (master only)
+extern "C" void rstv_chain_trace(unsigned int pc, void *state)
+{
+  if (rstv_dev_trace_to && yabsys.frame_count > rstv_dev_trace_to)
+    rstv_trace_flush();
+  if (!rstv_dev_trace_to || yabsys.frame_count < rstv_dev_trace_from || yabsys.frame_count > rstv_dev_trace_to)
+    return;
+  if (state != (void *)((DynarecSh2 *)MSH2->ext)->GetGenRegPtr())
+    return;
+  const u32 *g = (const u32 *)state;
+  rstv_trace_pc(pc, g[16 + 3 + 2], "c");
+  static int n;
+  if (rstv_dev_trap && pc == rstv_dev_trap && n < 8) { // registers as the chained block starts (the block stays chained)
+    n++;
+    rstv_log_printf("chtrap f%u l%d pr %08x sr %03x r0 %08x r4 %08x r5 %08x r6 %08x r7 %08x r13 %08x r15 %08x [72c] %08x [730] %08x",
+      (unsigned)yabsys.frame_count, yabsys.LineCount, g[16 + 3 + 2], g[16], g[0], g[4], g[5], g[6], g[7], g[13], g[15],
+      MappedMemoryReadLongNocache(0x0600072C), MappedMemoryReadLongNocache(0x06000730));
+  }
 }
 
 int DynarecSh2::InterruptRutine(u8 Vector, u8 level)
@@ -4868,6 +6539,9 @@ int DynarecSh2::InterruptRutine(u8 Vector, u8 level)
     MappedMemoryWriteLong(m_pDynaSh2->GenReg[15], m_pDynaSh2->SysReg[3],NULL);
     if (level == 0x10) { //NMI
       m_pDynaSh2->CtrlReg[0] |= 0x000000F0;
+      // rare: the BIOS clock change (ADR-151 diag); taken through the game's vector table it ends in its error loop
+      rstv_log_printf("nmi %s f%u l%d pc %08x vbr %08x", is_slave_ ? "S" : "M", (unsigned)yabsys.frame_count, yabsys.LineCount,
+        prepc, m_pDynaSh2->CtrlReg[2]);
     }
     else {
       m_pDynaSh2->CtrlReg[0] &= ~0x000000F0;

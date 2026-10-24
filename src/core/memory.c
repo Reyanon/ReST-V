@@ -780,6 +780,15 @@ void MappedMemoryInit()
      &BupRamMemoryWriteByte,
      &BupRamMemoryWriteWord,
      &BupRamMemoryWriteLong);
+   if (yabsys.isSTV)
+      // ST-V: high work RAM repeats every 1 MB up to 0x07FFFFFF (MAME mirror 0x01f00000); the Saturn backup RAM tweak
+      // above does not exist there. hanagumi copies its countdown digits and a mode panel from 0x0627xxxx
+      FillMemoryArea(0x600, 0x7FF, &HighWramMemoryReadByte,
+                                   &HighWramMemoryReadWord,
+                                   &HighWramMemoryReadLong,
+                                   &HighWramMemoryWriteByte,
+                                   &HighWramMemoryWriteWord,
+                                   &HighWramMemoryWriteLong);
 }
 
 #if 0
@@ -913,7 +922,8 @@ static u8 rstv_io_size[1024], rstv_io_w[1024];
 static int rstv_io_ram(u32 addr)
 {
    const u32 a = addr & 0xDFF00000;
-   return a == 0x06000000 || a == 0x00200000;
+   /* the BIOS ROM too: no side effects, and the interpreter fetches delay slots through the memory map */
+   return a == 0x06000000 || a == 0x00200000 || (a == 0x00000000 && (addr & 0xFFFFF) < 0x80000);
 }
 static void rstv_io_put(u32 addr, int size, u32 val, int w)
 {

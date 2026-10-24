@@ -15,7 +15,7 @@ src = open(os.path.join(src_dir, 'stv.cpp'), encoding='utf-8', errors='replace')
 ren = {'sandr': 'sandor'}
 
 stv_c = open(os.path.join(root, 'src', 'core', 'stv.c'), encoding='utf-8').read()
-manual = set(re.findall(r'\{ \{ "(\w+)"', stv_c))
+manual = set(re.findall(r'^\s*\{ \{ "(\w+)", (?:NULL|"\w+"), "', stv_c, re.M))  # game table rows only (not s_extra_hle)
 
 games = {}
 gpat = r'^GAME\(\s*(\d+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"'
@@ -31,12 +31,25 @@ EXTRA_HINTS = {
     # time slice is the same rate (the slave spent the whole frame in it during the attract mode)
     'bakubaku': ([0x06036dba], [0x060105c8]),
     'ejihon': ([0x060068b4], []),     # master: while (!flag) { poll(); n++; } (poll returns at once while the flag is 0)
-    'fhboxers': ([], [0x06021caa]),   # slave: while (flag) sound_update()
+    # slave: while (flag) sound_update(). ADR-166: the master wait 0600B338 and the ffrevng10 slave FTCSR poll
+    # (06041546) were dropped: no gain, ffrevng10 60 -> 55 fps with it
+    'fhboxers': ([], [0x06021caa]),
     # master: polls a VDP status bit; while (flag) poll() (same engine as ejihon)
     'gaxeduel': ([0x0601d790, 0x06011dce], []),
     'introdon': ([0x0602f788], []),   # master: t = *cnt + n; while (*cnt < t); (cnt = interrupt counter 0x0609ea18)
     # master: task scheduler, no ready task -> idle() (rts) -> scan again (~3500 scans a frame)
     'kiwames': ([0x06057f90], []),
+    # master: while (flag && !(status & 2) && ticks - t0 < 20) (a hardware status bit or an interrupt tick ends it)
+    # + t0 = *tick; while (*tick - t0 < n); (0605F862, the interrupt counts tick; 34k loops a frame in play)
+    'pblbeach': ([0x0605eaea, 0x0605f862], []),
+    # master: while (*flag == 1) n++; after MAME's while (*flag == 0) n++ hint (same engine, 6000 loops a frame)
+    'diehard': ([0x06027ca4], []),
+    'dnmtdeka': ([0x06027c9c], []),
+    # master: while (!*flag) ; (the vblank interrupt sets it; 446k cycles a frame polled, 55 fps on the Vita)
+    'prc298au': ([0x06004e30], []),  # the closing bt; the head 06004de8 leaves forward first
+    # master: while (*flag) n++; twice a frame (0602FB7C, 0602FC58; the flag is cleared by the slave / an interrupt)
+    # + while (*done != 1) { *waiting = 1; n++; } (0602C2F4, ~1800 loops a frame in play; ADR-171)
+    'vfremix': ([0x0602fb7c, 0x0602fc58, 0x0602c2f4], []),
 }
 # ADR-042 once_fn: master function called over and over while the game waits for vblank (runs once a frame on the Vita)
 EXTRA_ONCE = {
@@ -124,10 +137,14 @@ for set_, g in sorted(games.items(), key=lambda kv: kv[0]):
     hm, hs = pcflush.get(g['init'], ([], []))
     if set_ in EXTRA_HINTS:  # idle loops found by ReST-V profiling (sets with no MAME hint)
         hm, hs = hm + EXTRA_HINTS[set_][0], hs + EXTRA_HINTS[set_][1]
-    if io or hm or hs:
+    # ADR-132: 315-5838 / 317-0229 / 0230 / 0231 decompression chip variant (1..4), from the MAME machine config
+    comp = {'stv_5838': 1, 'stv_0229': 2, 'stv_0230': 3, 'stv_0231': 4}.get(g['machine'], 0) if g['init'] == 'init_5838' else 0
+    if io or hm or hs or comp:
         tail += ', ' + (io or '0')
-    if hm or hs:
+    if hm or hs or comp:
         tail += ', { %s }, { %s }' % (', '.join('0x%07x' % x for x in hm) or '0', ', '.join('0x%07x' % x for x in hs) or '0')
+    if comp:
+        tail += ', %d' % comp
     out.append('\t\t{ BLOB_END } }%s },' % tail)
     n += 1
 open(os.path.join(root, 'src', 'core', 'stv_games.h'), 'w', encoding='utf-8', newline='\n').write('\n'.join(out) + '\n')

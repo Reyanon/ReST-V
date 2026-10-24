@@ -180,13 +180,17 @@ int rbgq_prepare(RbgqState *st, const RstvRotCapture *c, const uint8_t *vram, co
 	return 0;
 }
 
-void rbgq_atlas_rgb_update(uint8_t *argb, int pitch_px, const uint8_t *vram, const uint8_t *dirty)
+void rbgq_atlas_rgb_update(uint8_t *argb, int pitch_px, const uint8_t *vram, const uint16_t *dirty)
 {
 	for (int p = 0; p < 128; p++) {
-		if (dirty && !dirty[p])
+		const unsigned m = dirty ? dirty[p] : 0xFFFFu;
+		if (!m)
 			continue;
-		// units touching this 4KB page: a 128-byte char can start up to 3 units earlier
+		// units touching each changed 256-byte block (ADR-137): a 128-byte char can start up to 3 units earlier
 		for (int k = -3; k < 128; k++) {
+			const int b = k < 0 ? 0 : k >> 3, bn = (k + 3) >> 3;
+			if (!(m & (1u << b)) && !(bn < 16 && (m & (1u << bn))))
+				continue;
 			const uint32_t u = (uint32_t)(p * 128 + k) & 0x3FFF;
 			const int ox = (int)(u & 127) * 8, oy = (int)(u >> 7) * 8;
 			for (int r = 0; r < 8; r++) {

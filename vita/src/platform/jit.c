@@ -12,6 +12,8 @@ typedef int (*JitFn)(int);
 int rstv_jit_selftest(char *msg, size_t msg_len)
 {
 	int r = rstv_jit_code_reserve(RSTV_JIT_CODE_SIZE);
+	if (r != 0)
+		r = rstv_jit_code_reserve(9u << 20); // the size before ADR-136 (no slave block cache: slaveasync stays off)
 	size_t size = 0;
 	uint8_t *base = (uint8_t *)rstv_jit_code_region(&size);
 	if (r != 0 || !base) {

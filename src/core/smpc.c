@@ -68,6 +68,12 @@ Smpc * SmpcRegs;
 u8 * SmpcRegsT;
 SmpcInternal * SmpcInternalVars = NULL;
 int intback_wait_for_line = 0;
+/* ReST-V (ADR-150): CKCHG352/320 run at the last visible line, like MAME smpc.cpp ("on ST-V timing of this is pretty
+   fussy, you get 2 credits at start-up otherwise"): the master's NMI then comes just before VBlank-in, and astrass'
+   VBlank handler reads the BIOS coin byte before the game clears sound RAM */
+static int ckchg_wait_for_line = 0;
+static u32 ckchg_frame; /* ADR-155: a CKCHG issued at or after that line waits for the next frame's (MAME time_until_pos) */
+static int ckchg_late;
 u8 bustmp = 0;
 int syslngid = 0;
 
@@ -136,6 +142,7 @@ int rstv_68k_reset_line = -1;
 
 void SmpcReset(void) {
    rstv_68k_reset_line = -1;
+   ckchg_wait_for_line = 0;
    memset((void *)SmpcRegs, 0, sizeof(Smpc));
    syslngid = SmpcInternalVars->syslanguageid;
    memset((void *)SmpcInternalVars->SMEM, syslngid, 4); // Language : 0=English - 1=Deutsch - 2=French - 3=Spanish - 4=Italian - 5=Japanese
@@ -205,11 +212,22 @@ static void SmpcSNDOFF(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* ADR-150: on ST-V the clock change keeps the raster position (MAME); starting the frame over at line 0 dropped that
+   frame's VBlank-in */
+static void rstv_change_clock(int freqtype) {
+   const u32 line = yabsys.LineCount, deciline = yabsys.DecilineCount;
+   YabauseChangeTiming(freqtype);
+   if (yabsys.isSTV) {
+      yabsys.LineCount = line;
+      yabsys.DecilineCount = deciline;
+   }
+}
+
 void SmpcCKCHG352(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   if (!yabsys.isSTV) ScuReset(); // ADR-150: MAME does not reset the SCU here; a reset masks VBlank-in after the NMI
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -217,7 +235,7 @@ void SmpcCKCHG352(void) {
    YabauseStopSlave();
 
    // change clock
-   YabauseChangeTiming(CLKTYPE_28MHZ);
+   rstv_change_clock(CLKTYPE_28MHZ);
 
    // Set DOTSEL
    SmpcInternalVars->dotsel = 1;
@@ -232,7 +250,7 @@ void SmpcCKCHG320(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   if (!yabsys.isSTV) ScuReset(); // ADR-150: MAME does not reset the SCU here; a reset masks VBlank-in after the NMI
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -240,7 +258,7 @@ void SmpcCKCHG320(void) {
    YabauseStopSlave();
 
    // change clock
-   YabauseChangeTiming(CLKTYPE_26MHZ);
+   rstv_change_clock(CLKTYPE_26MHZ);
 
    // Set DOTSEL
    SmpcInternalVars->dotsel = 0;
@@ -561,6 +579,17 @@ static void SmpcRESDISA(void) {
 void SmpcExec(s32 t) {
    if (SmpcInternalVars->timing > 0) {
 
+      if (ckchg_wait_for_line)
+      {
+         if (yabsys.LineCount >= yabsys.VBlankLineCount - 1 && (!ckchg_late || yabsys.frame_count != ckchg_frame))
+         {
+            SmpcInternalVars->timing = -1;
+            ckchg_wait_for_line = 0;
+         }
+         else
+            return;
+      }
+
       if (intback_wait_for_line)
       {
          if (yabsys.LineCount == 207)
@@ -687,6 +716,10 @@ u32 FASTCALL SmpcReadLong(USED_IF_SMPC_DEBUG u32 addr) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcSetTiming(void) {
+   if (SmpcRegs->COMREG != 0x10 && SmpcRegs->COMREG != 0x19) { // rare (boot, game start): the order of SMPC commands and 68K resets (ADR-151)
+      extern void rstv_log_printf(const char *fmt, ...);
+      rstv_log_printf("smpc f%u l%d cmd %02x", (unsigned)yabsys.frame_count, yabsys.LineCount, SmpcRegs->COMREG);
+   }
    switch(SmpcRegs->COMREG) {
       case 0x0:
          SMPCLOG("smpc\t: MSHON not implemented\n");
@@ -701,9 +734,14 @@ static void SmpcSetTiming(void) {
          SmpcInternalVars->timing = 1;
          return;
       case 0xD:
+         SmpcInternalVars->timing = 1; // this has to be tested on a real saturn
+         return;
       case 0xE:
       case 0xF:
-         SmpcInternalVars->timing = 1; // this has to be tested on a real saturn
+         SmpcInternalVars->timing = 1;
+         ckchg_wait_for_line = yabsys.isSTV; // ADR-150
+         ckchg_frame = yabsys.frame_count;
+         ckchg_late = yabsys.LineCount >= yabsys.VBlankLineCount - 1;
          return;
       case 0x10:
          if (SmpcInternalVars->intback)//continue was issued
@@ -873,6 +911,9 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 			  }
 			  if (held != rstv_68k_reset_line) { // only on a change (MAME set_input_line does nothing when the level is unchanged)
 				  rstv_68k_reset_line = held;
+				  { extern void rstv_log_printf(const char *fmt, ...);
+				    rstv_log_printf("smpc f%u l%d 68k %s pc %08x pr %08x", (unsigned)yabsys.frame_count, yabsys.LineCount, held ? "reset" : "run",
+				      SH2Core->GetPC(MSH2), SH2Core->GetPR(MSH2)); }
 				  if (held)
 					  M68KStop();
 				  else

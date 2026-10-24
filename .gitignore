@@ -5,6 +5,7 @@
 *.nv
 roms/
 nvram/
+cheats/
 
 # --- build output ---
 build/

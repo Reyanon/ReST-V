@@ -294,7 +294,8 @@ extern "C" {
 
 class CompileBlocks {
 private:
-  CompileBlocks(){
+  CompileBlocks(int nblocks = NUMOFBLOCKS){
+    nblocks_ = nblocks;
     dCode = NULL;
     debug_mode_ = false;
     BuildInstructionList();
@@ -309,9 +310,10 @@ private:
     remove_count_ = 0;
   }
   ~CompileBlocks(){
-    FREEMEM(dCode, sizeof(Block)*NUMOFBLOCKS);
+    FREEMEM(dCode, sizeof(Block)*nblocks_);
   }
   static CompileBlocks * instance_;
+  static CompileBlocks * slave_instance_;
   bool show_code_ = false;
 public:
   void setShowCode( bool b ){ show_code_ = b; }
@@ -321,6 +323,18 @@ public:
     }
     return instance_;
   }
+  // ReST-V (ADR-136): the slave SH-2 on its own thread compiles into its own blocks and tables (no block of one CPU
+  // is ever replaced under the other); made on first use. at(k) visits the existing instances (writes drop code in all)
+  static CompileBlocks * getSlaveInstance(){
+    if( slave_instance_ == NULL ){
+      slave_instance_ = new CompileBlocks(2048);
+    }
+    return slave_instance_;
+  }
+  static CompileBlocks * at(int k){ return k == 0 ? instance_ : slave_instance_; }
+  int nblocks_;
+  unsigned blk_last_ = 0;                                   // size of the block just emitted (ADR-036)
+  u8 emit_buf_[MAXBLOCKSIZE] __attribute__((aligned(16)));  // ADR-043: blocks are built here, then copied
 
   int blockCount;
   int LastMakeBlock; 
@@ -334,6 +348,16 @@ public:
   Block* LookupTableRom[0x80000>>1];
   Block* LookupTableLow[0x100000>>1];
   Block* LookupTableC[0x8000>>1];
+  // ReST-V (ADR-143): code run from the cartridge ROM (0x02000000-0x03FFFFFF, batmanfr): 64KB pages made on demand
+  // (it had no table: every entry from the dispatcher compiled the block again, 200 blocks a frame)
+  Block** LookupTableCart[0x200] = {};
+  Block** CartSlot(u32 pc) {
+    const u32 o = pc & 0x01FFFFFF;
+    Block **&pg = LookupTableCart[o >> 16];
+    if (!pg)
+      pg = (Block **)calloc(0x8000, sizeof(Block *));
+    return pg ? &pg[(o & 0xFFFF) >> 1] : NULL;
+  }
   Block * dCode;
   
   std::unordered_map<u32, int> self_modify_block;
@@ -412,6 +436,13 @@ protected:
   int RstvHle(int kind); // ADR-045: C library routine run natively (1 = done)
   int RstvHleSglVtx(const struct RstvSglDesc *dsc, u32 *cyc); // ADR-047
   int RstvHleTkVtx(u32 *cyc); // ADR-055
+  int RstvHleVfVtx(u32 *cyc); // ADR-139
+  int RstvHleVkVtx(u32 *cyc); // ADR-144
+  int RstvHleFhVtx(u32 *cyc); // ADR-168
+  int RstvHleFhRow(u32 *cyc); // ADR-168
+  int RstvHleFhFace(u32 *cyc); // ADR-168
+  int RstvHleVkSort(u32 *cyc); // ADR-172
+  int RstvHleFhProj(int b, u32 *cyc); // ADR-174
   int RstvHleSjInterp(u32 *cyc); // ADR-056
   int RstvHleSglSpr(u32 *cyc, u32 *npc); // ADR-069
   int RstvHleSglOnScr(u32 *cyc); // ADR-074
@@ -441,8 +472,16 @@ protected:
 public:
   DynarecSh2();
   ~DynarecSh2();
-  static DynarecSh2 * CurrentContext;
-  void SetCurrentContext(){ CurrentContext = this; }
+  // ReST-V (ADR-136): one current context per thread (the slave can run on its own thread; see CurrentSH2 in sh2core.h)
+  static DynarecSh2 *cur_ctx_[2];
+#if defined(RSTV) && defined(__arm__)
+  static DynarecSh2 *&Cur() { return cur_ctx_[rstv_thread_tp() == rstv_slave_tp]; }
+#else
+  static DynarecSh2 *&Cur() { return cur_ctx_[0]; }
+#endif
+  void SetCurrentContext(){ Cur() = this; }
+  void UseCompiler(CompileBlocks *c) { m_pCompiler = c; } // ADR-136
+  void WakeSleep() { rstv_sleep_n_ = 1 << 20; } // ADR-136: the next slice runs (ExecuteCount sees the sleep count at its end)
   int RstvHleStub(); // ADR-081 (called from native-call blocks)
   struct Block *RstvHleOrigBlock(u32 pc); // ADR-081
   void SetSlave(bool is_slave) { is_slave_ = is_slave; }
@@ -534,6 +573,12 @@ extern "C"
    __asm pop edx          \
 }
 
+#elif defined(RSTV)
+// ReST-V (ADR-136): the C memory functions (devices, and stores that drop compiled code) under the I/O lock while the
+// slave SH-2 runs on its own thread
+#include "../rstv_slave.h"
+#define dynaLock() RSTV_IO_LOCK()
+#define dynaFree() RSTV_IO_UNLOCK()
 #else
 #define dynaLock()
 #define dynaFree()

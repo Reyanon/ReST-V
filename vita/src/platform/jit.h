@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 // SH-2 recompiler code area size (2048 blocks × 4KB + header ≈ 8.4MB, ADR-010)
-#define RSTV_JIT_CODE_SIZE (9u << 20)
+#define RSTV_JIT_CODE_SIZE (12u << 20) // ADR-136: + the slave block cache (2048 blocks, 2.1MB)
 
 // Allocate the code area at startup and check generate → run → overwrite → rerun on real hardware.
 // Result in msg; returns 0 (success) or negative. The area is never freed (the recompiler uses it)

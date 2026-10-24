@@ -23,6 +23,7 @@
 #include "sh2int.h"
 #include "zlib.h"
 #include "sega5881.h"
+#include "sega5838.h"
 #include "stvio.h"
 
 typedef enum { BLOB_END, HEADER_BLOB, BYTE_BLOB, WORD_BLOB } BlobType;
@@ -42,6 +43,7 @@ typedef struct {
 	u32 nv_crc;
 	int io; // STV_IO_* board input variant
 	u32 hint_m[4], hint_s[4]; // ADR-106: MAME pcflush addresses; turned into idle-loop heads when the loop is seen
+	int comp5838; // ADR-132: 1..4 = 315-5838 / 317-0229 / 317-0230 / 317-0231 decompression chip on the cartridge, 0 = none
 } StvGame;
 
 static void sanjeon_decrypt(void);
@@ -63,6 +65,29 @@ static const RstvHleHook twcup98_hle[] = { { 0x0605CD86, RSTV_HLE_SGLVTX }, { 0x
 	{ 0x06063332, RSTV_HLE_SGLPOLY }, { 0x0605C04E, RSTV_HLE_SGLPOLY }, { 0, 0 } };
 	// and the SGL polygon loop (slave 06063332 = sanjeon 0607284E; master 0605C04E another build, ADR-101)
 static void twcup98_init(void);
+// ADR-139: generated sets with native routines (stv_games.h carries none): set name -> hooks
+static const RstvHleHook ffreveng_hle[] = { { 0x0603C24A, RSTV_HLE_SGLVTX }, { 0x06041FAE, RSTV_HLE_SGLVTX }, { 0, 0 } }; // ADR-141
+static const RstvHleHook ffrevng10_hle[] = { { 0x0603BDF6, RSTV_HLE_SGLVTX }, { 0x06041B5A, RSTV_HLE_SGLVTX }, { 0, 0 } }; // ADR-157: same code, 0x454 lower
+// ADR-141: the SGL vertex loop head in more SGL games (found by the loop's first words; the copy is told by its code)
+// (elandore 06054002 and ffreveng 0603B50E / 06042102 start like the SGL polygon loop but are other builds: no match)
+static const RstvHleHook elandore_hle[] = { { 0x06053EAE, RSTV_HLE_SGLVTX }, { 0, 0 } };
+static const RstvHleHook znpwfv_hle[] = { { 0x0601179A, RSTV_HLE_SGLVTX }, { 0x06017BBA, RSTV_HLE_SGLVTX },
+	{ 0x06010A62, RSTV_HLE_SGLPOLY }, { 0x06017D0E, RSTV_HLE_SGLPOLY }, { 0, 0 } };
+// (seabass 0602AC46 / 0602FC96 and decathlt 06053230 / 060533BA start the same way but are another SGL build: no match,
+// and a hook that never runs only splits blocks there: decathlt 48 -> 35 fps)
+static const RstvHleHook vfkids_hle[] = { { 0x0602A912, RSTV_HLE_VKVTX }, { 0x0605B3D4, RSTV_HLE_VKSORT }, { 0, 0 } }; // ADR-144, ADR-172
+static const RstvHleHook fhboxers_hle[] = { { 0x060EB284, RSTV_HLE_FHVTX }, { 0x060EABC4, RSTV_HLE_FHROW },
+	{ 0x060EAC3C, RSTV_HLE_FHROW }, { 0x060EACB4, RSTV_HLE_FHFACE }, { 0x060EADE0, RSTV_HLE_FHFACE },
+	{ 0x0600BAE0, RSTV_HLE_FHSND }, // ADR-183: slave sound driver, idle channels
+	{ 0x0604D8D4, RSTV_HLE_FHRLE }, // ADR-187: sprite decoder (cart ROM -> VDP1 RAM)
+	{ 0x0604BCF8, RSTV_HLE_FHMOVE }, { 0x0604BD40, RSTV_HLE_FHSET }, // ADR-188: byte memmove / memset
+	{ 0, 0 } }; // ADR-168; ADR-174 060EB4A4 (RSTV_HLE_FHPROJ) not hooked: slower on the device (ADR-179)
+static const RstvHleHook vfremix_hle[] = { { 0x060247F2, RSTV_HLE_VFVTX }, { 0x06024CA2, RSTV_HLE_VFVTX }, { 0, 0 } };
+static const struct { const char *set; const RstvHleHook *hle; } s_extra_hle[] = { { "vfremix", vfremix_hle }, { "vfkids", vfkids_hle }, { "fhboxers", fhboxers_hle },
+	{ "twsoc98", twcup98_hle }, /* clone of twcup98: the same SGL modules (sampled: S06063332, S060631DE, M0605CDA8) */
+	{ "ffreveng", ffreveng_hle }, { "ffrevng10", ffrevng10_hle },
+	{ "elandore", elandore_hle }, { "znpwfv", znpwfv_hle }, { "znpwfvt", znpwfv_hle },
+	{ NULL, NULL } };
 
 static const StvGame s_games[] = {
 	{ { "sandor", NULL, "Puzzle & Action: Sando-R (J 951114 V1.000)", { 0x602a0f8, 0x6013fb8, 0x602ac38, 0x6011332 }, 0x602abcc, 0, NULL, 0, 256 }, NULL, {
@@ -210,6 +235,60 @@ void stv_prot_write(u32 addr, u32 data, u32 mask)
 	}
 }
 
+// ---- ADR-132: 315-5838 family decompression chip (MAME stv_state::init_5838, sega5838_r / _w / _control_w) ----
+// writes 0x02000000-0x037FFFFF: offset 0x7FFFF0 source, 0x7FFFF4 tables (bank = address bits 23-24);
+// reads 0x027FFFF8 + bank * 0x800000: decoded bytes when control bit 1 is set, else the ROM; 0x04200000: control
+int stv_5838_enabled;
+static u32 s_5838_bank, s_5838_control;
+
+static u16 comp5838_rom_read(u32 word_addr) // MAME sega5838_source_r: the CPU-visible word in the selected 8 MB bank
+{
+	const u32 off = (s_5838_bank << 23) | ((word_addr * 2) & 0x7FFFFE);
+	return off < 0x3000000 ? T1ReadWord(CartridgeArea->rom, off) : 0xFFFF;
+}
+
+static void comp5838_init(int variant)
+{
+	sega5838_init(variant, comp5838_rom_read);
+	s_5838_bank = 0;
+	s_5838_control = 2; // DecAthlete starts decoding without writing the control register
+	stv_5838_enabled = 1;
+}
+
+u32 stv_5838_read_long(u32 off, u32 mask) // off = offset in the cartridge (0x7FFFF8 + bank * 0x800000)
+{
+	const u32 bank = off >> 23;
+	if (!(s_5838_control & 2))
+		return T1ReadLong(CartridgeArea->rom, bank * 0x800000 + 0x7FFFF8);
+	u32 r = 0;
+	if (mask & 0xFFFF0000)
+		r |= (u32)sega5838_data_r() << 16;
+	if (mask & 0x0000FFFF)
+		r |= sega5838_data_r();
+	return r;
+}
+
+void stv_5838_write(u32 off, u32 data, u32 mask) // off = offset in the cartridge, below 0x1800000
+{
+	s_5838_bank = (off >> 23) & 3;
+	switch (off & 0x7FFFFC) {
+	case 0x7FFFF0:
+		sega5838_source_w(data, mask);
+		break;
+	case 0x7FFFF4:
+		if (mask & 0xFFFF0000)
+			sega5838_table_w(0, (u16)(data >> 16));
+		if (mask & 0x0000FFFF)
+			sega5838_table_w(1, (u16)data);
+		break;
+	}
+}
+
+void stv_5838_control_w(u16 data, u16 mask)
+{
+	s_5838_control = (s_5838_control & ~mask) | (data & mask);
+}
+
 #define NUM_GAMES ((int)(sizeof(s_games) / sizeof(s_games[0])))
 
 // BIOS candidates in preference order (all target sets are Japanese or multi-region)
@@ -279,6 +358,14 @@ static int bios_order(const char *name, int *order)
 
 static int load_bios_from(const char *path, const int *order, int norder)
 {
+#ifndef __vita__
+	int forced[1];
+	if (getenv("RSTV_BIOS")) { // harness: RSTV_BIOS=index into s_bios (try one BIOS)
+		forced[0] = atoi(getenv("RSTV_BIOS"));
+		order = forced;
+		norder = 1;
+	}
+#endif
 	Zip z;
 	if (zip_open(&z, path) != 0)
 		return -1;
@@ -326,6 +413,41 @@ static int load_bios(const char *rom_dir, const StvGame *g, char *err, int errle
 }
 
 void (*rstv_load_progress)(int permille); // ADR-095: frontend loading bar (NULL = none)
+
+// ADR-173: batmanfr's Acclaim RAX sound board ROMs (MAME region "rax"; never copied into the cart area)
+#include "rstv_rax.h"
+static u8 *s_rax_rom;
+static void rax_load(const char *rom_dir, const StvGame *g)
+{
+	static const struct { const char *file; u32 crc, offset; } files[] = {
+		{ "350snda1.u52", 0x9027e7a0, 0x000000 }, { "snd0.u48", 0x02b1927c, 0x400000 },
+		{ "snd1.u49", 0x58b18eda, 0x600000 }, { "snd2.u50", 0x51d626d6, 0x800000 }, { "snd3.u51", 0x31af26ae, 0xa00000 } };
+	enum { RAX_ROM_SIZE = 0xc00000 };
+	rstv_rax_shutdown();
+	free(s_rax_rom);
+	s_rax_rom = NULL;
+	if (strcmp(g->info.romset, "batmanfr") != 0)
+		return;
+	char path[1024];
+	Zip z;
+	snprintf(path, sizeof(path), "%s/%s.zip", rom_dir, g->info.romset);
+	if (zip_open(&z, path) != 0)
+		return;
+	s_rax_rom = (u8 *)malloc(RAX_ROM_SIZE);
+	if (s_rax_rom) {
+		memset(s_rax_rom, 0xff, RAX_ROM_SIZE);
+		for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+			const ZipEntry *e = zip_find(&z, files[i].file, files[i].crc);
+			u32 size = 0;
+			u8 *d = e ? zip_read(&z, e, &size) : NULL;
+			if (d && files[i].offset + size <= RAX_ROM_SIZE)
+				memcpy(s_rax_rom + files[i].offset, d, size);
+			free(d);
+		}
+		rstv_rax_init(s_rax_rom, RAX_ROM_SIZE);
+	}
+	zip_close(&z);
+}
 int STVLoad(const char *rom_dir, const char *romset, char *err, int errlen)
 {
 	const StvGame *g = find_game(romset);
@@ -430,6 +552,9 @@ int STVLoad(const char *rom_dir, const char *romset, char *err, int errlen)
 		return rc;
 
 	stv_prot_enabled = 0;
+	stv_5838_enabled = 0;
+	if (g->comp5838)
+		comp5838_init(g->comp5838 - 1);
 	if (g->init)
 		g->init();
 	else if (g->key5881)
@@ -437,6 +562,7 @@ int STVLoad(const char *rom_dir, const char *romset, char *err, int errlen)
 	eeprom_start(have_nv ? nv : NULL);
 	StvIoSetType(g->io);
 	stv_current_game = &g->info;
+	rax_load(rom_dir, g);
 	{
 		// ADR-093: the sandor engine's slave must not run 2048 cycles ahead inside the wake-up write (the whack-a-mole
 		// mini game lost the player sprite); 0 keeps the ADR-020 default
@@ -472,7 +598,9 @@ static int rstv_sgl_synch_at(u32 addr)
 	if ((op[0] & 0xFF00) == 0xC600) {
 		if (op[1] != 0x400B || op[2] != 0x0009 || (op[3] & 0xFF00) != 0xC400 || op[4] != 0x4011 || op[5] != 0x89F9)
 			return 0;
-		cb = MappedMemoryReadLongNocache(MSH2->regs.GBR + (op[0] & 0xFF) * 4);
+		// GBR through the core: the recompiler keeps it in its own context (MSH2->regs.GBR was stale on the Vita after
+		// a state load, so cottonbm's master never idled: 476k cycles a frame, 34fps)
+		cb = MappedMemoryReadLongNocache(SH2Core->GetGBR(MSH2) + (op[0] & 0xFF) * 4);
 	} else {
 		// variant (nameclub): mov.l @(d,pc),r1 / mov.l @r1,r0 / jsr @r0 / nop / mov.b @(flag,gbr),r0 / cmp/pz r0 / bt loop
 		if (op[1] != 0x6012 || op[2] != 0x400B || op[3] != 0x0009 || (op[4] & 0xFF00) != 0xC400 || op[5] != 0x4011 ||
@@ -484,6 +612,11 @@ static int rstv_sgl_synch_at(u32 addr)
 	u16 c[5];
 	for (int i = 0; i < 5; i++)
 		c[i] = MappedMemoryReadWordNocache(cb + i * 2);
+#if !defined(__vita__)
+	if (getenv("RSTV_HINTLOG"))
+		fprintf(stderr, "slSynch candidate %08x cb %08x: %04x %04x %04x %04x %04x\n", (unsigned)addr, (unsigned)cb, c[0], c[1], c[2],
+			c[3], c[4]);
+#endif
 	if (c[0] == 0x000B && c[1] == 0x0009)
 		return 1; // rts / nop
 	// mov.l @(d,pc),r4 / mov.l @r4,r3 / add #1,r3 / rts / mov.l r3,@r4
@@ -507,6 +640,25 @@ int rstv_idle_hint_at(int w, u32 addr)
 				return 1;
 			}
 		}
+		// the slave polls its FRT input capture flag (FTCSR 0xFFFFFE11 bit 7, set by the master's write to 0x21000000):
+		//   mov.w @(d,pc),r1 / loop: mov.b @r1,r0 / tst #0x80,r0 / bt loop  (cottonbm: 110k loops a frame)
+		if (w && MappedMemoryReadWordNocache(addr) == 0x6010 && MappedMemoryReadWordNocache(addr + 2) == 0xC880 &&
+			MappedMemoryReadWordNocache(addr + 4) == 0x89FC) {
+			const u16 p = MappedMemoryReadWordNocache(addr - 2);
+			if ((p & 0xFF00) == 0x9100 && MappedMemoryReadWordNocache(addr - 2 + 4 + (p & 0xFF) * 2) == 0xFE11) {
+				for (int k = 0; k < rstv_idle_n[w]; k++)
+					if (rstv_idle_pc[w][k] == addr)
+						return 1;
+#if !defined(__vita__)
+				if (getenv("RSTV_HINTLOG"))
+					fprintf(stderr, "idle icf wait S %08x\n", (unsigned)addr);
+#endif
+				if (rstv_idle_n[w] < RSTV_MAX_IDLE_PC) {
+					rstv_idle_pc[w][rstv_idle_n[w]++] = addr;
+					return 1;
+				}
+			}
+		}
 	}
 	for (int k = 0; k < rstv_idle_hint_n[w]; k++) {
 		const u32 x = rstv_idle_hint[w][k];
@@ -519,12 +671,21 @@ int rstv_idle_hint_at(int w, u32 addr)
 			const u16 op = MappedMemoryReadWordNocache(pc);
 			if ((op & 0xFF00) == 0x8900 || (op & 0xFF00) == 0x8B00 || (op & 0xFF00) == 0x8D00 || (op & 0xFF00) == 0x8F00) {
 				const u32 t = pc + 4 + (u32)((s32)(s8)(op & 0xFF) * 2);
-				if (t > pc)
+				// a backward branch to a target after the hint is an inner loop (dnmtdeka's slave delays inside its
+				// task loop): keep going to the branch that closes the loop around the hint
+				if (t > pc || t > x)
 					continue;
 				target = t;
 			}
-			else if ((op & 0xF000) == 0xA000)
-				target = pc + 4 + (u32)((((s32)(op & 0xFFF)) << 20 >> 20) * 2);
+			else if ((op & 0xF000) == 0xA000) {
+				const u32 t = pc + 4 + (u32)((((s32)(op & 0xFFF)) << 20 >> 20) * 2);
+				if (t <= x)
+					target = t;
+				else if (t < pc)
+					continue; // inner loop
+				else
+					break; // forward bra: leaves the code around the hint
+			}
 			else if (op == 0x000B || op == 0x002B || (op & 0xF0FF) == 0x402B || (op & 0xF0FF) == 0x0023)
 				break; // rts / rte / jmp / braf: not a loop
 		}
@@ -575,6 +736,8 @@ int rstv_idle_hint_at(int w, u32 addr)
 	return 0;
 }
 
+int rstv_coin_mailbox_latch;
+
 // Idle-loop PCs (MAME install_stvbios_speedups + per-game pcflush). on = 0 disables (debug)
 void STVSetIdleHacks(int on)
 {
@@ -586,14 +749,20 @@ void STVSetIdleHacks(int on)
 	rstv_once_fn = 0;
 	rstv_hle_n = 0;
 	rstv_game_hacks = g ? g->hacks : 0;
+	// ADR-151: astrass reads its coins from the BIOS sound mailbox byte 0x4F1; the BIOS sound driver overwrote it
+	// before the game's read whenever the 68K got enough time (the Vita: a coin edge, then SYSTEM CHECKING).
+	// A correctness fix, so also without idle hacks.
+	rstv_coin_mailbox_latch = g && g->romset && !strcmp(g->romset, "astrass");
 	if (!on || !g)
 		return;
 	{ // ADR-106: generated sets carry MAME pcflush hints (manual sets list their loop heads directly)
 		const StvGame *sg = (const StvGame *)((const char *)g - offsetof(StvGame, info));
+		// hints in the BIOS ROM are skipped: MAME flushes its recompiler there, they are not idle loops (diehard and
+		// dnmtdeka list 0x0d04, a BIOS boot loop; sleeping in it kept the boot from finishing under the recompiler)
 		for (int k = 0; k < 4; k++) {
-			if (sg->hint_m[k])
+			if (sg->hint_m[k] >= 0x02000000)
 				rstv_idle_hint[0][rstv_idle_hint_n[0]++] = sg->hint_m[k];
-			if (sg->hint_s[k])
+			if (sg->hint_s[k] >= 0x02000000)
 				rstv_idle_hint[1][rstv_idle_hint_n[1]++] = sg->hint_s[k];
 		}
 	}
@@ -601,6 +770,10 @@ void STVSetIdleHacks(int on)
 	rstv_once_fn = g->once_fn;
 	for (const RstvHleHook *h = g->hle; h && h->pc && rstv_hle_n < RSTV_MAX_HLE; h++)
 		rstv_hle[rstv_hle_n++] = *h;
+	for (int k = 0; s_extra_hle[k].set; k++)
+		if (g->romset && !strcmp(g->romset, s_extra_hle[k].set))
+			for (const RstvHleHook *h = s_extra_hle[k].hle; h->pc && rstv_hle_n < RSTV_MAX_HLE; h++)
+				rstv_hle[rstv_hle_n++] = *h;
 	// MAME pcflush 0x60154b2 / 0x6013aee, moved to the loop heads (branch targets) because the
 	// interpreter checks idle PCs on taken branches only
 	static const u32 bios_idle[] = { 0x60154a8, 0x6013ae8 };
@@ -653,6 +826,13 @@ static int stv_state(FILE *fp, int save)
 #undef ST_
 	if (StvIoState(fp, save) || eeprom_state(fp, save) || sega5881_state(fp, save))
 		return -1;
+	if (stv_5838_enabled) { // ADR-132: only the sets with the chip (older saves of other sets keep their layout)
+#define ST_(x) do { if (save) fwrite(&(x), sizeof(x), 1, fp); else if (fread(&(x), sizeof(x), 1, fp) != 1) return -1; } while (0)
+		ST_(s_5838_bank); ST_(s_5838_control);
+#undef ST_
+		if (sega5838_state(fp, save))
+			return -1;
+	}
 	return 0;
 }
 
@@ -685,15 +865,20 @@ static void stv_frames_from_rtc(void)
 // loading a quick save). The clock must follow emulated time only, never the time the emulator was paused or reloaded
 int STVSaveState(FILE *fp)
 {
-	const int offset = StateWriteHeader(fp, "STV ", 2);
+	const int offset = StateWriteHeader(fp, "STV ", 3);
 	stv_state(fp, 1);
 	u32 fc = yabsys.frame_count;
 	fwrite(&fc, sizeof(fc), 1, fp);
+	u32 rax = rstv_rax_active; // version 3 (ADR-173): the batmanfr sound board
+	fwrite(&rax, sizeof(rax), 1, fp);
+	if (rax)
+		rstv_rax_state(fp, 1);
 	return StateFinishHeader(fp, offset);
 }
 
 int STVLoadState(FILE *fp, int version, int size)
 {
+	const long start = ftell(fp);
 	if (stv_state(fp, 0))
 		return -1;
 	if (version >= 2) {
@@ -703,6 +888,20 @@ int STVLoadState(FILE *fp, int version, int size)
 		yabsys.frame_count = fc;
 	} else
 		stv_frames_from_rtc();
+	u32 rax = 0;
+	if (version >= 3 && fread(&rax, sizeof(rax), 1, fp) != 1)
+		return -1;
+	if (rax) {
+		const int r = rstv_rax_active ? rstv_rax_state(fp, 0) : -1;
+		if (r < 0)
+			return -1;
+		if (r > 0) { // a board saved by a build with another layout: start the board again, skip its data
+			rstv_rax_reset();
+			if (start < 0 || fseek(fp, start + size, SEEK_SET))
+				return -1;
+		}
+	} else
+		rstv_rax_reset(); // saves without the board state: start it again
 	return size;
 }
 

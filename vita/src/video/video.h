@@ -35,6 +35,14 @@ void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h);
 
 // screen size: 0 = 4:3 (fit height), 1 = integer scale (pixel exact), 2 = full screen. filter: 0 = sharp (point), 1 = smooth (bilinear)
 void rstv_video_set_mode(int scale, int filter);
+// ADR-190: the game picture turned clockwise by 0, 90, 180 or 270 degrees
+void rstv_video_set_rotate(int deg);
+// layer slot turned clockwise by rot * 90 degrees (drawn at x, y as an h x w rectangle when rot is odd)
+void rstv_video_layer_rot(int slot, int rot);
+// layer slot opacity 0..1 (1 = as drawn)
+void rstv_video_layer_alpha(int slot, float a);
+// the app's LiveArea background as RGBA (malloc'd, NULL if missing)
+uint8_t *rstv_video_load_bg(int *w, int *h);
 
 // ADR-126 (Reirem Display): scanline type 0~5 (off, CRT smooth, CRT sharp, every 2/3/4 pixels), strength 0~2,
 // border 0 = black, 1 = artwork (solid if missing), 2 = solid, solid color index 0~5

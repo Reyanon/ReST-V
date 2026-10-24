@@ -45,6 +45,11 @@ void *rstv_jit_code_alloc(size_t size)
 	return p;
 }
 
+size_t rstv_jit_code_avail(void)
+{
+	return s_uid >= 0 ? s_size - s_used : 0;
+}
+
 void *rstv_jit_code_region(size_t *size)
 {
 	if (size)
@@ -107,6 +112,7 @@ int rstv_jit_keep_open = 1; // code memory is always writable here (ADR-043/048)
 
 int rstv_jit_code_reserve(size_t size) { (void)size; return 0; }
 void *rstv_jit_code_region(size_t *size) { if (size) *size = 0; return NULL; }
+size_t rstv_jit_code_avail(void) { return (size_t)-1; }
 
 void *rstv_jit_code_alloc(size_t size)
 {

@@ -43,6 +43,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdlib.h>
 #include "sh2core.h"
+#include "rstv_slave.h"
 #include "debug.h"
 #include "memory.h"
 #include "yabause.h"
@@ -54,7 +55,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 SH2_struct *MSH2=NULL;
 SH2_struct *SSH2=NULL;
+#if defined(RSTV) && defined(__arm__)
+SH2_struct *rstv_cur_sh2[2];
+u32 rstv_slave_tp = 0; /* ADR-136: 0 = no slave thread */
+#else
 SH2_struct *CurrentSH2;
+#endif
 SH2Interface_struct *SH2Core=NULL;
 extern SH2Interface_struct *SH2CoreList[];
 
@@ -233,7 +239,27 @@ void FASTCALL SH2Exec(SH2_struct *context, u32 cycles)
 {
    CurrentSH2 = context;
 
+#if defined(RSTV)
+   if (rstv_slave_on) {
+      /* ADR-136: the main thread holds the I/O lock except while its CPU runs; the slave thread takes it for the timers
+         and the DMA controller (DMAProc goes through the memory map) */
+      const int held = rstv_io_held();
+      if (held)
+         rstv_io_unlock();
+      SH2Core->Exec(context, cycles);
+      rstv_io_lock();
+      FRTExec(cycles);
+      WDTExec(cycles);
+      DMAProc(cycles);
+      if (!held)
+         rstv_io_unlock();
+      return;
+   }
+#endif
    SH2Core->Exec(context, cycles);
+#if defined(RSTV)
+   { extern volatile unsigned rstv_act_pc; rstv_act_pc = 0x18; } /* sampler: on-chip timers and DMA after the slice */
+#endif
 
    FRTExec(cycles);
    WDTExec(cycles);
@@ -264,6 +290,8 @@ void SH2RemoveInterrupt(SH2_struct *context, u8 vector, u8 level)
 
 void SH2NMI(SH2_struct *context)
 {
+   { extern void rstv_log_printf(const char *fmt, ...); // rare (ADR-151 diag)
+     rstv_log_printf("sh2nmi f%u l%d %s", (unsigned)yabsys.frame_count, yabsys.LineCount, context == SSH2 ? "S" : "M"); }
    context->onchip.ICR |= 0x8000;
    SH2SendInterrupt(context, 0xB, 0x10);
 }
@@ -1379,7 +1407,7 @@ u32 FASTCALL OnchipReadLong(u32 addr) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
+static void OnchipWriteByte_impl(u32 addr, u8 val) {
    switch(addr) {
       case 0x000:
 //         LOG("Serial Mode Register write: %02X\n", val);
@@ -1566,9 +1594,17 @@ void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
    }
 }
 
+/* ReST-V (ADR-136): the slave thread's writes to its FRT registers race with the master's input capture */
+void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
+   const int lk = rstv_slave_on && CurrentSH2 == SSH2;
+   if (lk) rstv_io_lock();
+   OnchipWriteByte_impl(addr, val);
+   if (lk) rstv_io_unlock();
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
-void FASTCALL OnchipWriteWord(u32 addr, u16 val) {
+static void OnchipWriteWord_impl(u32 addr, u16 val) {
    switch(addr)
    {
       case 0x060:
@@ -1689,6 +1725,14 @@ void FASTCALL OnchipWriteWord(u32 addr, u16 val) {
    }
 }
 
+/* ReST-V (ADR-136): the slave thread's writes to its FRT registers race with the master's input capture */
+void FASTCALL OnchipWriteWord(u32 addr, u16 val) {
+   const int lk = rstv_slave_on && CurrentSH2 == SSH2;
+   if (lk) rstv_io_lock();
+   OnchipWriteWord_impl(addr, val);
+   if (lk) rstv_io_unlock();
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 /* ReST-V: 64/32 truncating division for the on-chip divider. The Vita CPU has no integer divide and
@@ -1730,7 +1774,46 @@ static INLINE void rstv_div64(s64 dividend, s32 divisor, s64 *q, s32 *r)
 /* ReST-V (ADR-047): the same division for native routines */
 void rstv_div64_ext(s64 dividend, s32 divisor, s64 *q, s32 *r) { rstv_div64(dividend, divisor, q, r); }
 
-void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
+/* ReST-V: SH7604 division unit as MAME sh7604_device::divu_start (src/devices/cpu/sh/sh7604.cpp, mamedev/mame
+   master 2026-10). Overflow (zero divisor or a quotient outside 32 bits) stops after three division steps:
+   DVDNTH = partial remainder, DVDNTL = 0x7FFFFFFF / 0x80000000 by the sign (or the partial quotient with OVFIE).
+   The old code only overflowed negative quotients below -2^32 and set made-up DVDNTH values */
+static void rstv_divu(s64 dividend)
+{
+   SH2_struct *sh = CurrentSH2;
+   const s32 divisor = (s32)sh->onchip.DVSR;
+   if (divisor && (dividend != (s64)0x8000000000000000ULL || divisor != -1))
+   {
+      s64 quotient;
+      s32 remainder;
+      rstv_div64(dividend, divisor, &quotient, &remainder);
+      rstv_div_count++;
+      if (quotient == (s64)(s32)quotient)
+      {
+         sh->onchip.DVDNTL = sh->onchip.DVDNTUL = (u32)quotient;
+         sh->onchip.DVDNTH = sh->onchip.DVDNTUH = (u32)remainder;
+         return;
+      }
+   }
+   s64 rem = dividend >> 32;
+   u32 q = (u32)dividend;
+   for (int i = 0; i < 3; i++)
+   {
+      const int sub = (rem < 0) == (divisor < 0);
+      rem = (s64)((u64)rem << 1) | (q >> 31);
+      q <<= 1;
+      rem += sub ? -(s64)divisor : (s64)divisor;
+      q |= ((rem < 0) == (divisor < 0)) ? 1 : 0;
+   }
+   const int neg = (dividend < 0) != (divisor < 0);
+   sh->onchip.DVDNTH = sh->onchip.DVDNTUH = (u32)rem;
+   sh->onchip.DVDNTL = sh->onchip.DVDNTUL = (sh->onchip.DVCR & 2) ? q : neg ? 0x80000000u : 0x7FFFFFFFu;
+   sh->onchip.DVCR |= 1;
+   if (sh->onchip.DVCR & 0x2)
+      SH2SendInterrupt(sh, sh->onchip.VCRDIV & 0x7F, (MSH2->onchip.IPRA >> 12) & 0xF);
+}
+
+static void OnchipWriteLong_impl(u32 addr, u32 val) {
    switch (addr)
    {
    case 0x010:
@@ -1745,40 +1828,9 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
          return;
       case 0x104: // 32-bit / 32-bit divide operation
       case 0x124:
-      {
-         s32 divisor = (s32) CurrentSH2->onchip.DVSR;
-         if (divisor == 0)
-         {
-            // Regardless of what DVDNTL is set to, the top 3 bits
-            // are used to create the new DVDNTH value
-            if (val & 0x80000000)
-            {
-               CurrentSH2->onchip.DVDNTL = 0x80000000;
-               CurrentSH2->onchip.DVDNTH = 0xFFFFFFFC | ((val >> 29) & 0x3);
-            }
-            else
-            {
-               CurrentSH2->onchip.DVDNTL = 0x7FFFFFFF;
-               CurrentSH2->onchip.DVDNTH = 0 | (val >> 29);
-            }
-            CurrentSH2->onchip.DVDNTUL = CurrentSH2->onchip.DVDNTL;
-            CurrentSH2->onchip.DVDNTUH = CurrentSH2->onchip.DVDNTH;
-            CurrentSH2->onchip.DVCR |= 1;
-
-            if (CurrentSH2->onchip.DVCR & 0x2)
-               SH2SendInterrupt(CurrentSH2, CurrentSH2->onchip.VCRDIV & 0x7F, (MSH2->onchip.IPRA >> 12) & 0xF);
-         }
-         else
-         {
-            s32 quotient = ((s32) val) / divisor;
-            s32 remainder = ((s32) val) % divisor;
-            CurrentSH2->onchip.DVDNTL = quotient;
-            CurrentSH2->onchip.DVDNTUL = quotient;
-            CurrentSH2->onchip.DVDNTH = remainder;
-            CurrentSH2->onchip.DVDNTUH = remainder;
-         }
+         /* ReST-V: the dividend is sign-extended into DVDNTH (MAME sh7604_device::dvdnt_w) */
+         rstv_divu((s64)(s32)val);
          return;
-      }
       case 0x108:
       case 0x128:
          CurrentSH2->onchip.DVCR = val & 0x3;
@@ -1792,68 +1844,9 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
          CurrentSH2->onchip.DVDNTH = val;
          return;
       case 0x114:
-      case 0x134: { // 64-bit / 32-bit divide operation
-         s32 divisor = (s32) CurrentSH2->onchip.DVSR;
-         s64 dividend = CurrentSH2->onchip.DVDNTH;
-         dividend <<= 32;
-         dividend |= val;
-
-         if (divisor == 0)
-         {
-            if (CurrentSH2->onchip.DVDNTH & 0x80000000)
-            {
-               CurrentSH2->onchip.DVDNTL = 0x80000000;
-               CurrentSH2->onchip.DVDNTH = CurrentSH2->onchip.DVDNTH << 3; // fix me
-            }
-            else
-            {
-               CurrentSH2->onchip.DVDNTL = 0x7FFFFFFF;
-               CurrentSH2->onchip.DVDNTH = CurrentSH2->onchip.DVDNTH << 3; // fix me
-            }
-
-            CurrentSH2->onchip.DVDNTUL = CurrentSH2->onchip.DVDNTL;
-            CurrentSH2->onchip.DVDNTUH = CurrentSH2->onchip.DVDNTH;
-            CurrentSH2->onchip.DVCR |= 1;
-
-            if (CurrentSH2->onchip.DVCR & 0x2)
-               SH2SendInterrupt(CurrentSH2, CurrentSH2->onchip.VCRDIV & 0x7F, (MSH2->onchip.IPRA >> 12) & 0xF);
-         }
-         else
-         {
-            s64 quotient;
-            s32 remainder;
-            rstv_div64(dividend, divisor, &quotient, &remainder);
-            rstv_div_count++;
-
-            if (quotient > 0x7FFFFFFF)
-            {
-               CurrentSH2->onchip.DVCR |= 1;
-               CurrentSH2->onchip.DVDNTL = 0x7FFFFFFF;
-               CurrentSH2->onchip.DVDNTH = 0xFFFFFFFE; // fix me
-
-               if (CurrentSH2->onchip.DVCR & 0x2)
-                  SH2SendInterrupt(CurrentSH2, CurrentSH2->onchip.VCRDIV & 0x7F, (MSH2->onchip.IPRA >> 12) & 0xF);
-            }
-            else if ((s32)(quotient >> 32) < -1)
-            {
-               CurrentSH2->onchip.DVCR |= 1;
-               CurrentSH2->onchip.DVDNTL = 0x80000000;
-               CurrentSH2->onchip.DVDNTH = 0xFFFFFFFE; // fix me
-
-               if (CurrentSH2->onchip.DVCR & 0x2)
-                  SH2SendInterrupt(CurrentSH2, CurrentSH2->onchip.VCRDIV & 0x7F, (MSH2->onchip.IPRA >> 12) & 0xF);
-            }
-            else
-            {
-               CurrentSH2->onchip.DVDNTL = quotient;
-               CurrentSH2->onchip.DVDNTH = remainder;
-            }
-
-            CurrentSH2->onchip.DVDNTUL = CurrentSH2->onchip.DVDNTL;
-            CurrentSH2->onchip.DVDNTUH = CurrentSH2->onchip.DVDNTH;
-         }
+      case 0x134: // 64-bit / 32-bit divide operation
+         rstv_divu((s64)(((u64)CurrentSH2->onchip.DVDNTH << 32) | val));
          return;
-      }
       case 0x118:
       case 0x138:
          CurrentSH2->onchip.DVDNTUH = val;
@@ -1978,6 +1971,14 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
          LOG("Unhandled Onchip long write %08X,%08X\n", (int)addr, val);
          break;
    }
+}
+
+/* ReST-V (ADR-136): the slave thread's writes to its FRT registers race with the master's input capture */
+void FASTCALL OnchipWriteLong(u32 addr, u32 val) {
+   const int lk = rstv_slave_on && CurrentSH2 == SSH2;
+   if (lk) rstv_io_lock();
+   OnchipWriteLong_impl(addr, val);
+   if (lk) rstv_io_unlock();
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -2245,7 +2246,10 @@ void DMAExec(void) {
       CPU slice, so a CPU loop that patches the copied pattern name table in place ran first and the copy then
       overwrote it (ffreveng player select background); on the board the copy leads the CPU (bus cycle stealing) */
    const u32 d0 = CurrentSH2->onchip.DAR0 & 0x0FF80000, d1 = CurrentSH2->onchip.DAR1 & 0x0FF80000;
-   if (((CurrentSH2->onchip.CHCR0 & 3) == 1 && d0 == 0x05E00000) || ((CurrentSH2->onchip.CHCR1 & 3) == 1 && d1 == 0x05E00000))
+   /* VDP1 VRAM too: gaxeduel streams the next character's pattern with the DMAC while VDP1 draws it (half-copied
+      characters on the player select screen) */
+   if (((CurrentSH2->onchip.CHCR0 & 3) == 1 && (d0 == 0x05E00000 || d0 == 0x05C00000)) ||
+       ((CurrentSH2->onchip.CHCR1 & 3) == 1 && (d1 == 0x05E00000 || d1 == 0x05C00000)))
       DMAProc(0x10000000); /* not 0x7FFFFFFF: DMAProc doubles the budget for dual address mode */
    else
       DMAProc(200);
@@ -2397,12 +2401,53 @@ int getEatClock(u32 src, u32 dst) {
 
 extern int rstv_dma_busy;
 static void DMATransferCycles0(Dmac * dmac, int cycles);
+#ifndef __vita__
+unsigned rstv_dmac_hist[64][3]; /* harness (RSTV_DMACLOG): units per (source, destination) region pair and type */
+#endif
 void DMATransferCycles(Dmac * dmac, int cycles ){
    const int prev = rstv_dma_busy;
    rstv_dma_busy = 3;
+#ifndef __vita__
+   const u32 tcr0 = *dmac->TCR, k_ = ((*dmac->SAR >> 24) & 7) << 3 | ((*dmac->DAR >> 24) & 7);
+#endif
    DMATransferCycles0(dmac, cycles);
+#ifndef __vita__
+   rstv_dmac_hist[k_][0] += tcr0 - *dmac->TCR;
+   rstv_dmac_hist[k_][1] = *dmac->SAR;
+   rstv_dmac_hist[k_][2] = (*dmac->DAR & 0x0FFFFFFF) | ((u32)((*dmac->CHCR & 0x0C00) >> 10) << 28);
+#endif
    rstv_dma_busy = prev;
 }
+/* ReST-V (ADR-145): long units from high work RAM to VDP2 VRAM, both +4: the units this slice allows in one run
+   (vfkids sends 60KB a frame; each unit went through two mapped accesses). Returns the units done */
+static u32 rstv_dmac_fast(Dmac *dmac, int step)
+{
+   const u32 sar = *dmac->SAR, dar = *dmac->DAR;
+   if ((sar & 0x0E000000) != 0x06000000 || (dar & 0x0FF00000) != 0x05E00000 || ((sar | dar) & 3) || dmac->copy_clock < 0 ||
+       *dmac->TCR == 0)
+      return 0;
+   u32 n = *dmac->TCR;
+   if (step > 0) {
+      const u32 c = (u32)dmac->copy_clock / (u32)step + 1;
+      if (c < n)
+         n = c;
+   }
+   const u32 hw = (0x100000 - (sar & 0xFFFFF)) >> 2, vr = (0x80000 - (dar & 0x7FFFF)) >> 2;
+   if (n > hw)
+      n = hw;
+   if (n > vr)
+      n = vr;
+   if (!n)
+      return 0;
+   extern void rstv_vdp2_write_longs_hw(u32 addr, u32 hwoff, u32 n);
+   rstv_vdp2_write_longs_hw(dar, sar & 0xFFFFF, n);
+   dmac->copy_clock -= (int)(n * (u32)step);
+   *dmac->SAR += 4 * n;
+   *dmac->DAR += 4 * n;
+   *dmac->TCR -= n;
+   return n;
+}
+
 static void DMATransferCycles0(Dmac * dmac, int cycles ){
    int size;
    u32 i = 0;
@@ -2482,6 +2527,18 @@ static void DMATransferCycles0(Dmac * dmac, int cycles ){
          case 2:
             destInc *= 4;
             srcInc *= 4;
+            if (srcInc == 4 && destInc == 4) { // ADR-145
+               const u32 f = rstv_dmac_fast(dmac, eat);
+               i += f;
+               if (f && *dmac->TCR <= 0) {
+                  if (*dmac->CHCR & 0x4)
+                     SH2SendInterrupt(CurrentSH2, *dmac->VCRDMA, (CurrentSH2->onchip.IPRA & 0xF00) >> 8);
+                  *dmac->CHCR |= 0x2;
+                  *dmac->CHCRM |= 0x2;
+                  SH2WriteNotify(*dmac->DAR - i * destInc, i * abs(destInc));
+                  return;
+               }
+            }
             while (dmac->copy_clock >= 0) {
               dmac->copy_clock -= eat;
                u32 val = MappedMemoryReadLongNocache(*dmac->SAR);
@@ -2506,6 +2563,18 @@ static void DMATransferCycles0(Dmac * dmac, int cycles ){
          case 3:
            destInc *= 4;
            srcInc *= 4;
+           if (srcInc == 4 && destInc == 4) { // ADR-145
+              const u32 f = rstv_dmac_fast(dmac, eat >> 2);
+              i += f;
+              if (f && *dmac->TCR <= 0) {
+                 if (*dmac->CHCR & 0x4)
+                    SH2SendInterrupt(CurrentSH2, *dmac->VCRDMA, (CurrentSH2->onchip.IPRA & 0xF00) >> 8);
+                 *dmac->CHCR |= 0x2;
+                 *dmac->CHCRM |= 0x2;
+                 SH2WriteNotify(*dmac->DAR - i * destInc, i * abs(destInc));
+                 return;
+              }
+           }
            while (dmac->copy_clock >= 0) {
              dmac->copy_clock -= (eat>>2);
              u32 val = MappedMemoryReadLongNocache(*dmac->SAR);
@@ -2718,6 +2787,18 @@ static void SSH2InputCaptureWriteWord2(void)
       SH2SendInterrupt(SSH2, (SSH2->onchip.VCRC >> 8) & 0x7F, (SSH2->onchip.IPRB >> 8) & 0xF);
    }
 
+   /* ADR-136: the slave runs on its own thread: just wake it (no nested run inside the master's write) */
+#ifdef RSTV_DYNAREC
+   if (rstv_slave_on) {
+      /* the slave sleeps in its FTCSR poll (idle loop): end the sleep, and let it catch up to this point so it answers
+         right away as on the board (the nested run did that before) */
+      extern void SH2DynWake(SH2_struct *context);
+      SH2DynWake(SSH2);
+      rstv_slave_kick();
+      rstv_slave_drain();
+      return;
+   }
+#endif
 #ifdef RSTV_DYNAREC
    /* ReST-V: with the dynarec, ExecuteCount skips a run this short when the previous slice overshot, so the
       slave never saw the master's command-queue reset in time (sanjeon). Use the dynarec's nested run. */

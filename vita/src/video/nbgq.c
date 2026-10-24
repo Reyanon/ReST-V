@@ -3,6 +3,9 @@
 #include "nbgq.h"
 
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #define VRAM_MASK 0x7FFFF
 
@@ -29,7 +32,8 @@ typedef struct {
 // char, palette, flip and priority of the 8x8 cell containing map coord (xx, yy)
 int nbgq_track;
 uint32_t nbgq_track_pages[4];
-#define TRACK_PAGE(a) do { const unsigned p_ = ((unsigned)(a) & 0x7FFFFu) >> 12; nbgq_track_pages[p_ >> 5] |= 1u << (p_ & 31); } while (0)
+uint16_t nbgq_track_sub[128];
+#define TRACK_PAGE(a) do { const unsigned a_ = (unsigned)(a) & 0x7FFFFu, p_ = a_ >> 12; nbgq_track_pages[p_ >> 5] |= 1u << (p_ & 31); 	nbgq_track_sub[p_] |= (uint16_t)(1u << ((a_ >> 8) & 15)); } while (0)
 
 static void cell_at(const RstvLayerCapture *c, const RstvCapRow *r, const uint8_t *vram, int xx, int yy, Cell *o)
 {
@@ -89,7 +93,7 @@ static void cell_at(const RstvLayerCapture *c, const RstvCapRow *r, const uint8_
 		TRACK_PAGE(addr);
 		TRACK_PAGE(addr + 3);
 		TRACK_PAGE(o->unit * 32);
-		TRACK_PAGE(o->unit * 32 + 127);
+		TRACK_PAGE(o->unit * 32 + (cn == 0 ? 31 : cn == 1 ? 63 : cn == 4 ? 255 : 127)); // ADR-137: the char's last byte
 	}
 	o->flipx = flip & 1;
 	o->flipy = (flip >> 1) & 1;
@@ -277,15 +281,56 @@ static void unpack_unit(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram
 	}
 }
 
-void nbgq_atlas_update(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram, const uint8_t *dirty)
+// ADR-185: a whole 256-byte block = 8 units side by side on 8 atlas rows. Each 64-byte row is built in cached memory
+// and written with four 16-byte stores (unpack_unit: four 32-bit stores per unit row into uncached GPU memory)
+static void unpack_block(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram, uint32_t u0)
+{
+	const int ox = (int)(u0 & 127) * 8, oy = (int)(u0 >> 7) * 8;
+	const uint8_t *src = vram + u0 * 32;
+	uint8_t r4[64] __attribute__((aligned(16))), r8[64] __attribute__((aligned(16)));
+	for (int r = 0; r < 8; r++) {
+		for (int k = 0; k < 8; k++) {
+			const uint8_t *s4 = src + k * 32 + r * 4;
+			uint8_t *d = r4 + k * 8;
+			for (int b = 0; b < 4; b++) {
+				d[b * 2] = s4[b] >> 4;
+				d[b * 2 + 1] = s4[b] & 15;
+			}
+			memcpy(r8 + k * 8, src + k * 32 + r * 8, 8);
+		}
+		uint8_t *d4 = a4 + (oy + r) * pitch + ox, *d8 = a8 + (oy + r) * pitch + ox;
+#ifdef __ARM_NEON
+		for (int q = 0; q < 64; q += 16) {
+			vst1q_u8(d4 + q, vld1q_u8(r4 + q));
+			vst1q_u8(d8 + q, vld1q_u8(r8 + q));
+		}
+#else
+		memcpy(d4, r4, 64);
+		memcpy(d8, r8, 64);
+#endif
+	}
+}
+
+void nbgq_atlas_update(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram, const uint16_t *dirty)
 {
 	for (int p = 0; p < 128; p++) {
-		if (dirty && !dirty[p])
+		const unsigned m = dirty ? dirty[p] : 0xFFFFu;
+		if (!m)
 			continue;
-		// the 128 units of this page + 1 preceding unit whose 8bpp block reaches into this page
-		for (int k = -1; k < 128; k++) {
-			const uint32_t u = (uint32_t)(p * 128 + k) & 0x3FFF;
-			unpack_unit(a4, a8, pitch, vram, u);
+		// ADR-137: per changed 256-byte block, its 8 units + 1 preceding unit whose 8bpp block reaches into it
+		for (int b = 0; b < 16; b++) {
+			if (!(m & (1u << b)))
+				continue;
+			const int k0 = (b && (m & (1u << (b - 1)))) ? b * 8 : b * 8 - 1;
+			const uint32_t u0 = (uint32_t)(p * 128 + b * 8);
+			if (u0 * 32 + 256 + 32 <= VRAM_MASK + 1 && (pitch & 15) == 0) { // the last unit's 8bpp rows read 32 bytes on
+				if (k0 < b * 8)
+					unpack_unit(a4, a8, pitch, vram, (u0 - 1) & 0x3FFF);
+				unpack_block(a4, a8, pitch, vram, u0);
+				continue;
+			}
+			for (int k = k0; k < b * 8 + 8; k++)
+				unpack_unit(a4, a8, pitch, vram, (uint32_t)(p * 128 + k) & 0x3FFF);
 		}
 	}
 }

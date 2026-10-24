@@ -71,6 +71,11 @@ option(RSTV_V1WATCH "diag: log suspicious VDP1 register changes to ux0:data/rest
 if(RSTV_V1WATCH)
   target_compile_definitions(rstv_core PRIVATE RSTV_V1WATCH_FILE="ux0:data/restv/v1watch.txt")
 endif()
+# debug-only tools (fast boot ...). Release builds: -DRSTV_DEBUG_TOOLS=OFF (owner: not in published builds)
+option(RSTV_DEBUG_TOOLS "Include debug-only tools (fast boot)" ON)
+if(RSTV_DEBUG_TOOLS)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE RSTV_DEBUG_TOOLS)
+endif()
 if(RSTV_LOG)
   target_compile_definitions(${PROJECT_NAME} PRIVATE RSTV_ENABLE_LOG)
   if(RSTV_LOG_HOST)
@@ -78,7 +83,36 @@ if(RSTV_LOG)
   endif()
 endif()
 
+# ADR-195: kernel helper module (reads the PS button), in the VPK as module/restv_kctrl.skprx. Its user stubs are made
+# here directly (vita_create_stubs runs make on an unquoted path, and this tree's path has a space)
+add_executable(restv_kctrl kmod/restv_kctrl.c)
+set_target_properties(restv_kctrl PROPERTIES LINK_FLAGS "-nostdlib")
+target_compile_options(restv_kctrl PRIVATE -fno-builtin)
+target_link_libraries(restv_kctrl SceCtrlForDriver_stub SceThreadmgrForDriver_stub)
+# (vita_create_self splits its flags on spaces, so the export config path cannot be passed through it)
+add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
+  COMMAND vita-elf-create -e "${CMAKE_SOURCE_DIR}/kmod/exports.yml" $<TARGET_FILE:restv_kctrl> "${CMAKE_BINARY_DIR}/restv_kctrl.velf"
+  COMMAND vita-make-fself -c "${CMAKE_BINARY_DIR}/restv_kctrl.velf" "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
+  DEPENDS restv_kctrl "${CMAKE_SOURCE_DIR}/kmod/exports.yml"
+  VERBATIM)
+add_custom_target(kctrl_skprx ALL DEPENDS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx")
+set(RSTV_KSTUB_DIR "${CMAKE_BINARY_DIR}/kctrl_stubs")
+set(RSTV_KSTUB "${RSTV_KSTUB_DIR}/librestv_kctrl_v4_stub_weak.a")
+add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/kctrl.yml"
+  COMMAND vita-elf-export kernel $<TARGET_FILE:restv_kctrl> "${CMAKE_SOURCE_DIR}/kmod/exports.yml" "${CMAKE_BINARY_DIR}/kctrl.yml"
+  DEPENDS restv_kctrl "${CMAKE_SOURCE_DIR}/kmod/exports.yml"
+  VERBATIM)
+add_custom_command(OUTPUT "${RSTV_KSTUB}"
+  COMMAND vita-libs-gen "${CMAKE_BINARY_DIR}/kctrl.yml" "${RSTV_KSTUB_DIR}"
+  COMMAND make -C "${RSTV_KSTUB_DIR}"
+  DEPENDS "${CMAKE_BINARY_DIR}/kctrl.yml"
+  VERBATIM)
+add_custom_target(kctrl_stubs DEPENDS "${RSTV_KSTUB}")
+add_dependencies(${PROJECT_NAME} kctrl_stubs)
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/kmod)
+
 target_link_libraries(${PROJECT_NAME}
+  "${RSTV_KSTUB}"
   rstv_c2
   rstv_core
   vitashark
@@ -89,6 +123,7 @@ target_link_libraries(${PROJECT_NAME}
   SceGxm_stub
   SceDisplay_stub
   SceAppMgr_stub
+  SceShellSvc_stub
   SceCommonDialog_stub
   SceIme_stub
   SceAudio_stub
@@ -125,8 +160,10 @@ set(RSTV_SCE_SYS_FILES
   sce_sys/livearea/contents/startup.png
   sce_sys/livearea/contents/template.xml
 )
-set(RSTV_VPK_ADD_ARGS "")
-set(RSTV_VPK_DEPS "")
+# assets/blankArtwork.png: the border artwork of games without their own (owner)
+set(RSTV_VPK_ADD_ARGS -a "${CMAKE_BINARY_DIR}/restv_kctrl.skprx=module/restv_kctrl.skprx"
+  -a "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png=assets/blankArtwork.png")
+set(RSTV_VPK_DEPS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx" "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png")
 foreach(f ${RSTV_SCE_SYS_FILES})
   list(APPEND RSTV_VPK_ADD_ARGS -a "${CMAKE_SOURCE_DIR}/${f}=${f}")
   list(APPEND RSTV_VPK_DEPS "${CMAKE_SOURCE_DIR}/${f}")

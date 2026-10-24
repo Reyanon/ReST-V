@@ -24,7 +24,8 @@ static GxTex *s_gpu_tex;
 static int s_gpu_w, s_gpu_h, s_gpu_last;
 
 static GxProg *s_prog_img, *s_prog_osd, *s_prog_fill, *s_prog_layer; // layer: premultiplied alpha (ui.c, ADR-095)
-static GxParam s_u_layer_scale, s_u_layer_tex;
+static GxProg *s_prog_tint; // layer times an opacity (blinking menu focus, ADR-194)
+static GxParam s_u_layer_scale, s_u_layer_tex, s_u_tint_scale, s_u_tint_tex, s_u_tint_a;
 static GxParam s_u_img_scale, s_u_img_tex, s_u_osd_scale, s_u_osd_tex, s_u_fill_scale, s_u_fill_color;
 
 // pixel coords (960x544, top = 0) -> NDC. Texture coords unchanged
@@ -39,6 +40,11 @@ static const char *s_fs_img =
 	"float4 main(float2 vTex : TEXCOORD0, uniform sampler2D tex) : COLOR\n"
 	"{\n"
 	"  return tex2D(tex, vTex);\n"
+	"}\n";
+static const char *s_fs_tint =
+	"float4 main(float2 vTex : TEXCOORD0, uniform sampler2D tex, uniform float4 alpha) : COLOR\n"
+	"{\n"
+	"  return tex2D(tex, vTex) * alpha.x;\n"
 	"}\n";
 static const char *s_vs_fill =
 	"void main(float2 position, uniform float4 scale, float4 out vPosition : POSITION)\n"
@@ -75,6 +81,12 @@ void rstv_video_init(void)
 	s_prog_img = gx_prog(s_vs_img, s_fs_img, img_attr, 2, 16, GX_BLEND_NONE);
 	s_prog_osd = gx_prog(s_vs_img, s_fs_img, img_attr, 2, 16, GX_BLEND_ALPHA);
 	s_prog_layer = gx_prog(s_vs_img, s_fs_img, img_attr, 2, 16, GX_BLEND_PREMUL);
+	s_prog_tint = gx_prog(s_vs_img, s_fs_tint, img_attr, 2, 16, GX_BLEND_PREMUL);
+	if (s_prog_tint) {
+		s_u_tint_scale = gx_param(s_prog_tint, "scale");
+		s_u_tint_tex = gx_param(s_prog_tint, "tex");
+		s_u_tint_a = gx_param(s_prog_tint, "alpha");
+	}
 	const GxAttr fill_attr[1] = { { "position", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0 } };
 	s_prog_fill = gx_prog(s_vs_fill, s_fs_fill, fill_attr, 1, 8, GX_BLEND_NONE);
 	if (s_prog_img) {
@@ -279,7 +291,19 @@ static void quad(const GxProg *p, GxParam scale, float x0, float y0, float x1, f
 	gx_draw(SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, v, gx_seq_indices(4), 4);
 }
 
-static struct { GxTex *t; int x, y, w, h; } s_layer[4];
+static struct { GxTex *t; int x, y, w, h, rot; float a; } s_layer[4] = { { .a = 1 }, { .a = 1 }, { .a = 1 }, { .a = 1 } };
+// ADR-194: a layer's opacity (the blinking menu focus is a small layer of its own: the blink costs no CPU drawing)
+void rstv_video_layer_alpha(int slot, float a)
+{
+	if (slot >= 0 && slot < 4)
+		s_layer[slot].a = a;
+}
+// ADR-190: a layer turned clockwise by rot * 90 degrees (the FPS box follows a Vita held upright)
+void rstv_video_layer_rot(int slot, int rot)
+{
+	if (slot >= 0 && slot < 4)
+		s_layer[slot].rot = rot & 3;
+}
 void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h)
 {
 	if (slot < 0 || slot >= 4)
@@ -291,11 +315,32 @@ void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h)
 	s_layer[slot].h = h;
 }
 
-static int s_scale_mode, s_filter = 1;
+static int s_scale_mode, s_filter = 1, s_rot;
 void rstv_video_set_mode(int scale, int filter)
 {
 	s_scale_mode = scale;
 	s_filter = filter;
+}
+void rstv_video_set_rotate(int deg)
+{
+	s_rot = ((deg % 360) + 360) % 360 / 90;
+}
+// ADR-190: like quad, the texture turned clockwise by rot * 90 degrees inside the screen rectangle
+static void quad_rot(const GxProg *p, GxParam scale, float x0, float y0, float x1, float y1, float u1, float v1, int rot)
+{
+	// texture corners top-left, top-right, bottom-left, bottom-right; screen corners take them in turn
+	const float tu[4] = { 0, u1, 0, u1 }, tv[4] = { 0, 0, v1, v1 };
+	static const int pick[4][4] = { { 0, 1, 2, 3 }, { 2, 0, 3, 1 }, { 3, 2, 1, 0 }, { 1, 3, 0, 2 } };
+	const int *k = pick[rot & 3];
+	float *v = (float *)gx_temp(4 * 4 * sizeof(float));
+	if (!v)
+		return;
+	const float d[16] = { x0, y0, tu[k[0]], tv[k[0]], x1, y0, tu[k[1]], tv[k[1]], x0, y1, tu[k[2]], tv[k[2]], x1, y1, tu[k[3]], tv[k[3]] };
+	memcpy(v, d, sizeof(d));
+	const float sc[4] = { 2.0f / 960.0f, 2.0f / 544.0f, 0, 0 };
+	(void)p;
+	gx_set4(scale, sc);
+	gx_draw(SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, v, gx_seq_indices(4), 4);
 }
 
 // ---- ADR-126: scanlines and border (same math as Reirem frontend/video.c) ----
@@ -510,6 +555,11 @@ static uint8_t *load_art_file(const char *name, int *w, int *h)
 	}
 	return b;
 }
+// the app's LiveArea background (RGBA, malloc'd; NULL if missing): loading screen (ADR-191)
+uint8_t *rstv_video_load_bg(int *w, int *h)
+{
+	return load_png("app0:sce_sys/livearea/contents/bg.png", w, h);
+}
 void rstv_video_set_art(const char *set, const char *parent)
 {
 	s_art_w = s_art_h = 0; // (one texture: one game per run)
@@ -519,9 +569,22 @@ void rstv_video_set_art(const char *set, const char *parent)
 	uint8_t *b = load_art_file(set, &w, &h);
 	if (!b && parent)
 		b = load_art_file(parent, &w, &h);
+	if (!b) // no artwork for this game: the app's blank artwork (owner), as it is
+		b = load_png("app0:assets/blankArtwork.png", &w, &h);
 	if (!b) {
-		RSTV_LOG("video: %s artwork missing (Border Artwork falls back to the border color)", set);
-		return;
+		// (no blank artwork either: the app's LiveArea background, full screen at 60% over black, not too loud)
+		b = load_png("app0:sce_sys/livearea/contents/bg.png", &w, &h);
+		if (!b) {
+			RSTV_LOG("video: %s artwork missing (Border Artwork falls back to the border color)", set);
+			return;
+		}
+		for (int i = 0; i < w * h; i++) {
+			uint8_t *px = b + (size_t)i * 4;
+			px[0] = (uint8_t)(px[0] * 3 / 5);
+			px[1] = (uint8_t)(px[1] * 3 / 5);
+			px[2] = (uint8_t)(px[2] * 3 / 5);
+		}
+		RSTV_LOG("video: %s artwork missing, bg.png at 60%%", set);
 	}
 	if (w > 2048 || h > 2048 || (s_art && (w > s_art->w || h > s_art->h))) {
 		RSTV_LOG("video: artwork %dx%d too large", w, h);
@@ -572,20 +635,22 @@ void rstv_video_present(void)
 			w = s_w[s_ready];
 			h = s_h[s_ready];
 		}
-		// screen size: 4:3 (fit to 544 height), integer scale, full
+		// screen size: 4:3 (fit to 544 height), integer scale, full; turned a quarter: the picture's sides swap (ADR-190)
+		const int side = s_rot & 1;
+		const int pw = side ? h : w, ph = side ? w : h;
 		float dw, dh;
-		if (s_scale_mode == 1 && w > 0 && h > 0) {
-			int k = 960 / w < 544 / h ? 960 / w : 544 / h;
+		if (s_scale_mode == 1 && pw > 0 && ph > 0) {
+			int k = 960 / pw < 544 / ph ? 960 / pw : 544 / ph;
 			if (k < 1)
 				k = 1;
-			dw = (float)(w * k);
-			dh = (float)(h * k);
+			dw = (float)(pw * k);
+			dh = (float)(ph * k);
 		} else if (s_scale_mode == 2) {
 			dw = 960.0f;
 			dh = 544.0f;
 		} else {
 			dh = 544.0f;
-			dw = dh * 4.0f / 3.0f;
+			dw = side ? dh * 3.0f / 4.0f : dh * 4.0f / 3.0f;
 		}
 		const float x0 = (960.0f - dw) * 0.5f, y0 = (544.0f - dh) * 0.5f;
 		if (s_border && s_scale_mode != 2) {
@@ -613,9 +678,9 @@ void rstv_video_present(void)
 		gx_tex_filter((GxTex *)t, s_filter);
 		gx_use(s_prog_img);
 		gx_set_tex(s_u_img_tex, t);
-		quad(s_prog_img, s_u_img_scale, x0, y0, x0 + dw, y0 + dh, 0, 0, (float)w / t->w, (float)h / t->h);
-		// ADR-126 scanlines: game line count (half for double-line screens)
-		GxTex *sc = s_prog_osd ? scan_texture((int)(dh + 0.5f), h > 256 ? h / 2 : h) : NULL;
+		quad_rot(s_prog_img, s_u_img_scale, x0, y0, x0 + dw, y0 + dh, (float)w / t->w, (float)h / t->h, s_rot);
+		// ADR-126 scanlines: game line count (half for double-line screens); not on a turned picture (they would cross it)
+		GxTex *sc = s_prog_osd && !side ? scan_texture((int)(dh + 0.5f), h > 256 ? h / 2 : h) : NULL;
 		if (sc) {
 			gx_use(s_prog_osd);
 			gx_set_tex(s_u_osd_tex, sc);
@@ -645,10 +710,23 @@ void rstv_video_present(void)
 			RSTV_LOG("video: layer %d drawn %dx%d at %d,%d", k, s_layer[k].w, s_layer[k].h, s_layer[k].x, s_layer[k].y);
 		}
 		gx_tex_filter(t, 0);
+		const float x0 = (float)s_layer[k].x, y0 = (float)s_layer[k].y, w = (float)s_layer[k].w, h = (float)s_layer[k].h;
+		if (s_layer[k].a < 0.999f && s_prog_tint) {
+			gx_use(s_prog_tint);
+			gx_set_tex(s_u_tint_tex, t);
+			const float a4[4] = { s_layer[k].a, 0, 0, 0 };
+			gx_set4(s_u_tint_a, a4);
+			quad(s_prog_tint, s_u_tint_scale, x0, y0, x0 + w, y0 + h, 0, 0, w / t->w, h / t->h);
+			continue;
+		}
 		gx_use(s_prog_layer);
 		gx_set_tex(s_u_layer_tex, t);
-		const float x0 = (float)s_layer[k].x, y0 = (float)s_layer[k].y, w = (float)s_layer[k].w, h = (float)s_layer[k].h;
-		quad(s_prog_layer, s_u_layer_scale, x0, y0, x0 + w, y0 + h, 0, 0, w / t->w, h / t->h);
+		if (s_layer[k].rot & 1) // turned a quarter: the screen rectangle is h x w
+			quad_rot(s_prog_layer, s_u_layer_scale, x0, y0, x0 + h, y0 + w, w / t->w, h / t->h, s_layer[k].rot);
+		else if (s_layer[k].rot)
+			quad_rot(s_prog_layer, s_u_layer_scale, x0, y0, x0 + w, y0 + h, w / t->w, h / t->h, s_layer[k].rot);
+		else
+			quad(s_prog_layer, s_u_layer_scale, x0, y0, x0 + w, y0 + h, 0, 0, w / t->w, h / t->h);
 	}
 	gx_end();
 	gx_swap();

@@ -60,6 +60,9 @@ GxProg *gx_prog(const char *vs_src, const char *fs_src, const GxAttr *attrs, int
 GxParam gx_param(const GxProg *p, const char *name);
 // Cg source -> GXP binary (uses disk cache, compiles if missing). Does not touch the shader patcher, so safe from other threads
 const void *gx_compile(const char *src, int fragment);
+// ADR-193: while set, a compile on the calling thread runs on a helper thread and cb is called about every 50 ms
+void gx_set_busy(void (*cb)(void));
+extern volatile int gx_compiling; // a compile is running under gx_set_busy
 // program from an existing binary (main thread)
 GxProg *gx_prog_bin(const void *vgxp, const void *fgxp, const GxAttr *attrs, int nattr, int stride, int blend);
 

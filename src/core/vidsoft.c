@@ -35,6 +35,8 @@
 #include "rstv_vdp1rec.h"
 static void rstv_v1_unsupported(unsigned why);
 static void rstv_v1pat_reset(void);
+extern u8 rstv_v1_erase_pend[2], rstv_v1_erase_pend_gpu[2], rstv_v1_dropped_erase[2];
+extern int rstv_vdp1_back_idx;
 #include <stddef.h>
 
 int rstv_capture_mode = 0;
@@ -1221,7 +1223,11 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
          }
          /* ReST-V (ADR-112): the colour calculation window is applied by the GPU compose shader (rectangles; the sprite
             window case composes on the CPU), so it no longer keeps the layer off the GPU */
-         if (!((wnd_off || win_ok) && (unit_x || zoom_ok) && !bad_cycle && info->specialprimode != 2))
+         /* ReST-V (ADR-161): the sprite window alone (W0/W1 off) is tested per pixel by the GPU compose shader */
+         const int sw_only = (info->wctl & 0x2a) == 0x20 && info->titan_which_layer < 4;
+         if (sw_only)
+            cap->swin = (info->wctl & 0x10) ? 2 : 1;
+         if (!((wnd_off || win_ok || sw_only) && (unit_x || zoom_ok) && !bad_cycle && info->specialprimode != 2))
          {
             cap->ok = 0;
             cap->why |= 16 | (!wnd_off ? 0x100 : 0) | (!(unit_x || zoom_ok) ? 0x200 : 0) | (bad_cycle ? 0x400 : 0) |
@@ -1515,7 +1521,9 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
    rstv_rot_why = (info->isbitmap && !(info->colornumber <= 1 || info->colornumber == 3) ? 1 : 0) |
       ((regs->RPMD & 3) == 3 && (regs->WCTLD & 0x20) ? 0x800 : 0) | ((regs->RPMD & 3) == 2 && !(p->coefenab && p->deltaKAx == 0) ? 2 : 0) |
       ((info->wctl & 0x20) ? 4 : 0) |
-      ((regs->KTCTL & 0x1010) ? 8 : 0) | (info->specialprimode == 2 ? 16 : 0) | (vdp2_x_hires ? 32 : 0) |
+      /* coefficient line colours only matter when RBG0 takes the line colour screen (LNCLEN bit 4; dnmtdeka sets
+         KTCTL 0x11 with LNCLEN 0: RBG0 went to the CPU, 27 ms a frame) */
+      ((regs->KTCTL & 0x1010) && (regs->LNCLEN & 0x10) ? 8 : 0) | (info->specialprimode == 2 ? 16 : 0) | (vdp2_x_hires ? 32 : 0) |
       (!(info->colornumber <= 1 || info->colornumber == 3) ? 128 : 0) |
       (p->coefenab && p->deltaKAx != 0 ? 256 : 0) | (p->coefenab && p->coefmode > 2 ? 512 : 0);
    if (rstv_rot_why)
@@ -3171,10 +3179,23 @@ void VIDSoftVdp1DrawStart()
       if (tmp.FBCR & 8) vdp1interlace = 2; else vdp1interlace = 1;
       if (tmp.TVMR & 1) { vdp1pixelsize = 1; vdp1width = (tmp.TVMR & 2) ? 512 : 1024; vdp1height = (tmp.TVMR & 2) ? 512 : 256; }
       else { vdp1pixelsize = 2; vdp1width = 512; vdp1height = 256; }
-      rstv_v1n = 0;
-      rstv_v1unsup = 0;
-      rstv_v1_ccn = 0;
-      rstv_v1pat_reset();
+      /* several draws into the same buffer before the compose picks the list up (PTMR = 1 direct draws, pblbeach draws
+         twice a frame): append, the compose takes one list per frame and the earlier draws were lost (sprite trails) */
+      if (!(rstv_v1ready && rstv_v1ready_target == rstv_vdp1_back_idx && !rstv_v1unsup)) {
+         /* a list the compose never took (VDP2 display off during scene changes) is dropped here: keep its erase
+            for that buffer, or the buffer kept the old picture (diehard / dnmtdeka top lines on the Vita) */
+         if (rstv_v1ready && rstv_v1n > 0 && rstv_v1list[0].kind == RSTV_V1_ERASE) {
+            u8 *pe = &rstv_v1_erase_pend_gpu[rstv_v1ready_target & 1];
+            const u8 want = rstv_v1list[0].x[3] >= 1024 ? 2 : 1;
+            if (*pe < want)
+               *pe = want;
+            rstv_v1_dropped_erase[rstv_v1ready_target & 1] = 1; /* ADR-149: only this case clears the shown buffer */
+         }
+         rstv_v1n = 0;
+         rstv_v1unsup = 0;
+         rstv_v1_ccn = 0;
+         rstv_v1pat_reset();
+      }
       /* ADR-100: hi-res 8-bit / double interlace lists are drawn by the GPU at half size (rstv_hires_half) */
       rstv_v1list_fmt = 0;
       if (rstv_hires_half && vdp1pixelsize == 1 && vdp1width == 1024)
@@ -3182,13 +3203,36 @@ void VIDSoftVdp1DrawStart()
       if (rstv_hires_half && vdp1interlace == 2)
          rstv_v1list_fmt |= 2;
       {
+         /* the game writes the VDP1 framebuffer itself (pblbeach clears and draws its course into it with the CPU):
+            those writes only reach the CPU framebuffer, so VDP1 is drawn on the CPU until 120 frames after the last */
+         extern unsigned rstv_v1fb_writes;
+         static unsigned seen, until;
+         if (rstv_v1fb_writes != seen) {
+            seen = rstv_v1fb_writes;
+            until = (unsigned)yabsys.frame_count + 120;
+         }
+         if ((int)(until - (unsigned)yabsys.frame_count) > 0)
+            rstv_v1_unsupported(11);
+         extern int rstv_v1_force_cpu;
+         if (rstv_v1_force_cpu)
+            rstv_v1_unsupported(12);
+      }
+      {
          /* sprite window used by a layer: gvdp2 builds its mask from the CPU framebuffer (same test as gvdp2.c) */
          const Vdp2 *rr = Vdp2Regs;
          const int uses = ((rr->WCTLA | (rr->WCTLA >> 8) | rr->WCTLB | (rr->WCTLB >> 8) | rr->WCTLC) & 0x20) != 0;
          if ((rr->SPCTL & 0x10) && uses)
             rstv_v1_unsupported(10);
       }
-      if (!rstv_v1unsup && (((tmp.FBCR & 2) == 0) || Vdp1External.manualerase || (tmp.TVMR & 8))) {
+      if (!rstv_v1unsup && rstv_v1_erase_pend_gpu[rstv_vdp1_back_idx] == 2) {
+         /* framebuffer mode changed (rstv_vdp1_mode_change): the whole buffer to 0 first */
+         RstvV1Item *it = &rstv_v1list[rstv_v1n++];
+         memset(it, 0, sizeof(*it));
+         it->kind = RSTV_V1_ERASE;
+         it->x[3] = 1024; it->y[3] = 512;
+         rstv_v1_erase_pend_gpu[rstv_vdp1_back_idx] = 0;
+      }
+      if (!rstv_v1unsup && (((tmp.FBCR & 2) == 0) || rstv_v1_erase_pend_gpu[rstv_vdp1_back_idx] || (tmp.TVMR & 8))) {
          /* erase (VIDSoftVdp1EraseFrameBuffer, 16-bit) as the first item */
          RstvV1Item *it = &rstv_v1list[rstv_v1n++];
          memset(it, 0, sizeof(*it));
@@ -3196,11 +3240,56 @@ void VIDSoftVdp1DrawStart()
          it->x[0] = (s16)((tmp.EWLR >> 6) & 0x1F8); it->y[0] = (s16)(tmp.EWLR & 0x1FF);
          it->x[3] = (s16)(((tmp.EWRR >> 6) & 0x3F8) + 8); it->y[3] = (s16)((tmp.EWRR & 0x1FF) + 1);
          it->colr = tmp.EWDR;
+         rstv_v1_erase_pend_gpu[rstv_vdp1_back_idx] = 0;
+         rstv_v1_dropped_erase[rstv_vdp1_back_idx] = 0;
       }
       rstv_v1rec = 1;
       if (!rstv_v1unsup)
          Vdp1DrawCommands(Vdp1Ram, &tmp, NULL);
       rstv_v1rec = 0;
+      { /* diag (harness RSTV_V1GPULOG): one line per recorded GPU list */
+         static int lg = -1;
+         if (lg < 0) lg = getenv("RSTV_V1GPULOG") != NULL;
+         if (lg) {
+            extern unsigned rstv_v1fb_writes;
+            fprintf(stderr, "fbw %u ", rstv_v1fb_writes);
+            fprintf(stderr, "v1gpu f%u l%d items %d erase %d unsup %d FBCR %x PTMR %x TVMR %x merase %d mchange %d back %d\n",
+                    (unsigned)yabsys.frame_count, yabsys.LineCount, rstv_v1n, rstv_v1n > 0 && rstv_v1list[0].kind == RSTV_V1_ERASE,
+                    rstv_v1unsup, tmp.FBCR, tmp.PTMR, tmp.TVMR, Vdp1External.manualerase, Vdp1External.manualchange, rstv_vdp1_back_idx);
+         }
+         if (lg && getenv("RSTV_V1GPUITEMS"))
+            for (int k = 0; k < rstv_v1n && k < 400; k++)
+               fprintf(stderr, "  it %d kind %d ctrl %04x pmod %04x colr %04x srca %05x size %dx%d xy %d,%d %d,%d %d,%d %d,%d\n", k,
+                       rstv_v1list[k].kind, rstv_v1list[k].ctrl, rstv_v1list[k].pmod, rstv_v1list[k].colr,
+                       (unsigned)rstv_v1list[k].srca << 3, ((rstv_v1list[k].size >> 8) & 0x3F) * 8, rstv_v1list[k].size & 0xFF,
+                       rstv_v1list[k].x[0], rstv_v1list[k].y[0], rstv_v1list[k].x[1], rstv_v1list[k].y[1], rstv_v1list[k].x[2],
+                       rstv_v1list[k].y[2], rstv_v1list[k].x[3], rstv_v1list[k].y[3]);
+      }
+#ifdef __vita__
+      { /* diag (Vita ux0:data/restv/v1log): one UDP line per recorded list */
+         extern int rstv_v1log_n;
+         extern void rstv_log_printf(const char *fmt, ...);
+         extern unsigned rstv_v1log_from, rstv_v1log_to;
+         if (rstv_v1log_n > 0 && (unsigned)yabsys.frame_count >= rstv_v1log_from && (unsigned)yabsys.frame_count <= rstv_v1log_to) {
+            rstv_v1log_n--;
+            rstv_log_printf("v1l f%u items %d erase %d pend %d %d back %d FBCR %x TVMR %x fmt %d unsup %d ready %d tgt %d EW %x %x",
+                            (unsigned)yabsys.frame_count, rstv_v1n, rstv_v1n > 0 && rstv_v1list[0].kind == RSTV_V1_ERASE,
+                            rstv_v1_erase_pend_gpu[0], rstv_v1_erase_pend_gpu[1], rstv_vdp1_back_idx, tmp.FBCR, tmp.TVMR,
+                            rstv_v1list_fmt, rstv_v1unsup, rstv_v1ready, rstv_v1ready_target, tmp.EWLR, tmp.EWRR);
+            /* items by kind and screen band (top / bottom 32 lines), the last item's place */
+            int nk[8] = { 0 }, top = 0, bot = 0;
+            for (int k = 0; k < rstv_v1n; k++) {
+               nk[rstv_v1list[k].kind & 7]++;
+               if (rstv_v1list[k].kind == RSTV_V1_ERASE) continue;
+               if (rstv_v1list[k].y[0] < 32) top++;
+               if (rstv_v1list[k].y[0] > 190) bot++;
+            }
+            const RstvV1Item *la = rstv_v1n ? &rstv_v1list[rstv_v1n - 1] : NULL;
+            rstv_log_printf("v1l2 f%u kinds %d %d %d %d %d %d top %d bot %d last kind %d xy %d,%d", (unsigned)yabsys.frame_count,
+                            nk[0], nk[1], nk[2], nk[3], nk[4], nk[5], top, bot, la ? la->kind : -1, la ? la->x[0] : 0, la ? la->y[0] : 0);
+         }
+      }
+#endif
       if (!rstv_v1unsup) {
          rstv_v1ready = 1;
          rstv_v1ready_target = rstv_vdp1_back_idx;
@@ -3936,6 +4025,136 @@ static void DrawLineFast(int x1, int y1, int x2, int y2, double linenumber, doub
 #undef RSTV_PLOT
 }
 
+/* ReST-V (ADR-164): DrawLine for untextured polygons (16bpp framebuffer, replace or gouraud, no MSB-on, no
+   "outside" user clipping). Same line walk, the same per-pixel colour sums (doubles, in the same order) and the same
+   pixels as DrawLineCallback + getpixel + putpixel, without the per-pixel calls: pblbeach's gouraud course polygons
+   reach far off screen and took 100-300 ms a frame on the Vita */
+typedef struct {
+   int gour, write, mesh, dil_skip;
+   int cx1, cx2, cy1, cy2;
+   int pr, pg, pb;
+   u16 pix;
+   u16 *fb;
+   u16 tr[32], tg[32], tb[32]; /* gouraud output per channel for the summed colour 0-31 */
+} RstvPolyLine;
+
+static INLINE int rstv_gouraud_ch(int c, int tv)
+{
+   c += tv - 0x10;
+   return c < 0 ? 0 : c > 0x1F ? 0x1F : c;
+}
+
+static int rstv_line_poly_setup(RstvPolyLine *t, Vdp1 *regs, vdp1cmd_struct *cmd, u8 *back_framebuffer)
+{
+   static const u16 visible[6] = { 0xf, 0xffff, 0x3f, 0x7f, 0xff, 0xffff }; /* getpixel's currentPixelIsVisible */
+   const int pmod = cmd->CMDPMOD;
+   const int cmode = (pmod >> 3) & 7, SPD = (pmod & 0x40) != 0;
+   if (vdp1pixelsize != 2 || (cmd->CMDCTRL & 7) != 4 || (pmod & 0x8000) || cmode > 5)
+      return 0;
+   /* gouraud: not the paletted special case of putpixel (only colour modes 1 and 5 never take it) */
+   if ((pmod & 7) != 0 && !((pmod & 7) == 4 && (cmode == 1 || cmode == 5)))
+      return 0;
+   if ((pmod & 0x0400) && ((pmod >> 9) & 3) == 3)
+      return 0;
+   t->pix = cmd->CMDCOLR;
+   t->gour = (pmod & 7) == 4;
+   t->write = (SPD || (t->pix & visible[cmode])) && (t->gour || !(t->pix == 0 && !SPD));
+   t->pr = t->pix & 0x1F; t->pg = (t->pix >> 5) & 0x1F; t->pb = (t->pix >> 10) & 0x1F;
+   t->mesh = pmod & 0x0100;
+   t->dil_skip = (vdp1interlace == 2) ? (((regs->FBCR >> 2) & 1) ? 0 : 1) : -1;
+   t->cx1 = 0; t->cx2 = regs->systemclipX2; t->cy1 = 0; t->cy2 = regs->systemclipY2;
+   if (pmod & 0x0400) {
+      if (regs->userclipX1 > t->cx1) t->cx1 = regs->userclipX1;
+      if (regs->userclipX2 < t->cx2) t->cx2 = regs->userclipX2;
+      if (regs->userclipY1 > t->cy1) t->cy1 = regs->userclipY1;
+      if (regs->userclipY2 < t->cy2) t->cy2 = regs->userclipY2;
+   }
+   t->fb = (u16 *)back_framebuffer;
+   if (t->gour)
+      for (int k = 0; k < 32; k++) {
+         t->tr[k] = (u16)rstv_gouraud_ch(t->pr, k);
+         t->tg[k] = (u16)(rstv_gouraud_ch(t->pg, k) << 5);
+         t->tb[k] = (u16)((rstv_gouraud_ch(t->pb, k) << 10) | 0x8000);
+      }
+   return 1;
+}
+
+/* 16.16 colour sum to the int putpixel gets from (int)double: truncation toward zero, table range */
+static INLINE int rstv_fx_idx(int v)
+{
+   v = v < 0 ? -((-v) >> 16) : (v >> 16);
+   return v < 0 ? 0 : v > 31 ? 31 : v;
+}
+
+/* ADR-164: the colour sums run in 16.16 fixed point and the output comes from per-channel tables (the double sums of
+   putpixel give the same 5-bit values except within 1/65536 per step of an integer: at most one step off, rarely).
+   A line whose bounding box is inside the clip runs without the per-pixel clip tests */
+static void DrawLinePoly(int x1, int y1, int x2, int y2, double rs, double gs, double bs, const RstvPolyLine *t)
+{
+   int a = 0, ax, ay, dx, dy;
+   dx = x2 - x1;
+   dy = y2 - y1;
+   ax = (dx >= 0) ? 1 : -1;
+   ay = (dy >= 0) ? 1 : -1;
+   if (abs(dx) > 999 || abs(dy) > 999)
+      return;
+   const int cx1 = t->cx1, cx2 = t->cx2, cy1 = t->cy1, cy2 = t->cy2;
+   const int bx1 = x1 < x2 ? x1 : x2, bx2 = x1 > x2 ? x1 : x2, by1 = y1 < y2 ? y1 : y2, by2 = y1 > y2 ? y1 : y2;
+   /* every pixel of the walk lies in the line's bounding box: a line outside the clip draws nothing (the colour sums
+      start again on the next line) */
+   if (!t->write || bx2 < cx1 || bx1 > cx2 || by2 < cy1 || by1 > cy2)
+      return;
+   const int gour = t->gour, mesh = t->mesh, dil_skip = t->dil_skip, w = vdp1width;
+   const int ysh = vdp1interlace == 2;
+   const int inside = bx1 >= cx1 && bx2 <= cx2 && by1 >= cy1 && by2 <= cy2 && !mesh && dil_skip < 0;
+   const u16 pix = t->pix;
+   u16 *const fb = t->fb;
+   const u16 *const tr = t->tr, *const tg = t->tg, *const tb = t->tb;
+   int lr = 0, lg = 0, lb = 0, sr = 0, sg = 0, sb = 0;
+   if (gour) {
+      lr = (int)(leftColumnColor.r * 65536.0); lg = (int)(leftColumnColor.g * 65536.0); lb = (int)(leftColumnColor.b * 65536.0);
+      sr = (int)(rs * 65536.0); sg = (int)(gs * 65536.0); sb = (int)(bs * 65536.0);
+   }
+   /* y / vdp1interlace as a shift: y >= 0 once inside the clip (no divide on the Vita's CPU) */
+#define RSTV_PP(PX, PY) do { \
+      const int px_ = (PX), py_ = (PY); \
+      if (gour) { lr += sr; lg += sg; lb += sb; } \
+      if (inside || (px_ >= cx1 && px_ <= cx2 && py_ >= cy1 && py_ <= cy2 && (py_ & 1) != dil_skip)) { \
+         const int yy_ = py_ >> ysh, idx_ = yy_ * w + px_; \
+         if (idx_ < 0x40000 / 2 && !(mesh && ((px_ ^ yy_) & 1))) \
+            fb[idx_] = gour ? (u16)(tr[rstv_fx_idx(lr)] | tg[rstv_fx_idx(lg)] | tb[rstv_fx_idx(lb)]) : pix; \
+      } \
+   } while (0)
+   if (abs(dx) > abs(dy)) {
+      if (ax != ay) dx = -dx;
+      for (; x1 != x2; x1 += ax) {
+         RSTV_PP(x1, y1);
+         a += dy;
+         if (abs(a) >= abs(dx)) {
+            a -= dx;
+            y1 += ay;
+            if (ax == ay) RSTV_PP(x1 + ax, y1 - ay);
+            else RSTV_PP(x1, y1);
+         }
+      }
+      RSTV_PP(x2, y2);
+   } else {
+      if (ax != ay) dy = -dy;
+      for (; y1 != y2; y1 += ay) {
+         RSTV_PP(x1, y1);
+         a += dx;
+         if (abs(a) >= abs(dy)) {
+            a -= dy;
+            x1 += ax;
+            if (ay == ax) RSTV_PP(x1, y1);
+            else RSTV_PP(x1 - ax, y1 + ay);
+         }
+      }
+      RSTV_PP(x2, y2);
+   }
+#undef RSTV_PP
+}
+
 static INLINE double interpolate(double start, double end, int numberofsteps) {
 
 	double stepvalue = 0;
@@ -3969,6 +4188,110 @@ COLOR gouraudA;
 COLOR gouraudB;
 COLOR gouraudC;
 COLOR gouraudD;
+
+/* ADR-164: convex untextured polygons as scanlines. The outline (the 4 edges as Bresenham lines) gives each row's
+   leftmost and rightmost pixel with its colour (gouraud: linear along the edge), the row is filled between them with
+   the colour linear across it. The VDP1 walk covers the same pixels (its lines run between the edges and fill the
+   holes), but draws each pixel several times and in scattered rows: pblbeach's course polygons took 5-15 ms each on
+   the Vita. The gouraud colours can differ from the walk's by a step where they ramp. Returns 0 (caller walks) for
+   a non-convex outline or an edge longer than 999 */
+#define RSTV_FILL_ROWS 1024
+static int rstv_fill_poly(const int *vx, const int *vy, const COLOR *vc, const RstvPolyLine *t)
+{
+   static int xl[RSTV_FILL_ROWS], xr[RSTV_FILL_ROWS], cl[RSTV_FILL_ROWS][3], cr[RSTV_FILL_ROWS][3];
+   int k, sgn = 0;
+   for (k = 0; k < 4; k++) {
+      const int a = k, b = (k + 1) & 3, c = (k + 2) & 3;
+      if (abs(vx[b] - vx[a]) > 999 || abs(vy[b] - vy[a]) > 999)
+         return 0;
+      const long long cross = (long long)(vx[b] - vx[a]) * (vy[c] - vy[b]) - (long long)(vy[b] - vy[a]) * (vx[c] - vx[b]);
+      const int sc = cross > 0 ? 1 : cross < 0 ? -1 : 0;
+      if (sc) {
+         if (sgn && sc != sgn)
+            return 0;
+         sgn = sc;
+      }
+   }
+   const int cx1 = t->cx1, cx2 = t->cx2, cy1 = t->cy1, cy2 = t->cy2;
+   if (cy2 - cy1 + 1 > RSTV_FILL_ROWS || cy2 < cy1 || cx2 < cx1)
+      return 1;
+   int ry1 = vy[0], ry2 = vy[0];
+   for (k = 1; k < 4; k++) {
+      if (vy[k] < ry1) ry1 = vy[k];
+      if (vy[k] > ry2) ry2 = vy[k];
+   }
+   if (ry1 < cy1) ry1 = cy1;
+   if (ry2 > cy2) ry2 = cy2;
+   if (ry1 > ry2)
+      return 1;
+   for (int y = ry1; y <= ry2; y++) {
+      xl[y - cy1] = 0x7FFFFFFF;
+      xr[y - cy1] = -0x7FFFFFFF;
+   }
+   const int gour = t->gour;
+   for (k = 0; k < 4; k++) {
+      const int b = (k + 1) & 3;
+      int x = vx[k], y = vy[k];
+      const int dx = abs(vx[b] - x), dy = abs(vy[b] - y), sx = vx[b] >= x ? 1 : -1, sy = vy[b] >= y ? 1 : -1;
+      const int n = dx > dy ? dx : dy;
+      int c[3] = { 0, 0, 0 }, dc[3] = { 0, 0, 0 };
+      if (gour) {
+         const int ca[3] = { vc[k].r, vc[k].g, vc[k].b }, cb[3] = { vc[b].r, vc[b].g, vc[b].b };
+         for (int j = 0; j < 3; j++) {
+            c[j] = ca[j] << 16;
+            dc[j] = n ? ((cb[j] - ca[j]) << 16) / n : 0;
+         }
+      }
+      int err = dx - dy;
+      for (int i = 0; i <= n; i++) {
+         if (y >= ry1 && y <= ry2) {
+            const int r = y - cy1;
+            if (x < xl[r]) { xl[r] = x; cl[r][0] = c[0]; cl[r][1] = c[1]; cl[r][2] = c[2]; }
+            if (x > xr[r]) { xr[r] = x; cr[r][0] = c[0]; cr[r][1] = c[1]; cr[r][2] = c[2]; }
+         }
+         if (i == n)
+            break;
+         const int e2 = 2 * err;
+         if (e2 > -dy) { err -= dy; x += sx; }
+         if (e2 < dx) { err += dx; y += sy; }
+         c[0] += dc[0]; c[1] += dc[1]; c[2] += dc[2];
+      }
+   }
+   const int mesh = t->mesh, dil_skip = t->dil_skip, w = vdp1width, ysh = vdp1interlace == 2;
+   const u16 pix = t->pix;
+   const u16 *const tr = t->tr, *const tg = t->tg, *const tb = t->tb;
+   for (int y = ry1; y <= ry2; y++) {
+      const int r = y - cy1;
+      if (xl[r] > xr[r] || (y & 1) == dil_skip)
+         continue;
+      int x0 = xl[r], x1 = xr[r];
+      const int len = x1 - x0;
+      if (x0 < cx1) x0 = cx1;
+      if (x1 > cx2) x1 = cx2;
+      if (x0 > x1)
+         continue;
+      const int yy = y >> ysh;
+      if (yy * w + x1 >= 0x40000 / 2)
+         continue;
+      u16 *row = (u16 *)t->fb + yy * w;
+      if (!gour) {
+         if (!mesh)
+            for (int x = x0; x <= x1; x++) row[x] = pix;
+         else
+            for (int x = x0 + ((x0 ^ yy) & 1); x <= x1; x += 2) row[x] = pix;
+         continue;
+      }
+      int c[3], dc[3];
+      for (int j = 0; j < 3; j++) {
+         dc[j] = len ? (int)(((long long)cr[r][j] - cl[r][j]) / len) : 0;
+         c[j] = cl[r][j] + dc[j] * (x0 - xl[r]);
+      }
+      for (int x = x0; x <= x1; x++, c[0] += dc[0], c[1] += dc[1], c[2] += dc[2])
+         if (!mesh || !((x ^ yy) & 1))
+            row[x] = (u16)(tr[rstv_fx_idx(c[0])] | tg[rstv_fx_idx(c[1])] | tb[rstv_fx_idx(c[2])]);
+   }
+   return 1;
+}
 
 static void gouraudTable(u8* ram, Vdp1* regs, vdp1cmd_struct * cmd)
 {
@@ -4220,8 +4543,46 @@ int rstv_v1rec, rstv_v1unsup, rstv_v1n;
 int rstv_v1_cc_ok, rstv_v1_ccn;
 RstvV1Item rstv_v1list[RSTV_V1_MAX];
 int rstv_vdp1_gpu_on, rstv_v1ready, rstv_v1ready_target, rstv_vdp1_back_idx, rstv_vdp1_gpu_drawn[2];
+/* ADR-133: a manual erase request (FBCR = 2) erases the buffer displayed when it is written (hardware: during the
+   next field). It is kept per buffer and done when the next draw starts on that buffer. A single flag erased one
+   buffer only when the request spanned several frame changes (dnmtdeka / diehard scene changes: the other buffer
+   kept the intro picture) */
+u8 rstv_v1_erase_pend[2];     /* CPU framebuffers */
+u8 rstv_v1_dropped_erase[2]; /* ADR-149/154: a list with an erase was dropped for this GPU buffer (not manual erase
+                                 requests: vfremix makes one every frame, and the fighters were cleared away) */
+u8 rstv_v1_erase_pend_gpu[2]; /* GPU framebuffers: kept apart, VDP1 falls back to the CPU while the compose is off
+                                 (VDP2 display off at scene changes) and those draws used up the erase (diehard title) */
+int rstv_vdp1_back_idx_get(void) { return rstv_vdp1_back_idx; }
+void rstv_vdp1_manual_erase_req(void)
+{
+   /* both buffers: the requests of a scene change often come over several frames without a frame change between
+      them (dnmtdeka / diehard on the Vita: the buffer drawn last before the change kept the intro in the lines the
+      fights never draw); each buffer is erased once at its next draw start, before it is drawn */
+   for (int b = 0; b < 2; b++)
+   {
+      if (!rstv_v1_erase_pend[b])
+         rstv_v1_erase_pend[b] = 1;
+      if (!rstv_v1_erase_pend_gpu[b])
+         rstv_v1_erase_pend_gpu[b] = 1;
+   }
+}
+/* the framebuffer mode (TVMR bits 0-2) changed: MAME rebuilds both framebuffers (saturn.cpp vdp1_set_framebuffer_config),
+   so the old picture is gone (diehard's intro helicopter stayed in the top lines of the 8-bit hi-res fights). Each
+   buffer is cleared to 0 at its next draw start */
+/* VBE set at V-blank-in: the buffer displayed now becomes the drawing buffer at the frame change; erase it at its
+   next draw start */
+void rstv_vdp1_vbe_erase(void)
+{
+   const int f = rstv_vdp1_back_idx ^ 1;
+   if (!rstv_v1_erase_pend[f])
+      rstv_v1_erase_pend[f] = 1;
+   if (!rstv_v1_erase_pend_gpu[f])
+      rstv_v1_erase_pend_gpu[f] = 1;
+}
+void rstv_vdp1_mode_change(void) { rstv_v1_erase_pend[0] = rstv_v1_erase_pend[1] = rstv_v1_erase_pend_gpu[0] = rstv_v1_erase_pend_gpu[1] = 2; }
 int rstv_v1list_fmt;
 unsigned rstv_v1_gpu_frames, rstv_v1_cpu_frames, rstv_v1_why;
+int rstv_v1_force_cpu; // diag (Vita ux0:data/restv/v1cpu): VDP1 always on the CPU
 
 static void rstv_v1_unsupported(unsigned why)
 {
@@ -4538,6 +4899,21 @@ static void drawQuad(s16 tl_x, s16 tl_y, s16 bl_x, s16 bl_y, s16 tr_x, s16 tr_y,
       return;
    }
 
+	{
+		/* ADR-164: convex untextured polygons as scanlines (vertices in VDP1 order A B C D) */
+		RstvPolyLine pl;
+		if (rstv_line_poly_setup(&pl, regs, cmd, back_framebuffer)) {
+			const int vx[4] = { tl_x, tr_x, br_x, bl_x }, vy[4] = { tl_y, tr_y, br_y, bl_y };
+			COLOR vc[4];
+			if (pl.gour) {
+				gouraudTable(ram, regs, cmd);
+				vc[0] = gouraudA; vc[1] = gouraudB; vc[2] = gouraudC; vc[3] = gouraudD;
+			}
+			if (!pl.write || rstv_fill_poly(vx, vy, vc, &pl))
+				return;
+		}
+	}
+
 	intarrays[0] = xleft; intarrays[1] = yleft;
    totalleft = iterateOverLine(tl_x, tl_y, bl_x, bl_y, 0, intarrays, storeLineCoords, regs, cmd, ram, back_framebuffer);
 	intarrays[0] = xright; intarrays[1] = yright;
@@ -4580,6 +4956,8 @@ static void drawQuad(s16 tl_x, s16 tl_y, s16 bl_x, s16 bl_y, s16 tr_x, s16 tr_y,
 
 	RstvLineTex rstv_lt;
 	const int rstv_fast_lines = rstv_line_tex_setup(&rstv_lt, regs, cmd, ram, back_framebuffer);
+	RstvPolyLine rstv_pl;
+	const int rstv_poly_lines = !rstv_fast_lines && rstv_line_poly_setup(&rstv_pl, regs, cmd, back_framebuffer);
 	for(i = 0; i < total; i++) {
 
 		int xlinelength;
@@ -4629,6 +5007,12 @@ static void drawQuad(s16 tl_x, s16 tl_y, s16 bl_x, s16 bl_y, s16 tr_x, s16 tr_y,
 		if (rstv_fast_lines) {
 			DrawLineFast(xleft[(int)(i*leftLineStep)], yleft[(int)(i*leftLineStep)],
 				xright[(int)(i*rightLineStep)], yright[(int)(i*rightLineStep)], ytexturestep*i, xtexturestep, &rstv_lt);
+			continue;
+		}
+		if (rstv_poly_lines) {
+			DrawLinePoly(xleft[(int)(i*leftLineStep)], yleft[(int)(i*leftLineStep)],
+				xright[(int)(i*rightLineStep)], yright[(int)(i*rightLineStep)], leftToRightStep.r, leftToRightStep.g,
+				leftToRightStep.b, &rstv_pl);
 			continue;
 		}
 		DrawLine(
@@ -4942,6 +5326,31 @@ void VIDSoftVdp1ReadFrameBuffer(u32 type, u32 addr, void * out)
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+/* ReST-V (ADR-142): n 16-bit framebuffer writes from high work RAM (SCU DMA rows, pblbeach) with one thread wait */
+void rstv_vidsoft_fb_words_hw(u32 addr, u32 hwoff, int n)
+{
+   VidsoftWaitForVdp1Thread();
+   for (int k = 0; k < n; k++) {
+      u16 v = T2ReadWord(HighWram, (hwoff + 2 * k) & 0xFFFFF);
+#ifndef WORDS_BIGENDIAN
+      v = BSWAP16L(v);
+#endif
+      T1WriteWord(vdp1backframebuffer, (addr + 2 * k) & 0x3FFFF, v);
+   }
+}
+
+void rstv_vidsoft_fb_read_words_hw(u32 addr, u32 hwoff, int n)
+{
+   VidsoftWaitForVdp1Thread();
+   for (int k = 0; k < n; k++) {
+      u16 v = T1ReadWord(vdp1backframebuffer, (addr + 2 * k) & 0x3FFFF);
+#ifndef WORDS_BIGENDIAN
+      v = BSWAP16L(v);
+#endif
+      T2WriteWord(HighWram, (hwoff + 2 * k) & 0xFFFFF, v);
+   }
+}
 
 void VIDSoftVdp1WriteFrameBuffer(u32 type, u32 addr, u32 val)
 {
@@ -5713,8 +6122,21 @@ void VIDSoftVdp1EraseFrameBuffer(Vdp1* regs, u8 * back_framebuffer)
 
    /* ReST-V (ADR-114): VBE (TVMR bit 3) erases the displayed buffer in the V-blank before the change (vdp2.cpp calls
       Vdp1EraseWrite, empty here): the same as erasing the drawing buffer when the draw starts (batmanfr) */
-   if (((regs->FBCR & 2) == 0) || Vdp1External.manualerase || (regs->TVMR & 8))
+   if (rstv_v1_erase_pend[rstv_vdp1_back_idx] == 2)
    {
+      memset(back_framebuffer, 0, 0x40000); /* framebuffer mode changed: whole buffer to 0 */
+      rstv_v1_erase_pend[rstv_vdp1_back_idx] = 0;
+   }
+#ifdef __vita__
+   { extern int rstv_v1log_n; extern unsigned rstv_v1log_from, rstv_v1log_to; extern void rstv_log_printf(const char *fmt, ...);
+     if (rstv_v1log_n > 0 && (unsigned)yabsys.frame_count >= rstv_v1log_from && (unsigned)yabsys.frame_count <= rstv_v1log_to) {
+        rstv_v1log_n--;
+        rstv_log_printf("cpuerase f%u back %d pend %d FBCR %x TVMR %x EW %x %x", (unsigned)yabsys.frame_count, rstv_vdp1_back_idx,
+                        rstv_v1_erase_pend[rstv_vdp1_back_idx], regs->FBCR, regs->TVMR, regs->EWLR, regs->EWRR); } }
+#endif
+   if (((regs->FBCR & 2) == 0) || rstv_v1_erase_pend[rstv_vdp1_back_idx] || (regs->TVMR & 8))
+   {
+      rstv_v1_erase_pend[rstv_vdp1_back_idx] = 0;
       h = (regs->EWRR & 0x1FF) + 1;
       if (h > vdp1height) h = vdp1height;
       w = ((regs->EWRR >> 6) & 0x3F8) + 8;

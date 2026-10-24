@@ -7,7 +7,7 @@ set(RSTV_CORE_SOURCES
   sh2int.c smpc.c m68kcore.c m68kd.c m68kmusashi.c snddummy.c vidshared.c vidsoft.c yabause.c
   osdcore.c japmodem.c titan/titan.c vdp1.cpp vdp2.cpp stv.c stvio.c eeprom.c
   musashi/m68kcpu.c musashi/m68kops.c musashi/m68kopac.c musashi/m68kopdm.c musashi/m68kopnz.c
-  thr-restv.c soft_glue.c Counter.cpp sega5881.c rstv_zip.c rstv_dspjit.c
+  thr-restv.c soft_glue.c Counter.cpp sega5881.c sega5838.c rstv_slave.c rstv_zip.c rstv_dspjit.c rstv_scujit.c rstv_rax.cpp
 )
 # SH-2 ARMv7 dynamic recompiler (devmiyax, ADR-010). Only on 32-bit ARM targets (Vita, qemu harness)
 if(RSTV_DYNAREC)

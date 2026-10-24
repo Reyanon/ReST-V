@@ -76,20 +76,6 @@ static void decode(const Entry *e, const uint8_t *vram, uint8_t *atlas)
 		for (int k = 0; k < 16; k++)
 			lut[k] = (uint16_t)rd16(vram, ((uint32_t)e->colr << 3) + (uint32_t)k * 2);
 	const int rb = row_bytes(cm, w);
-	// transparent border around the pattern: a texture coordinate landing exactly on the pattern edge (distorted
-	// sprites: vertices on pixel centres, coordinates on texel edges) may round to the texel outside, which held the
-	// last row of the pattern above or stale data (thuntk hats: dark lines along the top edge)
-	{
-		uint32_t *top = (uint32_t *)(atlas + ((size_t)(e->ay - 1) * V1GPU_ATLAS + e->ax - 1) * 4);
-		uint32_t *bot = (uint32_t *)(atlas + ((size_t)(e->ay + h) * V1GPU_ATLAS + e->ax - 1) * 4);
-		memset(top, 0, (size_t)(w + 2) * 4);
-		memset(bot, 0, (size_t)(w + 2) * 4);
-		for (int y = 0; y < h; y++) {
-			uint32_t *row = (uint32_t *)(atlas + ((size_t)(e->ay + y) * V1GPU_ATLAS + e->ax) * 4);
-			row[-1] = 0;
-			row[w] = 0;
-		}
-	}
 	for (int y = 0; y < h; y++) {
 		uint32_t *d = (uint32_t *)(atlas + ((size_t)(e->ay + y) * V1GPU_ATLAS + e->ax) * 4);
 		const uint32_t row = e->addr + (uint32_t)(y * rb);
@@ -142,6 +128,17 @@ static void decode(const Entry *e, const uint8_t *vram, uint8_t *atlas)
 			d[x] = wr ? (pix & (s_fb8 ? 0xFF : 0xFFFF)) | 0xFF000000u : 0;
 		}
 	}
+	// 1-texel border copied from the pattern's own edge (clamp to edge): a texture coordinate landing exactly on the
+	// pattern edge (distorted sprites: vertices on pixel centres, coordinates on texel edges) may round to the texel
+	// outside. That texel held the last row of the pattern above or stale data (thuntk hats: dark lines along the top);
+	// a transparent border instead opened gaps between the polygons of ffrevng's characters
+	for (int y = 0; y < h; y++) {
+		uint32_t *row = (uint32_t *)(atlas + ((size_t)(e->ay + y) * V1GPU_ATLAS + e->ax) * 4);
+		row[-1] = row[0];
+		row[w] = row[w - 1];
+	}
+	memcpy(atlas + ((size_t)(e->ay - 1) * V1GPU_ATLAS + e->ax - 1) * 4, atlas + ((size_t)e->ay * V1GPU_ATLAS + e->ax - 1) * 4, (size_t)(w + 2) * 4);
+	memcpy(atlas + ((size_t)(e->ay + h) * V1GPU_ATLAS + e->ax - 1) * 4, atlas + ((size_t)(e->ay + h - 1) * V1GPU_ATLAS + e->ax - 1) * 4, (size_t)(w + 2) * 4);
 }
 
 static uint32_t src_hash(const Entry *e, const uint8_t *vram)
@@ -290,6 +287,7 @@ static void add_batch(V1Frame *f, int variant, int first, int count)
 	}
 }
 
+extern int v1gpu_skip_kinds;
 int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *atlas, const uint8_t *vram,
 	const uint32_t *page_stamp, uint32_t serial, V1Frame *f)
 {
@@ -304,6 +302,8 @@ int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *at
 	const uint16_t cmask = s_fb8 ? 0xFF : 0xFFFF;
 	for (int k = 0; k < n; k++) {
 		const RstvV1Item *it = &items[k];
+		if ((v1gpu_skip_kinds >> it->kind) & 1) // diag (ux0:data/restv/v1skip = kind bit mask)
+			continue;
 		Corner c[4];
 		memset(c, 0, sizeof(c));
 		float clip[4];
@@ -314,7 +314,7 @@ int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *at
 				continue;
 			clip[0] = 0; clip[1] = 0; clip[2] = 511; clip[3] = 255;
 			c[0].x = x0; c[0].y = y0; c[1].x = x1; c[1].y = y0; c[2].x = x0; c[2].y = y1; c[3].x = x1; c[3].y = y1;
-			for (int i = 0; i < 4; i++) c[i].u = (float)(it->colr & cmask);
+			for (int i = 0; i < 4; i++) { c[i].u = (float)(it->colr & cmask & 0xFF); c[i].v = (float)((it->colr & cmask) >> 8); }
 			variant = 4;
 		} else if (it->kind == RSTV_V1_LINE) {
 			// line (ADR-041): 1-pixel-wide quad stretched along the major axis to the end pixel, +-0.5 on the minor axis
@@ -333,7 +333,8 @@ int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *at
 			c[3].x = bx + ex + px; c[3].y = by + ey + py;
 			for (int i = 0; i < 4; i++) {
 				const uint16_t gc = it->grd[i & 1];
-				c[i].u = (float)(it->colr & cmask);
+				c[i].u = (float)(it->colr & cmask & 0xFF);
+				c[i].v = (float)((it->colr & cmask) >> 8);
 				c[i].r = (float)(gc & 31); c[i].g = (float)((gc >> 5) & 31); c[i].b = (float)((gc >> 10) & 31);
 			}
 		} else {
@@ -350,7 +351,7 @@ int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *at
 				c[i].r = (float)(it->grd[i] & 31); c[i].g = (float)((it->grd[i] >> 5) & 31); c[i].b = (float)((it->grd[i] >> 10) & 31);
 			}
 			if (it->kind == RSTV_V1_POLY) {
-				for (int i = 0; i < 4; i++) c[i].u = (float)(it->colr & cmask);
+				for (int i = 0; i < 4; i++) { c[i].u = (float)(it->colr & cmask & 0xFF); c[i].v = (float)((it->colr & cmask) >> 8); }
 			} else {
 				int ax, ay;
 				const int flags = ((pmod & 0x40) ? 1 : 0) | ((pmod & 0x80) ? 0 : 2);
@@ -426,6 +427,8 @@ int v1gpu_build(const RstvV1Item *items, int n, float *out, int max, uint8_t *at
 	return nv;
 }
 
+int v1gpu_skip_kinds;
+
 // ---- shaders ----
 #define NL "\n"
 const char *v1gpu_vs(void)
@@ -455,7 +458,9 @@ const char *v1gpu_fs(int variant)
 	if (mesh)
 		n += snprintf(b + n, 3072 - n, "  if (fmod(fp.x + fp.y, 2.0) > 0.5) discard;" NL);
 	if (solid)
-		n += snprintf(b + n, 3072 - n, "  float pix = floor(vUV.x * 1024.0 + 0.5);" NL);
+		// solid colour as two bytes in u / v: a 16-bit value in one coordinate lost its low bits in the interpolator
+		// (sanjeon RGB polygons came out as yellow / blue patterns)
+		n += snprintf(b + n, 3072 - n, "  float pix = floor(vUV.x * 1024.0 + 0.5) + floor(vUV.y * 1024.0 + 0.5) * 256.0;" NL);
 	else if (!gour && !cc && !msb)
 		n += snprintf(b + n, 3072 - n, "  float4 c = tex2D(tAtlas, vUV);" NL "  if (c.w < 0.5) discard;" NL
 			"  return float4(c.x, c.y, 0.0, 0.0);" NL "}" NL);

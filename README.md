@@ -1,5 +1,5 @@
 <p align="center">
-<img width="840" height="500" alt="bg" src="https://github.com/user-attachments/assets/218f16a4-4bf1-4485-bd99-a5bd9fed0398" />
+<img width="840" height="500" alt="ReST-V" src="vita/sce_sys_src/bg.png" />
 </p>
 
 <h1 align="center">ReST-V</h1>
@@ -69,9 +69,13 @@ screen are simplified when that buys speed.
 - Board I/O, external palette and the protection chips of the System C2 sets.
 
 **Frontend**
-- Game list with System C / System C2 / ST-V tabs and a Playable / All / Favorites filter.
-- Save states (10 slots plus quick save), button mapping with turbo, analog stick as lever, built-in cheats.
-- Display options: aspect ratio, filter, scanlines, border color or user artwork.
+- Game list with System C / System C2 / ST-V tabs, a Playable / All / Favorites filter, smooth scrolling and a blue
+  RetroArch-like theme.
+- Save states (10 slots plus quick save), button mapping with turbo, analog stick as lever, cheats from cheat files.
+- Display options: aspect ratio, screen rotation (vertical games such as Shienryu turn upright by themselves),
+  filter, scanlines, border color or artwork.
+- PS button: opens and closes the menu; a double press goes to the home screen.
+- Loading screen with progress while the ROMs load and the GPU shaders are prepared.
 - Per-game settings: save the current display and control settings for one game only.
 
 ## 3. Supported Boards and Games
@@ -79,9 +83,11 @@ screen are simplified when that buys speed.
 Set names are the MAME set names. ROMs must match the MAME romset; clone sets read missing files from the
 parent zip. ST-V games also need the BIOS set `stvbios.zip`.
 
-**Performance**: *Playable*, *Partial* or *Not working*, and the average frame rate on a PS Vita at 444 MHz
-over a few minutes of attract mode and play. Full speed is 60 fps (59.94 Hz). A rate with `~` is estimated from
-tested games on the same board, not measured for that set. No rate means the set has not been measured.
+**Performance**: *Playable*, *Partial* or *Not working*, and the average frame rate on a PS Vita at 444 MHz.
+ST-V rates are measured on the device for the current release: the exact average (frames divided by time) of the
+attract mode from frame 1500 to frame 2700 or later, after the BIOS start-up. Full speed is 59.94 fps, the Vita's
+refresh rate. A rate with `~` is estimated from tested games on the same board, not measured for that set. No rate
+means the set has not been measured.
 *Partial* sets run, but MAME also lists them as not working (missing printer, camera or other hardware), or a
 known problem remains. Click a board to expand its list.
 
@@ -92,123 +98,123 @@ known problem remains. Click a board to expand its list.
 
 | Set | Parent | Year | Title | Performance |
 |---|---|---|---|---|
-| `znpwfvt` | `znpwfv` | 1997 | All Japan Pro-Wrestling Featuring Virtua (T 971123 V1.000) | Playable<br>55.1 fps |
+| `znpwfvt` | `znpwfv` | 1997 | All Japan Pro-Wrestling Featuring Virtua (T 971123 V1.000) | Playable<br>59.94 fps |
 | `aclub` |  | 1997 | Aroma Club (J 970611 V1.000) | Playable |
-| `astrass` |  | 1998 | Astra SuperStars (J 980514 V1.002) | Not working<br>34.1 fps |
-| `bakubaku` |  | 1995 | Baku Baku Animal (J 950407 V1.000) | Playable<br>60 fps |
-| `batmanfr` |  | 1996 | Batman Forever (JUE 960507 V1.000) | Playable<br>54.7 fps |
+| `astrass` |  | 1998 | Astra SuperStars (J 980514 V1.002) | Playable<br>58.57 fps |
+| `bakubaku` |  | 1995 | Baku Baku Animal (J 950407 V1.000) | Playable<br>59.94 fps |
+| `batmanfr` |  | 1996 | Batman Forever (JUE 960507 V1.000) | Playable<br>58.94 fps |
 | `chalgolf` |  | 1999 | Challenge Golf (J 990326 V1.000) | Playable |
-| `choroqhr` |  | 1998 | Choro Q Hyper Racing 5 (J 981230 V1.000) | Playable<br>59.8 fps |
-| `colmns97` |  | 1996 | Columns '97 (JET 961209 V1.000) | Playable<br>60 fps |
-| `cotton2` |  | 1997 | Cotton 2 (JUET 970902 V1.000) | Playable<br>60 fps |
-| `cottonbm` |  | 1998 | Cotton Boomerang (JUET 980709 V1.000) | Playable<br>59.9 fps |
-| `sanjeon` | `sasissu` | 1999 | DaeJeon! SanJeon SuJeon (AJTUE 990412 V1.000) | Playable<br>60 fps |
-| `danchih` |  | 1999 | Danchi de Hanafuda (J 990607 V1.400) | Playable<br>60 fps |
-| `danchiq` |  | 2000 | Danchi de Quiz: Okusan Yontaku Desuyo! (J 001128 V1.200) | Playable<br>60 fps |
-| `dfeverg` |  | 2001 | Dancing Fever Gold (J 000821 V2.001) | Partial<br>49.6 fps |
-| `decathlto` | `decathlt` | 1996 | DecAthlete (JUET 960424 V1.000) | Partial<br>57.3 fps |
-| `decathlt` |  | 1996 | DecAthlete (JUET 960709 V1.001) | Partial<br>57.3 fps |
-| `diehard` |  | 1996 | Die Hard Arcade (UET 960515 V1.000) | Playable<br>60 fps |
-| `dnmtdeka` | `diehard` | 1996 | Dynamite Deka (J 960515 V1.000) | Playable<br>60 fps |
-| `ejihon` |  | 1995 | Ejihon Tantei Jimusho (J 950613 V1.000) | Playable<br>60 fps |
-| `fanzonem` |  | 1999 | Fantasy Zone (medal game, REV.A) (J 990202 V1.000) | Partial<br>60 fps |
-| `finlarch` | `smleague` | 1995 | Final Arch (J 950714 V1.001) | Playable<br>58.9 fps |
-| `ffrevng10` | `ffreveng` | 1999 | Final Fight Revenge / Final Revenge (JUET 990714 V1.000) | Playable<br>60 fps |
-| `ffreveng` |  | 1999 | Final Fight Revenge / Final Revenge (JUET 990930 V1.100) | Playable<br>60 fps |
-| `fhboxers` |  | 1995 | Funky Head Boxers (JUETBKAL 951218 V1.000) | Playable<br>55.2 fps |
-| `gaxeduel` |  | 1994 | Golden Axe - The Duel (JUETL 950117 V1.000) | Playable<br>59.6 fps |
-| `groovef` |  | 1997 | Groove on Fight - Gouketsuji Ichizoku 3 (J 970416 V1.001) | Playable<br>60 fps |
-| `grdforce` |  | 1998 | Guardian Force (JUET 980318 V0.105) | Playable<br>60 fps |
-| `patocar` |  | 2001 | Hashire Patrol Car (J 990326 V1.000) | Playable<br>59.9 fps |
-| `introdon` |  | 1996 | Karaoke Quiz Intro Don Don! (J 960213 V1.000) | Playable<br>59.2 fps |
-| `magzun` |  | 1996 | Magical Zunou Power (J 961031 V1.000) | Partial<br>60 fps |
-| `maruchan` |  | 1997 | Maru-Chan de Goo! (J 971216 V1.000) | Playable<br>59.2 fps |
-| `mausuke` |  | 1996 | Mausuke no Ojama the World (J 960314 V1.000) | Playable<br>59.2 fps |
-| `micrombc` |  | 1999 | Microman Battle Charge (J 990326 V1.000) | Playable<br>60 fps |
-| `nameclub` |  | 1996 | Name Club (J 960315 V1.000) | Playable<br>60 fps |
-| `nclubdis` |  | 1998 | Name Club Disney (J 980614 V1.000) | Partial<br>60 fps |
-| `nclubv2` |  | 1996 | Name Club Ver.2 (J 960315 V1.000) | Playable<br>60 fps |
-| `nclubv3` |  | 1997 | Name Club Ver.3 (J 970723 V1.000) | Playable<br>60 fps |
-| `nclubv4` |  | 1997 | Name Club Ver.4 (J 971202 V1.000) | Playable<br>60 fps |
-| `supgoal` |  | 1998 | Nerae! Super Goal (J 981218 V1.000) | Playable<br>59.3 fps |
-| `othellos` |  | 1998 | Othello Shiyouyo (J 980423 V1.002) | Playable<br>60 fps |
-| `pblbeach` |  | 1995 | Pebble Beach - The Great Shot (JUE 950913 V0.990) | Playable<br>59.2 fps |
-| `prikura` |  | 1996 | Princess Clara Daisakusen (J 960910 V1.000) | Partial |
-| `prc297wi` |  | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 1) | Partial |
-| `prc297wia` | `prc297wi` | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 2) | Partial |
-| `prc298au` |  | 1998 | Print Club 2 '98 Autumn Ver (J 980827 V1.000) | Partial |
-| `prc298sp` |  | 1998 | Print Club 2 '98 Spring Ver (J 971017 V1.100) | Partial |
-| `prc298su` |  | 1998 | Print Club 2 '98 Summer Ver (J 980603 V1.100) | Partial |
-| `prc2ksu` |  | 2000 | Print Club 2 2000 Summer (J 000509 V1.000) | Partial |
+| `choroqhr` |  | 1998 | Choro Q Hyper Racing 5 (J 981230 V1.000) | Playable<br>59.94 fps |
+| `colmns97` |  | 1996 | Columns '97 (JET 961209 V1.000) | Playable<br>59.94 fps |
+| `cotton2` |  | 1997 | Cotton 2 (JUET 970902 V1.000) | Playable<br>59.74 fps |
+| `cottonbm` |  | 1998 | Cotton Boomerang (JUET 980709 V1.000) | Playable<br>59.94 fps |
+| `sanjeon` | `sasissu` | 1999 | DaeJeon! SanJeon SuJeon (AJTUE 990412 V1.000) | Playable<br>59.94 fps |
+| `danchih` |  | 1999 | Danchi de Hanafuda (J 990607 V1.400) | Playable<br>59.94 fps |
+| `danchiq` |  | 2000 | Danchi de Quiz: Okusan Yontaku Desuyo! (J 001128 V1.200) | Playable<br>59.94 fps |
+| `dfeverg` |  | 2001 | Dancing Fever Gold (J 000821 V2.001) | Partial<br>42.73 fps |
+| `decathlto` | `decathlt` | 1996 | DecAthlete (JUET 960424 V1.000) | Partial<br>53.62 fps |
+| `decathlt` |  | 1996 | DecAthlete (JUET 960709 V1.001) | Partial<br>53.58 fps |
+| `diehard` |  | 1996 | Die Hard Arcade (UET 960515 V1.000) | Playable<br>59.94 fps |
+| `dnmtdeka` | `diehard` | 1996 | Dynamite Deka (J 960515 V1.000) | Playable<br>59.90 fps |
+| `ejihon` |  | 1995 | Ejihon Tantei Jimusho (J 950613 V1.000) | Playable<br>59.94 fps |
+| `fanzonem` |  | 1999 | Fantasy Zone (medal game, REV.A) (J 990202 V1.000) | Partial<br>59.94 fps |
+| `finlarch` | `smleague` | 1995 | Final Arch (J 950714 V1.001) | Playable<br>59.42 fps |
+| `ffrevng10` | `ffreveng` | 1999 | Final Fight Revenge / Final Revenge (JUET 990714 V1.000) | Playable<br>59.94 fps |
+| `ffreveng` |  | 1999 | Final Fight Revenge / Final Revenge (JUET 990930 V1.100) | Playable<br>59.94 fps |
+| `fhboxers` |  | 1995 | Funky Head Boxers (JUETBKAL 951218 V1.000) | Playable<br>57.27 fps |
+| `gaxeduel` |  | 1994 | Golden Axe - The Duel (JUETL 950117 V1.000) | Playable<br>59.94 fps |
+| `groovef` |  | 1997 | Groove on Fight - Gouketsuji Ichizoku 3 (J 970416 V1.001) | Playable<br>59.73 fps |
+| `grdforce` |  | 1998 | Guardian Force (JUET 980318 V0.105) | Playable<br>59.77 fps |
+| `patocar` |  | 2001 | Hashire Patrol Car (J 990326 V1.000) | Playable<br>59.94 fps |
+| `introdon` |  | 1996 | Karaoke Quiz Intro Don Don! (J 960213 V1.000) | Playable<br>59.94 fps |
+| `magzun` |  | 1996 | Magical Zunou Power (J 961031 V1.000) | Partial<br>59.94 fps |
+| `maruchan` |  | 1997 | Maru-Chan de Goo! (J 971216 V1.000) | Playable<br>59.12 fps |
+| `mausuke` |  | 1996 | Mausuke no Ojama the World (J 960314 V1.000) | Playable<br>59.94 fps |
+| `micrombc` |  | 1999 | Microman Battle Charge (J 990326 V1.000) | Playable<br>59.94 fps |
+| `nameclub` |  | 1996 | Name Club (J 960315 V1.000) | Playable<br>59.94 fps |
+| `nclubdis` |  | 1998 | Name Club Disney (J 980614 V1.000) | Partial<br>59.94 fps |
+| `nclubv2` |  | 1996 | Name Club Ver.2 (J 960315 V1.000) | Playable<br>59.94 fps |
+| `nclubv3` |  | 1997 | Name Club Ver.3 (J 970723 V1.000) | Playable<br>59.87 fps |
+| `nclubv4` |  | 1997 | Name Club Ver.4 (J 971202 V1.000) | Playable<br>59.94 fps |
+| `supgoal` |  | 1998 | Nerae! Super Goal (J 981218 V1.000) | Playable<br>59.94 fps |
+| `othellos` |  | 1998 | Othello Shiyouyo (J 980423 V1.002) | Playable<br>59.94 fps |
+| `pblbeach` |  | 1995 | Pebble Beach - The Great Shot (JUE 950913 V0.990) | Playable<br>57.73 fps |
+| `prikura` |  | 1996 | Princess Clara Daisakusen (J 960910 V1.000) | Partial<br>58.57 fps |
+| `prc297wi` |  | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 1) | Partial<br>58.53 fps |
+| `prc297wia` | `prc297wi` | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 2) | Partial<br>58.79 fps |
+| `prc298au` |  | 1998 | Print Club 2 '98 Autumn Ver (J 980827 V1.000) | Partial<br>59.94 fps |
+| `prc298sp` |  | 1998 | Print Club 2 '98 Spring Ver (J 971017 V1.100) | Partial<br>58.56 fps |
+| `prc298su` |  | 1998 | Print Club 2 '98 Summer Ver (J 980603 V1.100) | Partial<br>59.94 fps |
+| `prc2ksu` |  | 2000 | Print Club 2 2000 Summer (J 000509 V1.000) | Partial<br>59.94 fps |
 | `pclub2bb` |  | 1997 | Print Club 2 Banpresto Bono Bono (J 970925 V1.000) | Partial |
 | `pclub2bu` |  | 1997 | Print Club 2 Banpresto Ultraman (J 970604 V1.000) | Partial |
-| `pclb2elk` |  | 1997 | Print Club 2 Earth Limited Kobe (Print Club Custom) (J 970808 V1.000) | Partial |
+| `pclb2elk` |  | 1997 | Print Club 2 Earth Limited Kobe (Print Club Custom) (J 970808 V1.000) | Partial<br>59.94 fps |
 | `pclub2ev` |  | 1997 | Print Club 2 Evangelion (J 970319 V1.000) | Partial |
-| `pclub2fc` |  | 1999 | Print Club 2 Felix The Cat (Rev. A) (J 970415 V1.100) | Partial |
-| `pckobe99` |  | 1997 | Print Club 2 Kobe Luminaire '99 (Print Club Custom 3) (J 991203 V1.000) | Partial<br>60 fps |
+| `pclub2fc` |  | 1999 | Print Club 2 Felix The Cat (Rev. A) (J 970415 V1.100) | Partial<br>59.16 fps |
+| `pckobe99` |  | 1997 | Print Club 2 Kobe Luminaire '99 (Print Club Custom 3) (J 991203 V1.000) | Partial<br>59.94 fps |
 | `pclub2lc` |  | 1999 | Print Club 2 Lamb Chop and Friends (J 990520 V1.000) | Partial |
 | `pclub2mb` |  | 1998 | Print Club 2 Mr. Bean (J 980325 V1.000) | Partial |
-| `pclub2pe` |  | 1997 | Print Club 2 Pepsiman (J 970618 V1.100) | Partial |
-| `pclub2pf` |  | 1998 | Print Club 2 Puffy (J V1.100) | Partial |
-| `pclub2` |  | 1997 | Print Club 2 Standard Ver1 (U 970921 V1.000) | Partial |
+| `pclub2pe` |  | 1997 | Print Club 2 Pepsiman (J 970618 V1.100) | Partial<br>59.00 fps |
+| `pclub2pf` |  | 1998 | Print Club 2 Puffy (J V1.100) | Partial<br>59.94 fps |
+| `pclub2` |  | 1997 | Print Club 2 Standard Ver1 (U 970921 V1.000) | Partial<br>59.94 fps |
 | `pclub2ts` |  | 1997 | Print Club 2 Tsubuyaki Shiro (J 970708 V1.100) | Partial |
-| `pclub2v3` |  | 1999 | Print Club 2 Vol. 3 (U 990310 V1.000) | Partial |
-| `pclub26w` |  | 1997 | Print Club 2 Vol. 6 Winter (J 961210 V1.000) | Partial |
-| `pclub26wa` | `pclub26w` | 1997 | Print Club 2 Vol. 6 Winter (J 970121 V1.200) | Partial |
-| `pclub27s` |  | 1997 | Print Club 2 Vol. 7 Spring (J 970313 V1.100) | Partial |
-| `prc28su` |  | 1997 | Print Club 2 Vol. 8 '97 Summer (J 970616 V1.100) | Partial |
-| `prc29au` |  | 1997 | Print Club 2 Vol. 9 Autumn (J V1.100) | Partial |
-| `pclub2wb` |  | 1997 | Print Club 2 Warner Bros (J 970228 V1.000) | Partial |
-| `pclubor` |  | 1999 | Print Club Goukakenran (J 991104 V1.000) | Partial |
-| `pclub2kc` |  | 1997 | Print Club Kome Kome Club (J 970203 V1.000) | Partial |
-| `pclove` |  | 1997 | Print Club LoveLove (J 970421 V1.000) | Partial |
-| `pclove2` |  | 1997 | Print Club LoveLove Ver 2 (J 970825 V1.000) | Partial |
+| `pclub2v3` |  | 1999 | Print Club 2 Vol. 3 (U 990310 V1.000) | Partial<br>59.94 fps |
+| `pclub26w` |  | 1997 | Print Club 2 Vol. 6 Winter (J 961210 V1.000) | Partial<br>59.94 fps |
+| `pclub26wa` | `pclub26w` | 1997 | Print Club 2 Vol. 6 Winter (J 970121 V1.200) | Partial<br>59.14 fps |
+| `pclub27s` |  | 1997 | Print Club 2 Vol. 7 Spring (J 970313 V1.100) | Partial<br>59.08 fps |
+| `prc28su` |  | 1997 | Print Club 2 Vol. 8 '97 Summer (J 970616 V1.100) | Partial<br>58.74 fps |
+| `prc29au` |  | 1997 | Print Club 2 Vol. 9 Autumn (J V1.100) | Partial<br>58.84 fps |
+| `pclub2wb` |  | 1997 | Print Club 2 Warner Bros (J 970228 V1.000) | Partial<br>58.91 fps |
+| `pclubor` |  | 1999 | Print Club Goukakenran (J 991104 V1.000) | Partial<br>59.94 fps |
+| `pclub2kc` |  | 1997 | Print Club Kome Kome Club (J 970203 V1.000) | Partial<br>58.94 fps |
+| `pclove` |  | 1997 | Print Club LoveLove (J 970421 V1.000) | Partial<br>59.94 fps |
+| `pclove2` |  | 1997 | Print Club LoveLove Ver 2 (J 970825 V1.000) | Partial<br>59.94 fps |
 | `pclubnbc` |  | 1998 | Print Club Nightmare Before Christmas (J 980717 V1.000) | Partial |
-| `pclubol` |  | 1999 | Print Club Olive (J 980717 V1.000) | Partial |
-| `pclubpok` |  | 1999 | Print Club Pokemon B (U 991126 V1.000) | Partial |
+| `pclubol` |  | 1999 | Print Club Olive (J 980717 V1.000) | Partial<br>59.94 fps |
+| `pclubpok` |  | 1999 | Print Club Pokemon B (U 991126 V1.000) | Partial<br>59.94 fps |
 | `pclubsc5` |  | 1998 | Print Club Sony Creative Ver.5 (J 980721 V1.000) | Partial |
 | `pclubsc6` |  | 1997 | Print Club Sony Creative Ver.6 (J 971006 V1.000) | Partial |
-| `pcpooh2` |  | 1997 | Print Club Winnie-the-Pooh Vol. 2 (J 971218 V1.000) | Partial |
-| `pcpooh3` |  | 1998 | Print Club Winnie-the-Pooh Vol. 3 (J 980406 V1.000) | Partial |
+| `pcpooh2` |  | 1997 | Print Club Winnie-the-Pooh Vol. 2 (J 971218 V1.000) | Partial<br>10.65 fps |
+| `pcpooh3` |  | 1998 | Print Club Winnie-the-Pooh Vol. 3 (J 980406 V1.000) | Partial<br>10.65 fps |
 | `pclubyo` |  | 1997 | Print Club Yoshimoto V1 (J 970208 V1.000) | Partial |
-| `pclubyo2` |  | 1997 | Print Club Yoshimoto V2 (J 970422 V1.100) | Partial |
-| `kiwames` |  | 1995 | Pro Mahjong Kiwame S (J 951020 V1.208) | Playable<br>56.4 fps |
-| `puyosun` |  | 1996 | Puyo Puyo Sun (J 961115 V0.001) | Playable<br>59.0 fps |
-| `thuntk` | `sandor` | 1997 | Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K) | Playable<br>60 fps |
-| `sandor` |  | 1995 | Puzzle & Action: Sand-R (J 951114 V1.000) | Playable<br>60 fps |
-| `thunt` | `sandor` | 1997 | Puzzle & Action: Treasure Hunt (JUET 970901 V2.00E) | Playable<br>60 fps |
-| `rsgun` |  | 1998 | Radiant Silvergun (JUET 980523 V1.000) | Playable<br>60 fps |
-| `hanagumi` |  | 1997 | Sakura Taisen - Hanagumi Taisen Columns (J 971007 V1.010) | Playable<br>58.9 fps |
-| `seabass` |  | 1997 | Sea Bass Fishing (JUET 971110 V0.001) | Playable<br>59.4 fps |
-| `shanhigw` |  | 1995 | Shanghai - The Great Wall / Shanghai Triple Threat (JUE 950623 V1.005) | Playable<br>59.5 fps |
-| `shienryu` |  | 1997 | Shienryu (JUET 961226 V1.000) | Playable<br>60 fps |
+| `pclubyo2` |  | 1997 | Print Club Yoshimoto V2 (J 970422 V1.100) | Partial<br>59.94 fps |
+| `kiwames` |  | 1995 | Pro Mahjong Kiwame S (J 951020 V1.208) | Playable<br>59.77 fps |
+| `puyosun` |  | 1996 | Puyo Puyo Sun (J 961115 V0.001) | Playable<br>59.94 fps |
+| `thuntk` | `sandor` | 1997 | Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K) | Playable<br>58.76 fps |
+| `sandor` |  | 1995 | Puzzle & Action: Sand-R (J 951114 V1.000) | Playable<br>59.94 fps |
+| `thunt` | `sandor` | 1997 | Puzzle & Action: Treasure Hunt (JUET 970901 V2.00E) | Playable<br>59.94 fps |
+| `rsgun` |  | 1998 | Radiant Silvergun (JUET 980523 V1.000) | Playable<br>59.61 fps |
+| `hanagumi` |  | 1997 | Sakura Taisen - Hanagumi Taisen Columns (J 971007 V1.010) | Playable<br>58.01 fps |
+| `seabass` |  | 1997 | Sea Bass Fishing (JUET 971110 V0.001) | Playable<br>59.12 fps |
+| `shanhigw` |  | 1995 | Shanghai - The Great Wall / Shanghai Triple Threat (JUE 950623 V1.005) | Playable<br>59.55 fps |
+| `shienryu` |  | 1997 | Shienryu (JUET 961226 V1.000) | Playable<br>59.94 fps |
 | `pclub2sr` |  | 1998 | Showa Retro Print Club 2 (J 980217 V1.000) | Partial |
-| `skychal` |  | 2000 | Sky Challenger (J 000406 V1.000) | Playable<br>60 fps |
+| `skychal` |  | 2000 | Sky Challenger (J 000406 V1.000) | Playable<br>59.84 fps |
 | `slotbatt` |  | 2002 | Slot Battler (J 020703 V1.000) | Playable |
-| `sackids` |  | 2000 | Soreyuke Anpanman Crayon Kids (J 001026 V1.000) | Partial<br>60 fps |
-| `sokyugrt` |  | 1996 | Soukyugurentai / Terra Diver (JUET 960821 V1.000) | Playable<br>59.1 fps |
-| `sfish2j` | `sfish2` | 1995 | Sport Fishing 2 (J 951201 V1.100) | Partial<br>60 fps |
-| `sfish2` |  | 1995 | Sport Fishing 2 (UET 951106 V1.10e) | Partial<br>60 fps |
-| `sss` |  | 1998 | Steep Slope Sliders (JUET 981110 V1.000) | Playable<br>60 fps |
-| `stress` |  | 1998 | Stress Busters (J 981020 V1.000) | Partial<br>60 fps |
-| `suikoenb` |  | 1995 | Suiko Enbu / Outlaws of the Lost Dynasty (JUETL 950314 V2.001) | Playable<br>60 fps |
-| `smleague` |  | 1995 | Super Major League (U 960108 V1.000) | Partial<br>59.2 fps |
-| `sasissu` |  | 1998 | Taisen Tanto-R Sashissu!! (J 980216 V1.000) | Playable<br>60 fps |
-| `techbowl` |  | 1997 | Technical Bowling (J 971212 V1.000) | Playable<br>57.9 fps |
-| `twcup98` |  | 1998 | Tecmo World Cup '98 (JUET 980410 V1.000) | Playable<br>58.9 fps |
-| `twsoc98` | `twcup98` | 1998 | Tecmo World Soccer '98 (JUET 980410 V1.000) | Playable<br>57.7 fps |
-| `elandore` |  | 1998 | Touryuu Densetsu Elan-Doree / Elan Doree - Legend of Dragoon (JUET 980922 V1.006) | Playable<br>55.3 fps |
+| `sackids` |  | 2000 | Soreyuke Anpanman Crayon Kids (J 001026 V1.000) | Partial<br>59.94 fps |
+| `sokyugrt` |  | 1996 | Soukyugurentai / Terra Diver (JUET 960821 V1.000) | Playable<br>59.94 fps |
+| `sfish2j` | `sfish2` | 1995 | Sport Fishing 2 (J 951201 V1.100) | Partial<br>59.94 fps |
+| `sfish2` |  | 1995 | Sport Fishing 2 (UET 951106 V1.10e) | Partial<br>59.94 fps |
+| `sss` |  | 1998 | Steep Slope Sliders (JUET 981110 V1.000) | Playable<br>59.94 fps |
+| `stress` |  | 1998 | Stress Busters (J 981020 V1.000) | Partial<br>59.94 fps |
+| `suikoenb` |  | 1995 | Suiko Enbu / Outlaws of the Lost Dynasty (JUETL 950314 V2.001) | Playable<br>58.71 fps |
+| `smleague` |  | 1995 | Super Major League (U 960108 V1.000) | Partial<br>58.13 fps |
+| `sasissu` |  | 1998 | Taisen Tanto-R Sashissu!! (J 980216 V1.000) | Playable<br>59.94 fps |
+| `techbowl` |  | 1997 | Technical Bowling (J 971212 V1.000) | Playable<br>59.94 fps |
+| `twcup98` |  | 1998 | Tecmo World Cup '98 (JUET 980410 V1.000) | Playable<br>56.47 fps |
+| `twsoc98` | `twcup98` | 1998 | Tecmo World Soccer '98 (JUET 980410 V1.000) | Playable<br>57.02 fps |
+| `elandore` |  | 1998 | Touryuu Densetsu Elan-Doree / Elan Doree - Legend of Dragoon (JUET 980922 V1.006) | Playable<br>59.94 fps |
 | `tsuribor` |  | 1998 | Tsuribori Taikai (JAE 980605 V1.000) | Playable |
-| `vfkids` |  | 1996 | Virtua Fighter Kids (JUET 960319 V0.000) | Playable<br>57.5 fps |
-| `vfremix` |  | 1995 | Virtua Fighter Remix (JUETBKAL 950428 V1.000) | Playable<br>57.6 fps |
-| `vmahjong` |  | 1997 | Virtual Mahjong (J 961214 V1.000) | Playable<br>57.4 fps |
-| `myfairld` |  | 1998 | Virtual Mahjong 2 - My Fair Lady (J 980608 V1.000) | Playable<br>59.7 fps |
+| `vfkids` |  | 1996 | Virtua Fighter Kids (JUET 960319 V0.000) | Playable<br>59.26 fps |
+| `vfremix` |  | 1995 | Virtua Fighter Remix (JUETBKAL 950428 V1.000) | Playable<br>58.85 fps |
+| `vmahjong` |  | 1997 | Virtual Mahjong (J 961214 V1.000) | Playable<br>59.94 fps |
+| `myfairld` |  | 1998 | Virtual Mahjong 2 - My Fair Lady (J 980608 V1.000) | Playable<br>57.61 fps |
 | `wwshin` |  | 1997 | Waku Waku Shinkansen (J 971031 V0.002) | Playable |
-| `wasafari` |  | 1998 | Wanpaku Safari (J 981109 V1.000) | Playable<br>60 fps |
-| `winterht` |  | 1997 | Winter Heat (JUET 971012 V1.000) | Playable<br>57.8 fps |
-| `yattrmnp` |  | 1998 | Yatterman Plus (J 981006 V1.000) | Partial<br>60 fps |
-| `znpwfv` |  | 1997 | Zen Nippon Pro-Wres Featuring Virtua (J 971123 V1.000) | Playable<br>57.5 fps |
-| `findlove` |  | 1997 | Zenkoku Seifuku Bishoujo Grand Prix Find Love (J 971212 V1.000) | Playable<br>59.1 fps |
+| `wasafari` |  | 1998 | Wanpaku Safari (J 981109 V1.000) | Playable<br>59.94 fps |
+| `winterht` |  | 1997 | Winter Heat (JUET 971012 V1.000) | Playable<br>59.21 fps |
+| `yattrmnp` |  | 1998 | Yatterman Plus (J 981006 V1.000) | Partial<br>59.94 fps |
+| `znpwfv` |  | 1997 | Zen Nippon Pro-Wres Featuring Virtua (J 971123 V1.000) | Playable<br>59.94 fps |
+| `findlove` |  | 1997 | Zenkoku Seifuku Bishoujo Grand Prix Find Love (J 971212 V1.000) | Playable<br>58.06 fps |
 
 </details>
 
@@ -341,7 +347,7 @@ shaders are kept in `ux0:data/restv/shaders/`, and later starts load them up fro
 
 | What | Path |
 |---|---|
-| Border artwork | `ux0:data/restv/artwork/<set>.png` (`.jpg` and `.bmp` also work; the parent set name is tried next) |
+| Border artwork | `ux0:data/restv/artwork/<set>.png` (`.jpg` and `.bmp` also work; the parent set name is tried next; without one, the app's own blank artwork is used) |
 
 Files written by the emulator:
 
@@ -363,8 +369,9 @@ Files written by the emulator:
 | Page up / down | Left / Right |
 | Add / remove favorite | Square |
 | Filter: Playable / All / Favorites | SELECT |
-| Options (Display, Controls) | START |
+| Options (Display, Controls, Refresh ROM list) | START or PS |
 | About | Triangle |
+| Home screen | PS twice |
 
 Options opened from the game list edit the global settings.
 
@@ -375,18 +382,35 @@ Options opened from the game list edit the global settings.
 | Lever | D-pad (or left stick, see Controls) |
 | Buttons 1-4 | Cross, Circle, Square, Triangle (default) |
 | Coin / Start | SELECT / START (default) |
-| Open the in-game menu | SELECT + START |
+| Open / close the in-game menu | SELECT + START, or PS |
+| Home screen | PS twice |
 | Quick save / quick load | SELECT + L / SELECT + R |
 | Exit | L + R + START |
 
-The in-game menu provides: Resume, Reset, Save states (10 slots), Display (frame rate counter, aspect ratio,
-filter, scanlines, border), Controls (button mapping, turbo, analog stick), Cheats (games that have built-in cheats),
-per-game settings and game selection.
+The in-game menu provides: Resume, Reset, Press TEST switch (BIOS menu), Save states (10 slots), Cheats (games that have a
+cheat file), Display (frame rate counter, aspect ratio, rotation, filter, scanlines, border), Controls (button mapping,
+turbo, analog stick), per-game settings and game selection. The menu opens again where SELECT + START or PS closed
+it. On an option with three or more values, the confirm button opens a window with all of them.
 
-**Turbo.** Pick one *Turbo key* and the game button it fires (*Turbo button*), plus the speed
+**PS button.** The PS button belongs to ReST-V while it runs: one press opens or closes the menu (not while a game is
+loading), and only a quick double press goes to the home screen. A small kernel module that comes with the app
+(`module/restv_kctrl.skprx`, loaded by the app itself) reads the button; the first start after the Vita boots loads it
+and restarts the app once. Without it the PS button keeps its usual behaviour.
+
+**Rotate.** *Auto* turns vertical games upright; *Vertical L* / *Vertical R* are for holding the Vita upright, with
+the directions turned to match.
+
+**Press TEST switch (BIOS menu).** Each use presses the board's TEST switch once: the first press opens the ST-V test
+menu (settings, bookkeeping, input and memory tests), the next one leaves it. In the test menu L is the SERVICE button
+(move the cursor) and R is the TEST button (enter).
+
+**Turbo.** In Controls > Turbo, pick one *Turbo key* and the game button it fires (*Turbo button*), plus the speed
 (15, 10 or 7.5 presses per second). While the turbo key is held, that game button fires repeatedly.
 
-**Cheats.** Built-in cheats are listed only for the games that have them. *Start stage* (Treasure Hunt, `thunt` and
+**Cheats.** Cheats are read from `ux0:data/restv/cheats/<set>.txt` (for example `thuntk.txt`) and are listed only for
+the games that have such a file (cheat files are not included). One cheat a line:
+`name | address (hex) | start value (hex) | label = value (hex), ...`; lines starting with `#` are comments. While the
+byte at the address holds the start value, it is set to the chosen value. *Start stage* (Treasure Hunt, `thunt` and
 `thuntk`) starts a new game at stage 2, stage 3 or the final stage; it applies from the next game start, so pick it
 and then use *Reset game*. Cheat choices are not saved.
 

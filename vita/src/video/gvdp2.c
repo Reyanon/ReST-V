@@ -70,6 +70,7 @@ typedef struct {
 	float layerOn[4], layerAlpha[4], layerShad[4], layerLs[4];
 	float mosaic[4];   // ADR-129: horizontal mosaic size per NBG (N3..N0), 1 = off (runtime value)
 	float mosaicOn[4]; // 1 where mosaic > 1 (specialized: one compose variant for every size)
+	float layerSw[4];  // ADR-161: sprite window only (N3..N0): 1 = hidden where the sprite MSB is set, 2 = where it is clear
 	float ccwA[4], ccwB[4], ccw0[4], ccw1[4]; // ADR-112: colour calculation window (rectangles W0/W1)
 	float misc[4];
 	float sprA[4], sprB[4], sprC[4], sprD[4], sprE[4];
@@ -119,6 +120,7 @@ typedef struct {
 	// VDP1 GPU renderer (ADR-023)
 	void *v1_v;                // VDP1 triangles to draw this frame (frame temp GPU memory)
 	int v1_nv, v1_target, v1_pending;
+	int v1_clear;              // ADR-149: VDP1 target to clear before this frame (-1 none)
 	V1Frame v1f;               // batches per shader variant
 	int spr_front;             // VDP1 buffer read by the composite, s_v1rt[spr_front] if spr_gpu
 	int spr_gpu;
@@ -155,6 +157,7 @@ static GxTex *s_lcache[NUM_BG];
 static uint32_t s_lkey[NUM_BG], s_cgen = 1, s_rbgq_dec_seen;
 static int s_lvalid[NUM_BG], s_reuse_on;
 static uint32_t s_vcstamp[128]; // VRAM 4KB page: serial of the snapshot where its bytes last changed (+0), for the RBG page cache
+static uint32_t s_vcsub[128][16]; // ADR-137: the same for each 256-byte block of the page (plane row dependencies)
 static uint32_t mixw(uint32_t h, const void *p, size_t bytes)
 {
 	const uint32_t *w = (const uint32_t *)p;
@@ -180,7 +183,12 @@ static uint32_t s_plane_key[NUM_BG], s_plane_stamp[NUM_BG], s_plane_pages[NUM_BG
 static int s_plane_tag[NUM_BG][PLANE_HMAX];  // map row held by each plane row (-1 = none): plane row = map y & (PLANE_H - 1)
 static short s_plane_c0[NUM_BG][PLANE_HMAX], s_plane_c1[NUM_BG][PLANE_HMAX]; // columns drawn on that row [c0, c1)
 static uint32_t s_plane_rpg[NUM_BG][PLANE_HMAX][4]; // ADR-100: VRAM pages (4KB) each plane row was drawn from
-#define PLANE_GROUP_ROWS 32 // ADR-100: plane rows drawn per group at most (page tracking granularity)
+#define PLANE_GROUP_ROWS 16 // ADR-100: plane rows drawn per group at most (tracking granularity; ADR-137: 32 -> 16)
+// ADR-137: the 256-byte blocks each plane row read, for up to PL_SUBN pages (n = 255: more pages, page granularity).
+// vfkids rewrites a few NBG1 map cells every frame: a 4KB map page holds 256 plane rows, which were all drawn again
+#define PL_SUBN 14
+typedef struct { uint8_t n, pg[PL_SUBN]; uint16_t m[PL_SUBN]; } PlSub;
+static PlSub s_plane_sub[NUM_BG][PLANE_HMAX];
 static uint32_t s_plane_gen[NUM_BG];      // moves whenever plane rows are drawn (layer reuse key)
 static GxProg *s_prog_pcopy;
 static GxParam s_pc_scale, s_pc_tex;
@@ -273,6 +281,7 @@ static void save_ppm(const char *path, const uint8_t *rgba, int w, int h, int st
 }
 
 static FrameSet s_set[NSETS];
+void (*gvdp2_progress)(int permille); // loading screen during gvdp2_init (main thread, outside any scene)
 static int s_cur = -1; // set filled by draw_screens
 static GxTex *s_out_tex[NSETS];
 static int file_exists_q(const char *path);
@@ -284,6 +293,7 @@ static int s_cmp_exp;
 static GxProg *s_prog_v1;      // VDP1 GPU renderer (ADR-023): variant 0 (others in s_v1prog)
 static GxProg *s_v1prog[V1GPU_VARIANTS];
 static GxParam s_v1loc[V1GPU_VARIANTS];
+int rstv_v1_fullsnap; // diag (ux0:data/restv/v1full): copy all VDP1 RAM a frame, recheck every texture
 static GxTex *s_v1rt[2];       // 2 VDP1 framebuffers (front/back by rstv_vdp1_back_idx)
 static GxTex *s_v1atlas;       // sprite pattern cache (1024x1024 RGBA8)
 static GxTex *s_v1snap;        // ADR-115: VDP1 framebuffer copy read by shadow/half-transparency (512x256)
@@ -326,7 +336,7 @@ enum {
 	U_layerOn, U_layerAlpha, U_layerShad, U_layerLs, U_misc,
 	U_sprA, U_sprB, U_sprC, U_sprD, U_sprE, U_prioLo, U_prioHi, U_ccLo, U_ccHi, U_mode,
 	U_offB, U_off3, U_off2, U_off1, U_off0, U_offr, U_offs, U_tSLut,
-	U_ccwA, U_ccwB, U_ccw0, U_ccw1, U_mosaic, U_mosaicOn,
+	U_ccwA, U_ccwB, U_ccw0, U_ccw1, U_mosaic, U_mosaicOn, U_layerSw,
 	U_COUNT
 };
 _Static_assert(U_COUNT <= 40, "s_loc size");
@@ -335,7 +345,7 @@ static const char *s_uname[U_COUNT] = {
 	"layerOn", "layerAlpha", "layerShad", "layerLs", "misc",
 	"sprA", "sprB", "sprC", "sprD", "sprE", "prioLo", "prioHi", "ccLo", "ccHi", "mode",
 	"offB", "off3", "off2", "off1", "off0", "offr", "offs_", "tSLut",
-	"ccwA", "ccwB", "ccw0", "ccw1", "mosaic", "mosaicOn",
+	"ccwA", "ccwB", "ccw0", "ccw1", "mosaic", "mosaicOn", "layerSw",
 };
 
 static const char *s_vs =
@@ -393,7 +403,8 @@ static const char *s_fs =
 	"  uniform float4 layerOn, uniform float4 layerAlpha, uniform float4 layerShad, uniform float4 layerLs, uniform float4 misc,\n"
 	"  uniform float4 sprA, uniform float4 sprB, uniform float4 sprC, uniform float4 sprD, uniform float4 sprE,\n"
 	"  uniform float4 prioLo, uniform float4 prioHi, uniform float4 ccLo, uniform float4 ccHi, uniform float4 mode,\n"
-	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1, uniform float4 mosaic, uniform float4 mosaicOn) : COLOR\n"
+	"  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1, uniform float4 mosaic, uniform float4 mosaicOn,\n"
+	"  uniform float4 layerSw) : COLOR\n"
 	"{\n"
 	"  float x = floor(vPix.x);\n"
 	"  float y = floor(vPix.y);\n"
@@ -419,6 +430,12 @@ static const char *s_fs =
 	"  float4 c1 = lay(fetch(tN1, float2(mx(x, mosaicOn.z, mosaic.z), y), bsz));\n"
 	"  float4 c0 = lay(fetch(tN0, float2(mx(x, mosaicOn.w, mosaic.w), y), bsz));\n"
 	"  float4 cr = lay(fetch(tR0, float2(x, y), bsz));\n"
+	"  if (layerSw.x + layerSw.y + layerSw.z + layerSw.w > 0.5) {\n" // ADR-161: sprite window (sprite MSB) per layer
+	"    float4 sw = (sprE.z > 0.5) ? fetch(tSpr, float2(x, y), float2(512.0, 256.0)) : fetch(tSpr, float2(floor(x / 2.0), y), float2(256.0, 256.0));\n"
+	"    float b = step(127.5, (sprE.z > 0.5 || fmod(x, 2.0) < 0.5) ? sw.y : sw.w);\n"
+	"    float4 hd = step(abs(layerSw - 1.0), 0.5) * b + step(abs(layerSw - 2.0), 0.5) * (1.0 - b);\n"
+	"    c3 *= 1.0 - hd.x; c2 *= 1.0 - hd.y; c1 *= 1.0 - hd.z; c0 *= 1.0 - hd.w;\n"
+	"  }\n"
 	"  float p3 = fmod(c3.w, 8.0) * layerOn.x, p2 = fmod(c2.w, 8.0) * layerOn.y;\n"
 	"  float p1 = fmod(c1.w, 8.0) * layerOn.z, p0 = fmod(c0.w, 8.0) * layerOn.w, pr = fmod(cr.w, 8.0) * misc.x;\n"
 	"  float k3 = (p3 > 0.5) ? p3 * 8.0 + 0.0 : -1.0;\n"
@@ -704,12 +721,44 @@ static const char *s_fs_fast =
 	"  return float4(r, 1.0);\n"
 	"}\n";
 
+// ADR-161: s_fs_fast plus the per-layer sprite window test; made at init so s_fs_fast (its hash names the cached
+// variants) and the variants of frames without a sprite window stay as before
+static char *s_fs_fast_sw;
+static char *make_fs_fast_sw(void)
+{
+	static const char sig_old[] = "uniform float4 mosaic, uniform float4 mosaicOn) : COLOR\n";
+	static const char sig_new[] = "uniform float4 mosaic, uniform float4 mosaicOn,\n  uniform float4 layerSw) : COLOR\n";
+	static const char at[] = "  if (misc.x > 0.5) cr = tex2D(tR0, vUV);\n";
+	static const char test[] =
+		"  if (layerSw.x + layerSw.y + layerSw.z + layerSw.w > 0.5) {\n"
+		"    float4 sw = (sprE.z > 0.5) ? tex2D(tSpr, vUV) : tex2D(tSpr, float2((floor(x / 2.0) + 0.5) / 256.0, vUV.y));\n"
+		"    half b = step(127.5 / 255.0, (sprE.z > 0.5 || fmod(x, 2.0) < 0.5) ? sw.y : sw.w);\n"
+		"    half4 hd = step(abs(layerSw - 1.0), 0.5) * b + step(abs(layerSw - 2.0), 0.5) * (1.0 - b);\n"
+		"    c3 *= 1.0 - hd.x; c2 *= 1.0 - hd.y; c1 *= 1.0 - hd.z; c0 *= 1.0 - hd.w;\n"
+		"  }\n";
+	const char *p1 = strstr(s_fs_fast, sig_old), *p2 = strstr(s_fs_fast, at);
+	if (!p1 || !p2 || p2 < p1)
+		return NULL;
+	char *o = (char *)malloc(strlen(s_fs_fast) + sizeof(sig_new) + sizeof(test));
+	if (!o)
+		return NULL;
+	size_t n = 0;
+	memcpy(o + n, s_fs_fast, (size_t)(p1 - s_fs_fast)); n += (size_t)(p1 - s_fs_fast);
+	memcpy(o + n, sig_new, sizeof(sig_new) - 1); n += sizeof(sig_new) - 1;
+	const char *q = p1 + sizeof(sig_old) - 1;
+	const size_t m = (size_t)(p2 - q) + sizeof(at) - 1;
+	memcpy(o + n, q, m); n += m;
+	memcpy(o + n, test, sizeof(test) - 1); n += sizeof(test) - 1;
+	strcpy(o + n, p2 + sizeof(at) - 1);
+	return o;
+}
+
 // ---- fast composite shader specialization (ADR-019) ----
 // compiles a source where the uniform components that pick branches (enabled layers, shadow/line screen, color calc mode, sprite format ...) are
 // replaced by constants of their current values. The shader compiler drops unused paths. Cached in the GXP cache (ux0:data/restv/shaders) by source hash, so
 // a config seen once loads directly on the next run. Not used if ux0:data/restv/nocmpspec exists
 typedef struct {
-	char key[160];
+	char key[256];
 	volatile int state; // 0 waiting to compile, 1 binary ready (worker thread), 2 usable, 3 failed
 	char *src;
 	const void *fbin;
@@ -721,18 +770,21 @@ typedef struct {
 	int listed;         // confirmed in the per-game list this run
 	volatile int need_save, need_list; // file writes for the worker thread (source cache, one line of per-game list); no card writes from main
 	uint32_t list_hash;
+	float vals[64], sw[4]; // ADR-185: a variant found in a submit gets its source built by the worker (src NULL until then)
+	int has_sw;
 } CmpVariant;
 // sanjeon goes over 24 (ADR-042). At 96 the table filled with variants of several games and a new thuntk scene was composited with the
 // generic shader (100 instructions) -> 256; preregistration only for entries in the per-game list (cl_<game>.txt) (ADR-064)
 #define MAX_VARIANTS 256
 static CmpVariant s_var[MAX_VARIANTS];
-static int s_nvar, s_cmp_spec, s_lab_on, s_cmpsync_on;
+static int s_nvar, s_cmp_spec, s_lab_on;
 static SceUID s_cmp_sema = -1;
 
 static void rbg_compile_pending(void);
 static void nbg_compile_pending(void);
 static void variant_files(void);
 static void cmp_variant_save(const char *key, const char *src);
+static char *cmp_variant_src(const float *vals, const float *sw);
 static void mig_scan(void);
 static volatile int s_mig_pending;
 // worker thread (CPU1, lowest priority): variant source -> GXP (just reads if cached)
@@ -752,6 +804,15 @@ static int cmp_worker(SceSize args, void *argp)
 			CmpVariant *v = &s_var[i];
 			if (v->state != 0)
 				continue;
+			if (!v->src) {
+				v->src = cmp_variant_src(v->vals, v->has_sw ? v->sw : NULL);
+				if (!v->src) {
+					v->need_save = 0;
+					v->state = 3;
+					continue;
+				}
+				RSTV_LOG("gvdp2: compose variant %d source built, key %s", i + 1, v->key);
+			}
 			if (v->need_save) {
 				cmp_variant_save(v->key, v->src);
 				v->need_save = 0;
@@ -879,22 +940,25 @@ static int spec_pos(unsigned k, char comp)
 		p += (int)strlen(s_spec_list[i].comps);
 	return p + (int)(strchr(s_spec_list[k].comps, comp) - s_spec_list[k].comps);
 }
-static char *cmp_variant_src(const float *vals)
+static char *cmp_variant_src(const float *vals, const float *sw)
 {
-	const size_t n = strlen(s_fs_fast);
+	const char *base = sw ? s_fs_fast_sw : s_fs_fast;
+	if (!base)
+		return NULL;
+	const size_t n = strlen(base);
 	char *src = (char *)malloc(n * 2 + 1024);
 	if (!src)
 		return NULL;
 	size_t o = 0;
 	for (size_t i = 0; i < n;) {
 		int done = 0;
-		if (!i || !is_ident(s_fs_fast[i - 1]))
+		if (!i || !is_ident(base[i - 1])) {
 			for (unsigned k = 0; k < sizeof(s_spec_list) / sizeof(s_spec_list[0]) && !done; k++) {
 				const size_t ln = strlen(s_spec_list[k].name);
-				if (strncmp(s_fs_fast + i, s_spec_list[k].name, ln) || s_fs_fast[i + ln] != '.')
+				if (strncmp(base + i, s_spec_list[k].name, ln) || base[i + ln] != '.')
 					continue;
-				const char comp = s_fs_fast[i + ln + 1];
-				if (!strchr(s_spec_list[k].comps, comp) || is_ident(s_fs_fast[i + ln + 2]))
+				const char comp = base[i + ln + 1];
+				if (!strchr(s_spec_list[k].comps, comp) || is_ident(base[i + ln + 2]))
 					continue;
 				char lit[32];
 				snprintf(lit, sizeof(lit), "%.6f", (double)vals[spec_pos(k, comp)]);
@@ -902,18 +966,23 @@ static char *cmp_variant_src(const float *vals)
 				i += ln + 2;
 				done = 1;
 			}
+			if (!done && sw && !strncmp(base + i, "layerSw.", 8) && strchr("xyzw", base[i + 8]) && !is_ident(base[i + 9])) {
+				o += (size_t)sprintf(src + o, "(%.6f)", (double)sw[base[i + 8] == 'w' ? 3 : base[i + 8] - 'x']);
+				i += 9;
+				done = 1;
+			}
+		}
 		if (!done)
-			src[o++] = s_fs_fast[i++];
+			src[o++] = base[i++];
 	}
 	src[o] = 0;
 	return src;
 }
-static void cmp_variant_add(const char *key, char *src);
 
 // ADR-066 migration: worker thread reads keys from the cv files of the previous source hash, queues them and deletes the files (this game's list entries, or all if no list).
 // main (cmp_variant) registers up to 4 per frame as new-source variants -> no startup time, no file work on main thread
 #define MIG_MAX 256
-static char s_mig_key[MIG_MAX][160];
+static char s_mig_key[MIG_MAX][256];
 static volatile int s_mig_n;  // count filled by worker thread
 static int s_mig_taken;       // count taken by main
 static void mig_scan(void)
@@ -947,6 +1016,26 @@ static void mig_scan(void)
 	sceIoDclose(d);
 	RSTV_LOG("gvdp2: %d compose variants to rebuild for the new shader", n);
 }
+// ADR-185: a new variant from the submit path: building the source (16 ms) and the queue log (20-70 ms) ran inside the
+// GPU submit; the worker builds the source now (src stays NULL until then)
+static void cmp_variant_defer(const char *key, const float *vals, const float *sw)
+{
+	CmpVariant *vv = &s_var[s_nvar];
+	snprintf(vv->key, sizeof(vv->key), "%s", key);
+	memcpy(vv->vals, vals, sizeof(vv->vals));
+	vv->has_sw = sw != NULL;
+	if (sw)
+		memcpy(vv->sw, sw, sizeof(vv->sw));
+	vv->src = NULL;
+	vv->need_save = 1;
+	vv->fbin = NULL;
+	vv->prog = NULL;
+	vv->state = 0;
+	__sync_synchronize();
+	s_nvar++;
+	sceKernelSignalSema(s_cmp_sema, 1);
+}
+
 static void mig_take(void)
 {
 	for (int k = 0; k < 4 && s_mig_taken < s_mig_n && s_nvar < MAX_VARIANTS; k++) {
@@ -968,9 +1057,10 @@ static void mig_take(void)
 		}
 		if (nv != spec_pos(sizeof(s_spec_list) / sizeof(s_spec_list[0]) - 1, 'w') + 1)
 			continue; // different key format (build where the specialization list changed)
-		char *src = cmp_variant_src(vals);
-		if (src)
-			cmp_variant_add(key, src);
+		float sw[4];
+		const char *ks = strstr(key, "sw");
+		const int has_sw = ks && sscanf(ks, "sw%f,%f,%f,%f,", &sw[0], &sw[1], &sw[2], &sw[3]) == 4;
+		cmp_variant_defer(key, vals, has_sw ? sw : NULL);
 	}
 }
 
@@ -978,7 +1068,7 @@ static GxProg *cmp_variant(const FrameSet *s, GxParam **loc)
 {
 	if (s_mig_taken < s_mig_n)
 		mig_take();
-	char key[160];
+	char key[256];
 	float vals[64];
 	int kn = 0, nv = 0;
 	for (unsigned i = 0; i < sizeof(s_spec_list) / sizeof(s_spec_list[0]); i++) {
@@ -989,13 +1079,22 @@ static GxProg *cmp_variant(const FrameSet *s, GxParam **loc)
 			vals[nv++] = x;
 		}
 	}
+	// ADR-161: the sprite window values only when a layer uses it (other keys and sources stay as before ADR-161)
+	const float *sw = NULL;
+	if (s->layerSw[0] + s->layerSw[1] + s->layerSw[2] + s->layerSw[3] > 0.5f) {
+		sw = s->layerSw;
+		kn += snprintf(key + kn, sizeof(key) - kn, "sw%g,%g,%g,%g,", (double)sw[0], (double)sw[1], (double)sw[2], (double)sw[3]);
+	}
 	for (int i = 0; i < s_nvar; i++) {
 		CmpVariant *v = &s_var[i];
 		if (strcmp(v->key, key))
 			continue;
 		if (v->state == 1) {
 			// worker thread built the binary -> register program (main thread)
+			const u64 tr = RSTV_PROF_T();
 			v->prog = gx_prog_bin(gx_compile(s_vs_fast, 0), v->fbin, s_pix_attr, 2, 16, GX_BLEND_NONE);
+			if (RSTV_PROF_T() - tr > 10000)
+				RSTV_LOG("gvdp2: slow variant register %u us", (unsigned)(RSTV_PROF_T() - tr));
 			if (v->prog)
 				for (int k = 0; k < U_COUNT; k++)
 					v->loc[k] = gx_param(v->prog, s_uname[k]);
@@ -1023,45 +1122,10 @@ static GxProg *cmp_variant(const FrameSet *s, GxParam **loc)
 	}
 	if (s_nvar >= MAX_VARIANTS || s_cmp_sema < 0)
 		return NULL;
-	char *src = cmp_variant_src(vals);
-	if (src)
-		cmp_variant_add(key, src);
+	cmp_variant_defer(key, vals, sw);
 	return NULL;
 }
 
-// register a new variant (compiled on worker thread). The variant owns src
-static void cmp_variant_add(const char *key, char *src)
-{
-	CmpVariant *vv = &s_var[s_nvar];
-	snprintf(vv->key, sizeof(vv->key), "%s", key);
-	vv->src = src;
-	vv->need_save = 1;
-	if (s_lab_on) { // for shader experiments: save variant source
-		char path[96];
-		snprintf(path, sizeof(path), "ux0:data/restv/lab/var%d.txt", s_nvar + 1);
-		FILE *vf = fopen(path, "wb");
-		if (vf) {
-			fwrite(src, 1, strlen(src), vf);
-			fclose(vf);
-		}
-	}
-	vv->fbin = NULL;
-	vv->prog = NULL;
-	__sync_synchronize();
-	if (s_cmpsync_on) { // test: compile directly on the main thread
-		vv->fbin = gx_compile(src, 1);
-		RSTV_LOG("gvdp2: compose variant %d sync compile %s", s_nvar + 1, vv->fbin ? "ok" : "failed");
-		vv->state = vv->fbin ? 1 : 3;
-		vv->need_save = 0;
-		cmp_variant_save(key, src);
-		s_nvar++;
-		return;
-	}
-	vv->state = 0;
-	s_nvar++;
-	sceKernelSignalSema(s_cmp_sema, 1);
-	RSTV_LOG("gvdp2: compose variant %d queued, key %s", s_nvar, key);
-}
 
 // ---- stage 2: NBG layer shader (vidsoft Vdp2DrawScroll's MapCalcXY + PatternAddr + FetchPixel + GetAlpha) ----
 // ---- cell quad path (ADR-014) ----
@@ -1094,12 +1158,17 @@ static int rbg_flat_ok(const RstvRotCapture *rc);
 static volatile int s_nrvar;
 static int s_rbg_spec;
 static GxAttr s_rbg_attr[2];
+static char *rbg_variant_src(int key);
 static void rbg_compile_pending(void)
 {
 	for (int i = 0; i < s_nrvar; i++) {
 		RbgVariant *v = &s_rvar[i];
 		if (v->state != 0)
 			continue;
+		if (!v->src && !(v->src = rbg_variant_src(v->key))) { // ADR-193: built here, not in the GPU submit
+			v->state = 3;
+			continue;
+		}
 		v->fbin = gx_compile(v->src, 1);
 		RSTV_LOG("gvdp2: rbg variant %02x compiled %s", v->key, v->fbin ? "ok" : "failed");
 		__sync_synchronize();
@@ -1107,6 +1176,47 @@ static void rbg_compile_pending(void)
 	}
 }
 static GxTex *s_rbg_pages, *s_argb;
+static uint16_t s_argb_dirty[128]; // ADR-185: 256-byte VRAM blocks not yet in the RGB atlas
+static int s_argb_pend;
+// convert the pending blocks into the RGB atlas if frame s samples it (s = NULL: always). Prep worker (or main thread
+// without the submit thread), from the snapshot the frame was prepared from
+static void argb_flush(const FrameSet *s)
+{
+	if (s) {
+		int need = s->gpu_layer[4] && s->rbg_cfg[0][3] >= 3.0f;
+		for (int L = 0; L < 4 && !need; L++)
+			need = s->quad_cn[L] == 3;
+		if (!need) {
+			// ADR-193: a few blocks a frame meanwhile, so the first frame that samples it does not convert everything
+			// changed since boot at once (thuntk: 53 ms in one submit)
+			static uint16_t part[128];
+			int left = 32, any = 0;
+			for (int p = 0; p < 128; p++) {
+				part[p] = 0;
+				for (int b = 0; b < 16 && left > 0; b++)
+					if (s_argb_dirty[p] & (1u << b)) {
+						part[p] |= (uint16_t)(1u << b);
+						s_argb_dirty[p] &= (uint16_t)~(1u << b);
+						left--;
+					}
+				any |= s_argb_dirty[p];
+			}
+			if (left < 32) {
+				const u64 ta = RSTV_PROF_T();
+				rbgq_atlas_rgb_update(s_argb->data, 1024, s_snap_vram, part);
+				s_stats.t_atlas += RSTV_PROF_T() - ta;
+			}
+			if (!any)
+				s_argb_pend = 0;
+			return;
+		}
+	}
+	const u64 ta = RSTV_PROF_T();
+	rbgq_atlas_rgb_update(s_argb->data, 1024, s_snap_vram, s_argb_dirty);
+	memset(s_argb_dirty, 0, sizeof(s_argb_dirty));
+	s_argb_pend = 0;
+	s_stats.t_atlas += RSTV_PROF_T() - ta;
+}
 static RbgqState s_rbgq;
 static GxTex *s_rbg_pages_b;  // ADR-067: map-order cell layout of the B map when there are two maps
 // ADR-077: draw RBG0 at half horizontal resolution (256 x 256, render target slot 20) and stretch-copy into the layer texture (half the rotation shader pixels)
@@ -1144,12 +1254,17 @@ typedef struct {
 static NbgVariant s_nvar_tab[24];
 static volatile int s_nnvar;
 static int s_nbg_spec;
+static char *nbg_variant_src_alloc(int key);
 static void nbg_compile_pending(void)
 {
 	for (int i = 0; i < s_nnvar; i++) {
 		NbgVariant *v = &s_nvar_tab[i];
 		if (v->state != 0)
 			continue;
+		if (!v->src && !(v->src = nbg_variant_src_alloc(v->key))) { // ADR-193: built here, not in the GPU submit
+			v->state = 3;
+			continue;
+		}
 		v->fbin = gx_compile(v->src, 1);
 		RSTV_LOG("gvdp2: nbg variant %03x compiled %s", v->key, v->fbin ? "ok" : "failed");
 		__sync_synchronize();
@@ -1409,7 +1524,7 @@ static inline void rgb555(uint8_t *o, u16 v)
 // n = the window, 0 if it is not that shape
 static int sprite_window_one(const Vdp2 *r)
 {
-	const int w = (r->WCTLC >> 8) & 0x2a;
+	const int w = (r->WCTLC >> 8) & 0x0a; // the sprite window bit does not apply to the sprite layer (see unsupported_reason)
 	if (w == 0x02)
 		return 1;
 	if (w == 0x08)
@@ -1463,7 +1578,9 @@ static int unsupported_reason(int vdp1w, int vdp1ps)
 	if (!(vdp1ps == 2 && vdp1w == 512) && !(vdp1ps == 1 && vdp1w == 1024)) return 3;
 	if (Vdp1Regs->TVMR & 2) return 4;                       // VDP1 rotation framebuffer
 	int wx0, wy0, wx1, wy1, win;
-	if (((r->WCTLC >> 8) & 0x2a) && !sprite_window_whole(r) && !sprite_window_rect(r, &wx0, &wy0, &wx1, &wy1, &win)) {
+	// the sprite layer's own sprite window bit (0x20) is not applied to it (vidsoft TestBothWindow uses W0/W1 only;
+	// kiwames sets WCTLC 0x2000 in play and fell to the CPU)
+	if (((r->WCTLC >> 8) & 0x0a) && !sprite_window_whole(r) && !sprite_window_rect(r, &wx0, &wy0, &wx1, &wy1, &win)) {
 		// sprite layer window (window 0 covering the full screen is ignored, rectangle window 0 is cleared from the sprite texture)
 		static u16 lw[6];
 		const u16 cw[6] = { r->WCTLC, r->WCTLD, r->WPSX0, r->WPEX0, r->WPSY0, r->WPEY0 };
@@ -2226,6 +2343,9 @@ static uint32_t bank_hash(const uint32_t *bk)
 
 // ADR-058: draw layer L through its plane cache. 0 = not suitable (the caller builds cell quads as before)
 static int s_plane_rej[4]; // diag: last reject point (perf line prej)
+#define PLANE_QN_MANY 3000
+static int s_plane_many = 1; // ADR-152 (ux0:data/restv/noplanemany = off)
+static int s_last_qn[4];   // ADR-152: cell quads the layer needed when it last went that way
 static int s_plane_fullw = 1; // ADR-080 (ux0:data/restv/noplanefull = per-row column ranges)
 static int s_plane_mag = 1;   // ADR-080 (ux0:data/restv/noplanemag = magnified lines as texel-run quads)
 static int s_plane_all; // experiment: ux0:data/restv/planeall = use the plane cache even for layers with identical lines
@@ -2276,7 +2396,8 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 	}
 	// lines alike: the cell quads merge well already — unless lines are zoomed by a factor the cell quads cannot draw
 	// (those would go to the NBG pixel shader line by line, 251 instructions a pixel: sanjeon f3300 4.6ms)
-	if (first < 0 || (nvar < 16 && nzoom == 0 && !s_plane_all))
+	// ADR-152: ... unless they did not merge last time (astrass' hi-res NBG2: 8880 quads, 11 ms of prep a frame)
+	if (first < 0 || (nvar < 16 && nzoom == 0 && !s_plane_all && (!s_plane_many || s_last_qn[L] < PLANE_QN_MANY)))
 		return (s_plane_rej[L] = 3, 0);
 	// the map rows this frame needs, at plane row y & (PH - 1); two different rows on one plane row: not here
 	static int need[PLANE_HMAX];
@@ -2336,7 +2457,10 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 	MIXV(key, c->colornumber); MIXV(key, c->transparencyenable); MIXV(key, c->patterndatasize); MIXV(key, c->patternwh);
 	MIXV(key, c->auxmode); MIXV(key, c->supplementdata); MIXV(key, c->specialprimode); MIXV(key, c->pagewh_bits);
 	MIXV(key, c->planew_bits); MIXV(key, c->patterndatasize_bits); MIXV(key, c->mapwh); MIXV(key, c->planepixelwidth_bits);
-	MIXV(key, c->planepixelheight_bits); MIXV(key, c->charaddr_mask_3fff); MIXV(key, c->coloroffset); MIXV(key, c->alpha);
+	MIXV(key, c->planepixelheight_bits); MIXV(key, c->charaddr_mask_3fff); MIXV(key, c->coloroffset);
+	// only "alpha != 63" reaches the plane texels (nbg_tail flag); the ratio is applied in the compose. rsgun fades NBG2
+	// alpha every 2~3 frames: the whole plane was drawn again each time (prep 16ms, dropped frames)
+	MIXV(key, (c->alpha & 0xFF) != 63);
 	MIXV(key, c->specialcolormode); MIXV(key, c->specialcode); MIXV(key, c->ymask); MIXV(key, L);
 	MIXV(key, c->row[first].priority); key = mixw(key, c->row[first].planetbl, sizeof(c->row[first].planetbl));
 	MIXV(key, s->pal_mode);
@@ -2356,12 +2480,28 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 			}
 		if (any) {
 			s_stats.plane_why[2]++;
+			uint16_t chgsub[128];
+			for (int pg = 0; pg < 128; pg++) {
+				chgsub[pg] = 0;
+				if (chg[pg >> 5] & (1u << (pg & 31)))
+					for (int b = 0; b < 16; b++)
+						if (s_vcsub[pg][b] > s_plane_stamp[L])
+							chgsub[pg] |= (uint16_t)(1u << b);
+			}
 			uint32_t keep[4] = { 0, 0, 0, 0 };
 			for (int j = 0; j < PH; j++) {
 				if (s_plane_tag[L][j] < 0)
 					continue;
 				const uint32_t *rp = s_plane_rpg[L][j];
-				if ((rp[0] & chg[0]) | (rp[1] & chg[1]) | (rp[2] & chg[2]) | (rp[3] & chg[3]))
+				int stale = ((rp[0] & chg[0]) | (rp[1] & chg[1]) | (rp[2] & chg[2]) | (rp[3] & chg[3])) != 0;
+				if (stale && s_plane_sub[L][j].n != 255) {
+					// ADR-137: only if a block it read changed (every page it read has an entry)
+					const PlSub *ps = &s_plane_sub[L][j];
+					stale = 0;
+					for (int k = 0; k < ps->n && !stale; k++)
+						stale = (ps->m[k] & chgsub[ps->pg[k]]) != 0;
+				}
+				if (stale)
 					s_plane_tag[L][j] = -1;
 				else
 					for (int k = 0; k < 4; k++)
@@ -2545,6 +2685,7 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 			uint32_t gpg[4];
 			memcpy(gpg, nbgq_track_pages, sizeof(gpg));
 			memset(nbgq_track_pages, 0, sizeof(nbgq_track_pages));
+			memset(nbgq_track_sub, 0, sizeof(nbgq_track_sub));
 			const int n = nbgq_build(&s_plane_cap, rb[j] - ra[j], e - j, s_snap_vram, s_qtmp + n1, PLQ - n1, NBGQ_NO_WINDOW);
 			if (n < 0) {
 				nbgq_track = 0;
@@ -2563,8 +2704,20 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 			const float d[8] = { x0, y0, x1, y0, x0, y1, x1, y1 };
 			memcpy(cv + nb * 8, d, sizeof(d));
 			nb++;
+			PlSub gs;
+			gs.n = 0;
+			for (int pg = 0; pg < 128 && gs.n != 255; pg++)
+				if (nbgq_track_pages[pg >> 5] & (1u << (pg & 31))) {
+					if (gs.n == PL_SUBN)
+						gs.n = 255;
+					else {
+						gs.pg[gs.n] = (uint8_t)pg;
+						gs.m[gs.n++] = nbgq_track_sub[pg];
+					}
+				}
 			for (int k = j; k < e; k++) {
 				s_plane_tag[L][k] = need[k];
+				s_plane_sub[L][k] = gs;
 				memcpy(s_plane_rpg[L][k], nbgq_track_pages, sizeof(s_plane_rpg[L][k]));
 				s_plane_c0[L][k] = ra[j];
 				s_plane_c1[L][k] = rb[j];
@@ -2698,11 +2851,33 @@ static void clear_target(void)
 
 static void prep_b(FrameSet *s, u8 *front, u64 tp);
 static void prep_wait(void);
+static void draw_end_work(int cur);
+static int s_end_defer, s_end_pend = -1; // ADR-186
 
 
 static void gvdp2_draw_screens(void)
 {
+	{ // diag (ux0:data/restv/v1log "from to"): which frames composite and whether they take a VDP1 list
+		extern int rstv_v1log_n;
+		extern unsigned rstv_v1log_from, rstv_v1log_to;
+		if (rstv_v1log_n > 0 && (unsigned)yabsys.frame_count >= rstv_v1log_from && (unsigned)yabsys.frame_count <= rstv_v1log_to)
+			RSTV_LOG("v1take f%u ready %d tgt %d back %d drawn %d %d TVMD %04x BGON %04x", (unsigned)yabsys.frame_count, rstv_v1ready,
+				rstv_v1ready_target, rstv_vdp1_back_idx, rstv_vdp1_gpu_drawn[0], rstv_vdp1_gpu_drawn[1], Vdp2Regs->TVMD, Vdp2Regs->BGON);
+	}
+	if (s_end_pend >= 0) { // ADR-186: finish the previous frame (its prep is long done)
+		draw_end_work(s_end_pend);
+		s_end_pend = -1;
+	}
 	prep_wait(); // if the previous frame's prep is still pending
+#ifdef RSTV_DEBUG_TOOLS
+	{ // debug fast boot (main.c): no compose
+		extern int rstv_fastboot_now;
+		if (rstv_fastboot_now) {
+			rstv_vdp1_gpu_on = s_prog_v1 != NULL; // VDP1 lists are recorded (and dropped), not drawn on the CPU
+			return;
+		}
+	}
+#endif
 	if (s_gpu_finish_from && s_frame >= s_gpu_finish_from)
 		s_gpu_finish = 1;
 	int vdp1w, vdp1h, vdp1ps;
@@ -2721,8 +2896,9 @@ static void gvdp2_draw_screens(void)
 		// recorded list and VDP1 RAM copy (changed 4KB pages only). Vertices/cache in prep_b (ADR-025)
 		rstv_v1ready = 0;
 		extern u32 rstv_vdp1_serial, rstv_vdp1_page_stamp[128];
+		extern int rstv_v1_fullsnap;
 		for (int p = 0; p < 128; p++)
-			if (!s_v1snap_valid || rstv_vdp1_page_stamp[p] > s_v1snap_serial) {
+			if (!s_v1snap_valid || rstv_v1_fullsnap || rstv_vdp1_page_stamp[p] > s_v1snap_serial) {
 				memcpy(s_v1snap_ram + p * 4096, Vdp1Ram + p * 4096, 4096);
 				s_v1snap_stamp[p] = rstv_vdp1_serial;
 			}
@@ -2736,11 +2912,24 @@ static void gvdp2_draw_screens(void)
 	}
 	s->spr_front = rstv_vdp1_back_idx ^ 1;
 	s->spr_gpu = s_prog_v1 && rstv_vdp1_gpu_drawn[s->spr_front];
+	s->v1_clear = -1;
+	{
+		// ADR-149: lists drawn while the compose did not run (VDP2 display off at a scene change) were dropped, but their
+		// erase is real: VDP1 kept erasing. The buffer shown now still held the old scene's sprites over the new scene
+		// (vfremix after the character select). Clear it before this frame's compose
+		// ADR-154: only for a dropped list's erase (rstv_v1_dropped_erase), not for manual erase requests: vfremix makes
+		// one every frame and this cleared the fighters away
+		extern u8 rstv_v1_dropped_erase[2];
+		if (s_prog_v1 && s->spr_gpu && rstv_v1_dropped_erase[s->spr_front] && !(s->v1_pending && s->v1_target == s->spr_front)) {
+			s->v1_clear = s->spr_front;
+			rstv_v1_dropped_erase[s->spr_front] = 0;
+		}
+	}
 	s->spr8 = vdp1ps == 1;
 	// ADR-100: sprite layer window 0 rectangle -> the parts of the sprite texture it hides are cleared before the compose
 	s->swin_n = 0;
 	s->swin_lw = 0;
-	if (s->gpu && ((Vdp2Regs->WCTLC >> 8) & 0x2a) && !sprite_window_whole(Vdp2Regs) &&
+	if (s->gpu && ((Vdp2Regs->WCTLC >> 8) & 0x0a) && !sprite_window_whole(Vdp2Regs) &&
 		sprite_window_rect(Vdp2Regs, &s->swin_x0, &s->swin_y0, &s->swin_x1, &s->swin_y1, &s->swin_in)) {
 		const int W = s->w < 512 ? s->w : 512, H = s->h < 256 ? s->h : 256;
 		int x0 = s->swin_x0, x1 = s->swin_x1 + 1, y0 = s->swin_y0, y1 = s->swin_y1 + 1; // [x0, x1) x [y0, y1)
@@ -2828,7 +3017,7 @@ static void gvdp2_draw_screens(void)
 	if (!s->gpu) {
 		if (s->v1_pending) {
 			v1gpu_fmt = s_v1snap_fmt;
-			const int nv = v1gpu_build(s_v1snap_list, s_v1snap_n, s_v1buf, V1GPU_MAX_VERTS, s_v1atlas->data, s_v1snap_ram, s_v1snap_stamp,
+			const int nv = v1gpu_build(s_v1snap_list, s_v1snap_n, s_v1buf, V1GPU_MAX_VERTS, s_v1atlas->data, s_v1snap_ram, rstv_v1_fullsnap ? NULL : s_v1snap_stamp,
 				s_v1snap_serial, &s->v1f);
 			void *v = nv > 0 ? gx_temp(nv * V1GPU_VERTEX_FLOATS * (int)sizeof(float)) : NULL;
 			if (v) {
@@ -2954,7 +3143,7 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 	if (s->v1_pending) {
 		const u64 tb = RSTV_PROF_T();
 		v1gpu_fmt = s_v1snap_fmt;
-		const int nv = v1gpu_build(s_v1snap_list, s_v1snap_n, s_v1buf, V1GPU_MAX_VERTS, s_v1atlas->data, s_v1snap_ram, s_v1snap_stamp,
+		const int nv = v1gpu_build(s_v1snap_list, s_v1snap_n, s_v1buf, V1GPU_MAX_VERTS, s_v1atlas->data, s_v1snap_ram, rstv_v1_fullsnap ? NULL : s_v1snap_stamp,
 			s_v1snap_serial, &s->v1f);
 		void *v = nv > 0 ? gx_temp(nv * V1GPU_VERTEX_FLOATS * (int)sizeof(float)) : NULL;
 		if (v) {
@@ -3030,6 +3219,7 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 	if (s_prog_q) {
 		// character atlas: re-decode only VRAM pages written since the last update
 		uint8_t dirty[128];
+		uint16_t dsub[128]; // ADR-137: changed 256-byte blocks
 		int nd = 0;
 		// ADR-057: a written page whose bytes are the same as at the last decode is not decoded again (and does not move
 		// the layer cache generation): tables in VRAM are rewritten every frame with the same values
@@ -3038,9 +3228,19 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 			vshadow = (uint8_t *)calloc(1, 0x80000);
 		for (int p = 0; p < 128; p++) {
 			dirty[p] = !s_atlas_copied || rstv_vdp2_page_stamp[p] > s_atlas_copied;
+			dsub[p] = 0;
 			if (dirty[p] && vshadow && s_atlas_copied) {
-				if (memcmp(vshadow + p * 4096, s_snap_vram + p * 4096, 4096) == 0)
+				for (int b = 0; b < 16; b++)
+					if (memcmp(vshadow + p * 4096 + b * 256, s_snap_vram + p * 4096 + b * 256, 256)) {
+						s_vcsub[p][b] = s_snap_serial;
+						dsub[p] |= (uint16_t)(1u << b);
+					}
+				if (!dsub[p])
 					dirty[p] = 0;
+			} else if (dirty[p]) {
+				for (int b = 0; b < 16; b++)
+					s_vcsub[p][b] = s_snap_serial;
+				dsub[p] = 0xFFFF;
 			}
 			if (dirty[p] && vshadow) {
 				memcpy(vshadow + p * 4096, s_snap_vram + p * 4096, 4096);
@@ -3050,9 +3250,16 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 		}
 		if (nd) {
 			const u64 ta = RSTV_PROF_T();
-			nbgq_atlas_update(s_atlas_px[0], s_atlas_px[1], NBGQ_ATLAS, s_snap_vram, dirty);
-			if (s_argb)
-				rbgq_atlas_rgb_update(s_argb->data, 1024, s_snap_vram, dirty);
+			nbgq_atlas_update(s_atlas_px[0], s_atlas_px[1], NBGQ_ATLAS, s_snap_vram, dsub);
+			if (s_argb) {
+				// ADR-185: the RGB atlas (4 bytes a pixel into GPU memory, 25-40 ms for a whole VRAM change) only for frames
+				// that sample it: blocks pile up here, gpu_submit converts them when the frame uses RGB characters
+				for (int p = 0; p < 128; p++)
+					s_argb_dirty[p] |= dsub[p];
+				s_argb_pend = 1;
+				if (!s_submit_thr)
+					argb_flush(NULL); // the submit runs later on the main thread: convert from this snapshot now
+			}
 			s_stats.t_atlas += RSTV_PROF_T() - ta;
 			s_stats.atlas_pages += nd;
 			s_cgen++;
@@ -3213,6 +3420,7 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 				// ADR-052: zoomed lines (zx != 1) are left to the pixel shader, the rest become cell quads
 				const int qflags = c->zx != 0.0f ? NBGQ_SKIP_ZOOM | NBGQ_ZOOM_RUNS : 0;
 				int n = nbgq_build(c, s->w, s->h < 256 ? s->h : 256, s_snap_vram, s_qtmp, MAXQ, qflags);
+				s_last_qn[L] = n < 0 ? 1 << 30 : n; // -1: more than MAXQ
 				s_stats.qtry[L] = n;
 				s->qclr_n[L] = 0;
 				if (n < 0 && c->has_win) {
@@ -3396,6 +3604,12 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 	{
 			s->mosaic[L] = rstv_layer_capture[L].captured && rstv_layer_capture[L].mosx > 1 ? (float)rstv_layer_capture[L].mosx : 1.0f;
 			s->mosaicOn[L] = s->mosaic[L] > 1.0f ? 1.0f : 0.0f;
+			// ADR-161: the sprite window bit is the sprite MSB for types 2-7 without RGB sprites (vidsoft's mask rule)
+			const int sw = rstv_layer_capture[L].captured && on[L] > 0.5f ? rstv_layer_capture[L].swin : 0;
+			const int swbit = (r->SPCTL & 0x10) && (r->SPCTL & 0xF) >= 2 && (r->SPCTL & 0xF) <= 7 && !(r->SPCTL & 0x20);
+			s->layerSw[L] = (float)(swbit && s->sprB[3] > 0.5f ? sw : 0);
+			if (sw == 2 && !swbit)
+				s->layerOn[L] = 0; // the mask is clear everywhere: the layer shows nowhere
 		}
 	s->layerAlpha[0] = layer_alpha(r, 0x8, r->CCRNB >> 8);
 	s->layerAlpha[1] = layer_alpha(r, 0x4, r->CCRNB);
@@ -3513,11 +3727,7 @@ static GxProg *nbg_variant(const float (*u)[4], GxParam **loc)
 	if (s_nnvar >= 24 || s_cmp_sema < 0)
 		return NULL;
 	NbgVariant *v = &s_nvar_tab[s_nnvar];
-	const size_t n = strlen(s_fs_nbg) + 512;
-	v->src = (char *)malloc(n);
-	if (!v->src)
-		return NULL;
-	nbg_variant_src(v->src, n, key);
+	v->src = NULL; // ADR-193: the compile worker builds the source (no allocation inside the GPU submit)
 	v->key = key;
 	v->fbin = NULL;
 	v->prog = NULL;
@@ -3528,6 +3738,25 @@ static GxProg *nbg_variant(const float (*u)[4], GxParam **loc)
 	sceKernelSignalSema(s_cmp_sema, 1);
 	RSTV_LOG("gvdp2: nbg variant %03x queued", key);
 	return NULL;
+}
+
+// ADR-193: variant sources, built on the compile worker
+static char *nbg_variant_src_alloc(int key)
+{
+	const size_t n = strlen(s_fs_nbg) + 512;
+	char *src = (char *)malloc(n);
+	if (src)
+		nbg_variant_src(src, n, key);
+	return src;
+}
+static char *rbg_variant_src(int key)
+{
+	const size_t n = strlen(s_fs_rbg2);
+	char *src = (char *)malloc(n + 256);
+	if (src)
+		snprintf(src, n + 256, "#define RBG_SO %d\n#define RBG_RGB %d\n#define RBG_TR %d\n#define RBG_SCM %d\n#define RBG_CCR %d\n#define RBG_BMP %d\n#define RBG_4BPP %d\n%s%s%s",
+			key & 1, (key >> 1) & 1, (key >> 2) & 1, (key >> 3) & 3, (key >> 5) & 1, (key >> 6) & 1, (key >> 7) & 1, ((key >> 8) & 1) ? "#define RBG_FLAT 1\n" : "", ((key >> 9) & 1) ? "#define RBG_SO3 1\n" : "", s_fs_rbg2);
+	return src;
 }
 
 // find/register RBG0 specialized variant (worker thread, or main on sync frames, inside gx_lock)
@@ -3592,12 +3821,7 @@ static GxProg *rbg_variant_key(int key, GxParam **loc)
 	if (s_nrvar >= 32 || s_cmp_sema < 0)
 		return NULL;
 	RbgVariant *v = &s_rvar[s_nrvar];
-	const size_t n = strlen(s_fs_rbg2);
-	v->src = (char *)malloc(n + 256);
-	if (!v->src)
-		return NULL;
-	snprintf(v->src, n + 256, "#define RBG_SO %d\n#define RBG_RGB %d\n#define RBG_TR %d\n#define RBG_SCM %d\n#define RBG_CCR %d\n#define RBG_BMP %d\n#define RBG_4BPP %d\n%s%s%s",
-		key & 1, (key >> 1) & 1, (key >> 2) & 1, (key >> 3) & 3, (key >> 5) & 1, (key >> 6) & 1, (key >> 7) & 1, ((key >> 8) & 1) ? "#define RBG_FLAT 1\n" : "", ((key >> 9) & 1) ? "#define RBG_SO3 1\n" : "", s_fs_rbg2);
+	v->src = NULL; // ADR-193: the compile worker builds the source (no allocation inside the GPU submit)
 	v->key = key;
 	v->fbin = NULL;
 	v->prog = NULL;
@@ -3678,6 +3902,14 @@ static void v1_snap_copy(GxTex *src)
 // GPU submit: VDP1 pass + GPU layers + composite (ADR-029). Done by the worker thread right after prep (inside gx_lock), or by main at VBlankIN on sync frames
 static void gpu_submit(FrameSet *s, int oi, int on_worker)
 {
+	if (s_argb_pend)
+		argb_flush(s);
+	if (s->v1_clear >= 0) {
+		gx_begin(s_v1rt[s->v1_clear]);
+		clear_target();
+		gx_end();
+		s->v1_clear = -1;
+	}
 	if (s->v1_nv > 0) {
 		const u64 tv1 = RSTV_PROF_T();
 		if (s_gpu_finish)
@@ -4002,7 +4234,10 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 	GxProg *cprog = fast ? s_prog_fast : s_prog;
 	if (fast && s_cmp_spec) {
 		GxParam *vloc;
+		const u64 tcv = RSTV_PROF_T();
 		GxProg *vp = cmp_variant(s, &vloc);
+		if (RSTV_PROF_T() - tcv > 10000) // diag: a slow variant lookup (registration, new source) inside the submit
+			RSTV_LOG("gvdp2: slow variant lookup f%u %u us", s_frame, (unsigned)(RSTV_PROF_T() - tcv));
 		s_stats.cmp_vi = 0;
 		if (vp) {
 			cprog = vp;
@@ -4071,6 +4306,7 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 	gx_set4(loc[U_ccw1], s->ccw1);
 	gx_set4(loc[U_mosaic], s->mosaic);
 	gx_set4(loc[U_mosaicOn], s->mosaicOn);
+	gx_set4(loc[U_layerSw], s->layerSw);
 	draw_quad(s->w, s->h);
 	gx_end();
 
@@ -4083,6 +4319,12 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 		snprintf(path, sizeof(path), "ux0:data/restv/shot_%u_cpu.ppm", s_frame - 1);
 		save_ppm(path, (const uint8_t *)dispbuffer, s->w, s->h, s->w);
 		RSTV_LOG("gvdp2: shot %u", s_frame - 1);
+		for (int b = 0; b < 2; b++) // the two VDP1 GPU framebuffers (raw RGBA8: 8-bit dots in R)
+			if (s_v1rt[b]) {
+				snprintf(path, sizeof(path), "ux0:data/restv/shot_%u_v1rt%d.ppm", s_frame - 1, b);
+				save_ppm(path, s_v1rt[b]->data, 512, 256, 512);
+			}
+		RSTV_LOG("gvdp2: shot %u spr_front %d spr_gpu %d", s_frame - 1, s->spr_front, s->spr_gpu);
 	}
 	if (s_gpu_finish) {
 		u64 tg = RSTV_PROF_T();
@@ -4095,16 +4337,55 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 
 static void gvdp2_draw_end(void)
 {
+#ifdef RSTV_DEBUG_TOOLS
+	{ // debug fast boot (main.c): no composite, only the VDP1 framebuffer swap
+		extern int rstv_fastboot_now;
+		if (rstv_fastboot_now) {
+			s_cur = -1;
+			VIDSoftVdp1SwapFrameBuffer();
+			return;
+		}
+	}
+#endif
+	if (s_end_defer) {
+		// ADR-186: the prep worker starts a frame at V-blank-in and can still be busy at its end (V-blank-out); the
+		// main thread waited for it (vfremix 1.1 ms a frame). After 60 such frames the game stays in deferred mode: each
+		// frame is finished at the next V-blank-in (draw_screens) and shown one frame later; every frame is still shown
+		// once (going back would drop one). CPU-composited frames as before.
+		if (s_end_pend >= 0)
+			draw_end_work(s_end_pend); // no draw_screens since the last frame
+		s_end_pend = -1;
+		if (s_cur >= 0 && s_set[s_cur].gpu) {
+			if (s_end_defer == 1 && s_prep_pending) {
+				static unsigned s_late;
+				if (sceKernelPollSema(s_prep_done, 1) == 0)
+					s_prep_pending = 0; // done in time: finish now
+				else if (++s_late >= 60) { // not for a few load frames
+					s_end_defer = 2;
+					RSTV_LOG("gvdp2: frame finish deferred from f%u (prep still busy at V-blank-out)", s_frame);
+				}
+			}
+			if (s_end_defer == 2) {
+				s_end_pend = s_cur;
+				return;
+			}
+		}
+	}
+	draw_end_work(s_cur);
+}
+
+static void draw_end_work(int cur)
+{
 	const u64 te0 = RSTV_PROF_T();
 	static unsigned gw_prev;
 	const unsigned gw0 = gx_gpu_wait_us();
 	prep_wait();
 	const u64 te1 = RSTV_PROF_T();
-	FrameSet *s = (s_cur >= 0) ? &s_set[s_cur] : NULL;
+	FrameSet *s = (cur >= 0) ? &s_set[cur] : NULL;
 	s_frame++;
 	const int on_main = s && !s->submitted;
 	if (s && !s->submitted)
-		gpu_submit(s, s_cur, 0);
+		gpu_submit(s, cur, 0);
 	else if (s && s_shot_now && s->gpu) {
 		// capture of a frame drawn by the worker thread (shotasync)
 		char path[96];
@@ -4112,7 +4393,7 @@ static void gvdp2_draw_end(void)
 		gx_finish();
 		gx_unlock();
 		snprintf(path, sizeof(path), "ux0:data/restv/shot_%u_gpu.ppm", s_frame - 1);
-		save_ppm(path, s_out_tex[s_cur]->data, s->w, s->h, LAYER_W);
+		save_ppm(path, s_out_tex[cur]->data, s->w, s->h, LAYER_W);
 	}
 	const u64 te2 = RSTV_PROF_T();
 	if (s)
@@ -4124,7 +4405,7 @@ static void gvdp2_draw_end(void)
 	}
 	VIDSoftVdp1SwapFrameBuffer();
 	const u64 te3 = RSTV_PROF_T();
-	rstv_video_frame_gpu(s_out_tex[s_cur], s->w, s->h);
+	rstv_video_frame_gpu(s_out_tex[cur], s->w, s->h);
 	const u64 te4 = RSTV_PROF_T();
 	if (te4 - te0 > 10000) // diag: per-stage times of draw_end over 10ms
 		RSTV_LOG("gvdp2: slow draw_end f%u gpu wait %u (since last %u) prep_wait %u submit %u (main %d) swapfb %u frame_gpu %u us", s_frame - 1,
@@ -4240,6 +4521,8 @@ static void preload_variants(void)
 				v->src = NULL;
 				s_nvar++;
 				nc++;
+				if (gvdp2_progress) // loading screen: the preload is most of the GPU set-up time
+					gvdp2_progress(300 + (nc < 160 ? nc * 650 / 160 : 650));
 			}
 			free(buf);
 		} else if (pass == 0 && s_nbg_spec && !strncmp(e.d_name, pre_n, 12) && s_nnvar < 24) {
@@ -4305,14 +4588,21 @@ static void preload_variants(void)
 
 int gvdp2_init(void)
 {
+	if (gvdp2_progress)
+		gvdp2_progress(0);
 	shader_lab();
 	const GxAttr pix_attr[2] = { { "position", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0 }, { "pix", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 8 } };
 	s_prog = gx_prog(s_vs, s_fs, pix_attr, 2, 16, GX_BLEND_NONE);
 	if (!s_prog)
 		return -1;
-	for (int i = 0; i < U_offB; i++)
+	if (gvdp2_progress) // ADR-193: steps through the base shaders (a first run compiles them: about a minute)
+		gvdp2_progress(20);
+	for (int i = 0; i < U_COUNT; i++) // the ones it does not have stay unset (offsets, slut)
 		s_loc[i] = gx_param(s_prog, s_uname[i]);
-	s_prog_fast = gx_prog(s_vs_fast, s_fs_fast, pix_attr, 2, 16, GX_BLEND_NONE);
+	s_fs_fast_sw = make_fs_fast_sw();
+	s_prog_fast = gx_prog(s_vs_fast, s_fs_fast_sw ? s_fs_fast_sw : s_fs_fast, pix_attr, 2, 16, GX_BLEND_NONE);
+	if (gvdp2_progress)
+		gvdp2_progress(110);
 	if (s_prog_fast)
 		for (int i = 0; i < U_COUNT; i++)
 			s_loc_fast[i] = gx_param(s_prog_fast, s_uname[i]);
@@ -4340,7 +4630,7 @@ int gvdp2_init(void)
 	s_pix_attr[1] = pix_attr[1];
 	s_cmp_spec = s_prog_fast && !file_exists_q("ux0:data/restv/nocmpspec");
 	s_lab_on = file_exists_q("ux0:data/restv/lab");
-	s_cmpsync_on = file_exists_q("ux0:data/restv/cmpsync");
+	s_end_defer = !file_exists_q("ux0:data/restv/noenddefer"); // ADR-186 (the flag file turns it off for A/B tests)
 	s_cmp_exp = 0;
 	{
 		FILE *ef = fopen("ux0:data/restv/cmpexp", "r");
@@ -4361,7 +4651,13 @@ int gvdp2_init(void)
 			pix_attr, 2, 16, GX_BLEND_NONE);
 	if (s_cmp_spec) {
 		s_cmp_sema = sceKernelCreateSema("rstv_shc", 0, 0, 1 << 20, NULL);
-		SceUID t = s_cmp_sema >= 0 ? sceKernelCreateThread("rstv_shc", cmp_worker, 191, 0x400000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL) : -1;
+		// ADR-185: on CPU3, not CPU1: there the spinning sound thread starved the compiler (11 ms -> 300-600 ms) while it
+		// held locks the prep thread's GPU submit needed (submit stalls of 35-330 ms when a new variant was queued)
+		int cpu = 0x80000;
+#ifdef RSTV_DEBUG_TOOLS
+		{ FILE *ff = fopen("ux0:data/restv/shccpu1", "rb"); if (ff) { fclose(ff); cpu = SCE_KERNEL_CPU_MASK_USER_1; } } // A/B test
+#endif
+		SceUID t = s_cmp_sema >= 0 ? sceKernelCreateThread("rstv_shc", cmp_worker, 191, 0x400000, 0, cpu, NULL) : -1;
 		if (t >= 0)
 			sceKernelStartThread(t, 0, NULL);
 		else
@@ -4376,6 +4672,8 @@ int gvdp2_init(void)
 			snprintf(src, ln, "%s%s", s_fs_nbg_gen, s_fs_nbg);
 			s_prog_nbg = gx_prog(s_vs, src, pix_attr, 2, 16, GX_BLEND_NONE);
 			free(src);
+			if (gvdp2_progress)
+				gvdp2_progress(200);
 		}
 		s_nbg_spec = s_prog_nbg && !file_exists_q("ux0:data/restv/nonbgspec");
 		s_bmp_tex_on = !file_exists_q("ux0:data/restv/nobmptex"); // ADR-123
@@ -4423,6 +4721,8 @@ int gvdp2_init(void)
 	if (s_prog_q && !file_exists_q("ux0:data/restv/norbg")) {
 		const GxAttr r_attr[2] = { { "position", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0 }, { "map", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 8 } };
 		s_prog_rbg = gx_prog(s_vs_rbg, s_fs_rbg, r_attr, 2, 16, GX_BLEND_NONE);
+		if (gvdp2_progress)
+			gvdp2_progress(230);
 		s_rbg_attr[0] = r_attr[0];
 		s_rbg_attr[1] = r_attr[1];
 		s_rbg_spec = !file_exists_q("ux0:data/restv/norbgspec");
@@ -4448,6 +4748,7 @@ int gvdp2_init(void)
 	s_plane_fullw = !file_exists_q("ux0:data/restv/noplanefull");
 	s_plane_all = file_exists_q("ux0:data/restv/planeall");
 	s_plane_mag = !file_exists_q("ux0:data/restv/noplanemag");
+	s_plane_many = !file_exists_q("ux0:data/restv/noplanemany");
 	// layer prep worker thread (ADR-025, CPU2). On main if ux0:data/restv/noprepthr exists
 	s_snap_vram = (u8 *)malloc(0x80000);
 	s_v1snap_ram = (u8 *)malloc(0x80000);
@@ -4495,6 +4796,8 @@ int gvdp2_init(void)
 
 	v1gpu_grid_adapt = !file_exists_q("ux0:data/restv/v1grid4"); // ADR-090
 	s_reuse_on = !file_exists_q("ux0:data/restv/noreuse");
+	if (gvdp2_progress)
+		gvdp2_progress(280);
 	if (s_prog_q && !file_exists_q("ux0:data/restv/noplane")) {
 		const GxAttr pc_attr[2] = { { "position", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0 }, { "uv", SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 8 } };
 		s_prog_pcopy = gx_prog(s_vs_pc, s_fs_pc, pc_attr, 2, 16, GX_BLEND_NONE);
@@ -4620,7 +4923,11 @@ int gvdp2_init(void)
 			RSTV_LOG("gxtest: target %d first px %08x mid px %08x", k, ((uint32_t *)targets[k]->data)[0],
 				((uint32_t *)targets[k]->data)[100 * 512 + 100]);
 	}
+	if (gvdp2_progress)
+		gvdp2_progress(300);
 	preload_variants();
+	if (gvdp2_progress)
+		gvdp2_progress(1000);
 	s_ok = 1;
 	RSTV_LOG("gvdp2: ready");
 	return 0;

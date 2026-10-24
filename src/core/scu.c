@@ -42,6 +42,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 #include <stdlib.h>
+#include "rstv_slave.h"
 #include "scu.h"
 #include "debug.h"
 #include "memory.h"
@@ -856,6 +857,7 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
     {
       if (sel == 0x04){
         sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
+        { extern void rstv_scujit_dirty(void); rstv_scujit_dirty(); } /* ADR-169 */
         //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
         index++;
       }
@@ -875,6 +877,7 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
 
       if (sel == 0x04){
         sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
+        { extern void rstv_scujit_dirty(void); rstv_scujit_dirty(); } /* ADR-169 */
         //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
         index++;
       }else{
@@ -900,6 +903,7 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
         {
             u32 Adr = (sc->RA0 << 2);
             sc->ProgramRam[i] = MappedMemoryReadLong(Adr);
+        { extern void rstv_scujit_dirty(void); rstv_scujit_dirty(); } /* ADR-169 */
             sc->RA0 += incl;
         }
     }
@@ -1097,6 +1101,12 @@ void ScuSetAddValue(scudmainfo_struct * dmainfo) {
   LOG("DoDMA src=%08X,dst=%08X,size=%d, ra:%d/wa:%d flame=%d:%d\n",
     dmainfo->ReadAddress, dmainfo->WriteAddress, dmainfo->TransferNumber,
     dmainfo->ReadAdd, dmainfo->WriteAdd, yabsys.frame_count, yabsys.LineCount);
+#ifndef __vita__
+  { static int on = -1; if (on < 0) on = getenv("RSTV_SCUDMALOG") != NULL; // harness: every SCU DMA start
+    if (on) printf("scudma f%u l%d src %08x dst %08x n %u ra %d wa %d mode %d%c", (unsigned)yabsys.frame_count, yabsys.LineCount,
+      (unsigned)dmainfo->ReadAddress, (unsigned)dmainfo->WriteAddress, (unsigned)dmainfo->TransferNumber, (int)dmainfo->ReadAdd,
+      (int)dmainfo->WriteAdd, (int)dmainfo->mode, 10); }
+#endif
 
 }
 
@@ -1105,6 +1115,11 @@ static void SucDmaExecImpl(scudmainfo_struct * dma, int * time );
 unsigned rstv_dma_units;
 unsigned rstv_dsp_slices; /* ReST-V: slices with the SCU DSP running (statistics) */
 unsigned rstv_dsp_insns; /* ReST-V: DSP instructions executed (statistics) */
+#ifndef __vita__
+#include <time.h>
+unsigned rstv_dsp_pchist[256]; /* harness: instructions executed per program address */
+unsigned long long rstv_dsp_ns; /* harness: host time in the DSP loop */
+#endif
 /* ReST-V: finish SCU DMA when it starts instead of spreading it over slices (timing hack, see DECISIONS) */
 int rstv_dma_instant = 0;
 // ADR-106: DMA into sound RAM finishes at once (MAME). Games stop the 68K, DMA its driver in and restart it at once:
@@ -1243,12 +1258,17 @@ static void SucDmaExecImpl0(scudmainfo_struct * dma, int * time ) {
       // Copy in 16-bit units, avoiding misaligned accesses.
       u32 counter = 0;
       u32 start = dma->WriteAddress;
-      /* ReST-V fast path: high work RAM -> VDP1 RAM, contiguous (same words as the MappedMemory loop below) */
+      /* ReST-V fast path: high work RAM -> VDP1 RAM or VDP2 VRAM, contiguous (same words as the MappedMemory loop below;
+         grdforce sends about 15KB a frame to VDP2 VRAM) */
+      const int v2dst = (dma->WriteAddress & 0x0FF80000) == 0x05E00000;
       if (dma->WriteAdd == 2 && !(dma->ReadAddress & 1) && !(dma->WriteAddress & 1) &&
-          (dma->ReadAddress & 0x0E000000) == 0x06000000 && (dma->WriteAddress & 0x0FF80000) == 0x05C00000) {
+          (dma->ReadAddress & 0x0E000000) == 0x06000000 && ((dma->WriteAddress & 0x0FF80000) == 0x05C00000 || v2dst)) {
         extern void rstv_vdp1_ram_touch(u32 addr, u32 bytes);
-        /* words before the destination leaves VDP1 RAM */
-        int room = (int)((0x05C80000 - (dma->WriteAddress & 0x0FFFFFFF)) >> 1);
+        extern void rstv_vdp2_ram_touch(u32 addr, u32 bytes);
+        extern u8 *Vdp2Ram;
+        u8 *const dram = v2dst ? Vdp2Ram : Vdp1Ram;
+        /* words before the destination leaves VDP1 RAM / VDP2 VRAM (512KB each) */
+        int room = (int)((0x80000 - (dma->WriteAddress & 0x7FFFF)) >> 1);
         /* words = min(time, room, ceil(TransferNumber / 2)) then one tight loop (same words as before) */
         int k = (dma->TransferNumber + 1) >> 1;
         if (k > room) k = room;
@@ -1260,20 +1280,54 @@ static void SucDmaExecImpl0(scudmainfo_struct * dma, int * time ) {
           /* both 4-byte aligned and no wrap: two words per step (T2 native words -> T1 big-endian bytes = rev16) */
           if (!((w0 | r0) & 3) && ((r0 & 0xFFFFF) + 2u * k) <= 0x100000 && ((w0 & 0x7FFFF) + 2u * k) <= 0x80000) {
             const u32 *src = (const u32 *)(HighWram + (r0 & 0xFFFFF));
-            u32 *dst = (u32 *)(Vdp1Ram + (w0 & 0x7FFFF));
+            u32 *dst = (u32 *)(dram + (w0 & 0x7FFFF));
             for (; q + 1 < k; q += 2) {
               const u32 x = *src++;
               *dst++ = ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu);
             }
           }
           for (; q < k; q++)
-            T1WriteWord(Vdp1Ram, (w0 + 2 * q) & 0x7FFFF, T2ReadWord(HighWram, (r0 + 2 * q) & 0xFFFFF));
+            T1WriteWord(dram, (w0 + 2 * q) & 0x7FFFF, T2ReadWord(HighWram, (r0 + 2 * q) & 0xFFFFF));
+        }
+        { // diag (RSTV_V1RAMW): the fast path writes VDP1 RAM directly
+          extern u32 rstv_v1ramw_lo, rstv_v1ramw_hi;
+          extern void rstv_v1ramw_log(u32 addr, u32 val, int size);
+          const u32 w = dma->WriteAddress & 0x7FFFF;
+          if (!v2dst && w < rstv_v1ramw_hi && w + 2u * k > rstv_v1ramw_lo)
+            rstv_v1ramw_log(w, dma->ReadAddress, 0);
         }
         *time -= k;
         dma->TransferNumber -= 2 * k;
-        rstv_vdp1_ram_touch(dma->WriteAddress, (u32)k * 2);
+        if (v2dst)
+          rstv_vdp2_ram_touch(dma->WriteAddress, (u32)k * 2);
+        else
+          rstv_vdp1_ram_touch(dma->WriteAddress, (u32)k * 2);
         dma->WriteAddress += 2 * k;
         dma->ReadAddress += 2 * k;
+        if (dma->TransferNumber <= 0 || *time <= 0) {
+          SH2WriteNotify(start, dma->WriteAddress - start);
+          return;
+        }
+      }
+      /* high work RAM -> VDP1 framebuffer (pblbeach draws its course there, 35k words every 5 frames): the framebuffer
+         write handler straight, without the two mapped lookups a word */
+      if (dma->WriteAdd == 2 && !(dma->ReadAddress & 1) && (dma->ReadAddress & 0x0E000000) == 0x06000000 &&
+          (dma->WriteAddress & 0x0FFC0000) == 0x05C80000) {
+        extern void Vdp1FrameBufferWriteWordsHw(u32 addr, u32 hwoff, int n);
+        // ADR-142: the whole run at once (one VDP1 thread wait instead of one a word)
+        int k = *time;
+        if (k > (dma->TransferNumber + 1) / 2) k = (dma->TransferNumber + 1) / 2;
+        const int fb_left = (int)((0x40000 - (dma->WriteAddress & 0x3FFFF)) >> 1);
+        const int hw_left = (int)((0x100000 - (dma->ReadAddress & 0xFFFFF)) >> 1);
+        if (k > fb_left) k = fb_left;
+        if (k > hw_left) k = hw_left;
+        if (k > 0) {
+          Vdp1FrameBufferWriteWordsHw(dma->WriteAddress, dma->ReadAddress & 0xFFFFF, k);
+          *time -= k;
+          dma->WriteAddress += 2 * k;
+          dma->ReadAddress += 2 * k;
+          dma->TransferNumber -= 2 * k;
+        }
         if (dma->TransferNumber <= 0 || *time <= 0) {
           SH2WriteNotify(start, dma->WriteAddress - start);
           return;
@@ -1295,6 +1349,29 @@ static void SucDmaExecImpl0(scudmainfo_struct * dma, int * time ) {
     }
     else if (((dma->ReadAddress & 0x1FFFFFFF) >= 0x5A00000 && (dma->ReadAddress & 0x1FFFFFFF) < 0x5FF0000)) {
       u32 start = dma->WriteAddress;
+      /* ReST-V (ADR-165): VDP1 framebuffer -> high work RAM, contiguous (pblbeach reads its course rows back, up to
+         180KB a frame): the whole run at once, the same words as the loop below */
+      if (dma->WriteAdd == 4 && !(dma->ReadAddress & 1) && !(dma->WriteAddress & 1) &&
+          (dma->ReadAddress & 0x0FFC0000) == 0x05C80000 && (dma->WriteAddress & 0x0E000000) == 0x06000000) {
+        extern void Vdp1FrameBufferReadWordsHw(u32 addr, u32 hwoff, int n);
+        int k = *time;
+        if (k > (dma->TransferNumber + 1) / 2) k = (dma->TransferNumber + 1) / 2;
+        const int fb_left = (int)((0x40000 - (dma->ReadAddress & 0x3FFFF)) >> 1);
+        const int hw_left = (int)((0x100000 - (dma->WriteAddress & 0xFFFFF)) >> 1);
+        if (k > fb_left) k = fb_left;
+        if (k > hw_left) k = hw_left;
+        if (k > 0) {
+          Vdp1FrameBufferReadWordsHw(dma->ReadAddress, dma->WriteAddress & 0xFFFFF, k);
+          *time -= k;
+          dma->WriteAddress += 2 * k;
+          dma->ReadAddress += 2 * k;
+          dma->TransferNumber -= 2 * k;
+        }
+        if (dma->TransferNumber <= 0 || *time <= 0) {
+          SH2WriteNotify(start, dma->WriteAddress - start);
+          return;
+        }
+      }
       while ( *time > 0) {
         *time -= 1;
         u16 tmp = MappedMemoryReadWord((dma->ReadAddress & 0x0FFFFFFF), &cycle);
@@ -1403,6 +1480,678 @@ void ScuDmaProc(Scu * scu, int time) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+/* ReST-V (ADR-167): the DSP loop of ScuExec with AC, P, ALU and the flag port in locals and the counter increments
+   in a local array (the same expressions, the same order of DMA steps): every flag update was a read-modify-write of
+   the port in memory and every instruction cleared and tested the static incFlg. vfremix runs ~15k DSP instructions
+   a frame, ~3 ms on the Vita. Locals go back to ScuDsp before every DMA step and the end interrupt, and at the end.
+   Used when no DSP breakpoints are set */
+#define RSTV_DSP_SYNC() do { d->AC = AC; d->P = P; d->ALU = ALU; d->ProgControlPort = pcp; } while (0)
+#define RSTV_DSP_LOAD() do { AC = d->AC; P = d->P; ALU = d->ALU; pcp = d->ProgControlPort; } while (0)
+#define RSTV_DSP_STEP() do { RSTV_DSP_SYNC(); step_dsp_dma(d); RSTV_DSP_LOAD(); } while (0)
+#define RSTV_DSP_FIN() do { if (d->dsp_dma_wait > 0) { d->dsp_dma_wait = 0; RSTV_DSP_STEP(); } } while (0)
+#define RSTV_DSP_INC() do {       if (inc & 1) d->CT[0] = (d->CT[0] + 1) & 0x3f;       if (inc & 2) d->CT[1] = (d->CT[1] + 1) & 0x3f;       if (inc & 4) d->CT[2] = (d->CT[2] + 1) & 0x3f;       if (inc & 8) d->CT[3] = (d->CT[3] + 1) & 0x3f;       inc = 0; } while (0)
+/* readgensrc */
+#define RSTV_DSP_SRC(num_) ({ const unsigned n_ = (num_); u32 r_; \
+      if (n_ <= 7) { inc |= ((n_ >> 2) & 1) << (n_ & 3); RSTV_DSP_FIN(); r_ = d->MD[n_ & 3][d->CT[n_ & 3] & 0x3F]; } \
+      else if (n_ == 9) r_ = (u32)ALU.part.L; \
+      else if (n_ == 0xA) r_ = (u32)(ALU.all >> 16); \
+      else r_ = 0xFFFFFFFF; \
+      r_; })
+/* writed1busdest */
+#define RSTV_DSP_D1(num_, val_) do { const unsigned n_ = (num_); const u32 v_ = (val_); RSTV_DSP_FIN(); \
+      switch (n_) { \
+      case 0x0: case 0x1: case 0x2: case 0x3: d->MD[n_][d->CT[n_] & 0x3F] = v_; inc |= 1u << n_; break; \
+      case 0x4: d->RX = v_; break; \
+      case 0x5: P.all = (signed)v_; break; \
+      case 0x6: d->RA0 = v_; break; \
+      case 0x7: d->WA0 = v_; break; \
+      case 0xA: d->LOP = (u16)v_; break; \
+      case 0xB: d->TOP = (u8)v_; break; \
+      case 0xC: case 0xD: case 0xE: case 0xF: d->CT[n_ & 3] = (u8)v_; inc &= ~(1u << (n_ & 3)); break; \
+      default: break; } } while (0)
+/* writeloadimdest */
+#define RSTV_DSP_IMM(num_, val_) do { const unsigned n_ = (num_); u32 v_ = (val_); RSTV_DSP_FIN(); \
+      switch (n_) { \
+      case 0x0: case 0x1: case 0x2: case 0x3: d->MD[n_][d->CT[n_] & 0x3F] = v_; inc |= 1u << n_; break; \
+      case 0x4: d->RX = v_; break; \
+      case 0x5: P.all = (s32)v_; break; \
+      case 0x6: d->RA0 = v_ & 0x1FFFFFF; break; \
+      case 0x7: d->WA0 = v_ & 0x1FFFFFF; break; \
+      case 0xA: d->LOP = (u16)(v_ & 0x0FFF); break; \
+      case 0xC: d->TOP = d->PC + 1; d->jmpaddr = v_; d->delayed = 0; break; \
+      default: LOG("writeloadimdest BAD NUM %d,%d", n_, v_); break; } } while (0)
+
+s32 rstv_dsp_interp_n(s32 dsp_counter, int maxn)
+{
+   scudspregs_struct *const d = ScuDsp;
+   __typeof__(ScuDsp->AC) AC = d->AC;
+   __typeof__(ScuDsp->P) P = d->P;
+   __typeof__(ScuDsp->ALU) ALU = d->ALU;
+   __typeof__(ScuDsp->ProgControlPort) pcp = d->ProgControlPort;
+   unsigned inc, ni = 0; /* CT increments (bit n = CTn), instructions run */
+   while (dsp_counter > 0 && maxn-- > 0) {
+      u32 instruction;
+
+      if (pcp.part.T0 != 0) {
+        RSTV_DSP_STEP();
+      }
+
+      instruction = d->ProgramRam[d->PC];
+#ifndef __vita__
+      rstv_dsp_pchist[d->PC & 0xFF]++;
+#endif
+      //LOG("scu: dsp %08X @ %08X", instruction, d->PC);
+      inc = 0;
+
+      ALU.all = AC.all;
+#ifdef DSPLOG
+      if (slogp){
+        char buf[128];
+        ScuDspDisasm(d->PC, buf);
+        fprintf(slogp, "%s ALU=%" PRId64 ",P=%" PRId64 "\n", buf, ALU.all, P.all);
+      }
+#endif
+
+      // ALU commands
+      switch (instruction >> 26)
+      {
+         case 0x0: // NOP
+            //AC is moved as-is to the ALU
+           //ALU.all = AC.all;
+            break;
+         case 0x1: // AND
+            //the upper 16 bits of AC are not modified for and, or, add, sub, rr and rl8
+           ALU.part.L = (s64)((u32)AC.part.L & (u32)P.part.L);
+
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if ((s64)ALU.part.L < 0)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            pcp.part.C = 0;
+            break;
+         case 0x2: // OR
+           ALU.part.L = (u64)((u32)AC.part.L | (u32)P.part.L);
+
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if ((s64)ALU.part.L < 0)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            pcp.part.C = 0;
+            break;
+         case 0x3: // XOR
+           ALU.part.L = (u64)((u32)AC.part.L ^ (u32)P.part.L);
+
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if ((s64)ALU.part.L < 0)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            pcp.part.C = 0;
+            break;
+         case 0x4: // ADD
+            ALU.part.L = (s32)AC.part.L + (s32)P.part.L;
+#ifdef DSPLOG
+            if (slogp){
+              fprintf(slogp, "%02X: %d + %d = %d\n", d->PC, (s32)AC.part.L, (s32)P.part.L, (s32)ALU.part.L);
+            }
+#endif
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if ((s32)ALU.part.L < 0)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            //0x00000001 + 0xFFFFFFFF will set the carry bit, needs to be unsigned math
+            if (((u64)(u32)P.part.L + (u64)(u32)AC.part.L) & 0x100000000){
+              pcp.part.C = 1;
+            }
+            else{
+              pcp.part.C = 0;
+            }
+
+ 
+            //if (ALU.part.L ??) // set overflow flag
+            //    pcp.part.V = 1;
+            //else
+            //   pcp.part.V = 0;
+            break;
+         case 0x5: // SUB
+         {
+           //u64 ans = (u64)AC.part.L - (u32)P.part.L;
+           ALU.part.L = (s32)AC.part.L - (s32)P.part.L;
+#ifdef DSPLOG
+           if (slogp) {
+             fprintf(slogp, "%02X: %" PRId64 " - %d = %" PRId64 " \n", d->PC, (u64)AC.part.L, (u32)P.part.L, ans);
+           }
+#endif
+           //pcp.part.C = ((ans >> 32) & 0x01);
+
+           //ALU.part.L = ans;
+
+           if (ALU.part.L == 0)
+             pcp.part.Z = 1;
+           else
+             pcp.part.Z = 0;
+
+           if ((s64)ALU.part.L < 0)
+             pcp.part.S = 1;
+           else
+             pcp.part.S = 0;
+
+           //0x00000001 - 0xFFFFFFFF will set the carry bit, needs to be unsigned math
+           if ((((u64)(u32)AC.part.L - (u64)(u32)P.part.L)) & 0x100000000)
+             pcp.part.C = 1;
+           else
+             pcp.part.C = 0;
+
+           //0x00000001 - 0xFFFFFFFF will set the carry bit, needs to be unsigned math
+           //if ((((u64)(u32)AC.part.L - (u64)(u32)P.part.L)) & 0x100000000)
+           //  pcp.part.C = 1;
+           //else
+           //  pcp.part.C = 0;
+
+
+           //               if (ALU.part.L ??) // set overflow flag
+           //                  pcp.part.V = 1;
+           //               else
+           //                  pcp.part.V = 0;
+         }
+            break;
+         case 0x6: // AD2
+           ALU.all = (s64)AC.all +(s64)P.all;
+#ifdef DSPLOG
+           if (slogp){
+             fprintf(slogp, "%02X: %" PRId64 "+ %" PRId64 "= %" PRId64 "\n", d->PC, AC.all, P.all, ALU.all);
+           }
+#endif
+            if (ALU.all == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            //0x500000000000 + 0xd00000000000 will set the sign bit
+            if (ALU.all & 0x800000000000)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            //AC.all and P.all are sign-extended so we need to mask it off and check for a carry
+            if (((AC.all & 0xffffffffffff) + (P.all & 0xffffffffffff)) & (0x1000000000000))
+               pcp.part.C = 1;
+            else
+               pcp.part.C = 0;
+
+//               if (ALU.part.unused != 0)
+//                  pcp.part.V = 1;
+//               else
+//                  pcp.part.V = 0;
+
+            break;
+         case 0x8: // SR
+           pcp.part.C = AC.part.L & 0x1;
+            ALU.part.L = (AC.part.L & 0x80000000) | (AC.part.L >> 1);
+
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if (ALU.part.L & 0x80000000)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            //0x00000001 >> 1 will set the carry bit
+            //pcp.part.C = ALU.part.L >> 31; would not handle this case
+            break;
+         case 0x9: // RR
+           pcp.part.C = AC.part.L & 0x1;
+            ALU.part.L = ((u32)(pcp.part.C) << 31) | ((u32)(AC.part.L) >> 1) ;
+            
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            //rotating 0x00000001 right will produce 0x80000000 and set 
+            //the sign bit.
+            if (ALU.part.L & 0x80000000)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+            break;
+         case 0xA: // SL
+           pcp.part.C = (AC.part.L >> 31) & 0x01;
+
+            ALU.part.L = (u32)(AC.part.L << 1);
+
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            if (ALU.part.L & 0x80000000)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+            break;
+         case 0xB: // RL
+
+           pcp.part.C = (AC.part.L >> 31) & 0x01;
+
+            ALU.part.L = (((u32)AC.part.L << 1) | pcp.part.C);
+            
+            if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+      
+            if (ALU.part.L & 0x80000000)
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+            
+            //AC.part.L = ALU.part.L;
+            break;
+         case 0xF: // RL8
+
+           pcp.part.C = (AC.part.L >> 24) & 0x01;
+           ALU.part.L  = ((u32)(AC.part.L << 8) | ((AC.part.L >> 24) & 0xFF)) ;
+
+           if (ALU.part.L == 0)
+               pcp.part.Z = 1;
+            else
+               pcp.part.Z = 0;
+
+            //rotating 0x00ffffff left 8 will produce 0xffffff00 and
+            //set the sign bit
+            if ( ALU.part.L & 0x80000000 )
+               pcp.part.S = 1;
+            else
+               pcp.part.S = 0;
+
+            //rotating 0xff000000 left 8 will produce 0x000000ff and set the
+            //carry bit
+            //pcp.part.C = (AC.part.L >> 24) & 0x01;
+            break;
+         default: break;
+      }
+
+      
+      switch (instruction >> 30) {
+      case 0x00: // Operation Commands
+            switch ((instruction >> 23) & 0x3)
+            {
+               case 2: // MOV MUL, P
+                 P.all = (s64)d->RX * (s32)d->RY; // d->MUL.all;
+                  break;
+               case 3: // MOV [s], P
+                  //s32 cast to sign extend
+                 P.all = (s64)(s32)RSTV_DSP_SRC((instruction >> 20) & 0x7);
+                  break;
+               default: break;
+            }
+            // X-bus
+            if ((instruction >> 23) & 0x4)
+            {
+              // MOV [s], X
+              d->RX = RSTV_DSP_SRC((instruction >> 20) & 0x7);
+            }
+
+            // Y-bus
+            if ((instruction >> 17) & 0x4) 
+            {
+               // MOV [s], Y
+               d->RY = RSTV_DSP_SRC((instruction >> 14) & 0x7);
+            }
+            switch ((instruction >> 17) & 0x3)
+            {
+               case 1: // CLR A
+                  AC.all = 0;
+                  break;
+               case 2: // MOV ALU,A
+                  AC.all = ALU.all;
+                  break;
+               case 3: // MOV [s],A
+                  //s32 cast to sign extend
+                  AC.all = (s64)(s32)RSTV_DSP_SRC((instruction >> 14) & 0x7);
+                  break;
+               default: break;
+            }
+
+
+            // D1-bus
+            switch ((instruction >> 12) & 0x3)
+            {
+               case 1: // MOV SImm,[d]
+                 if (inc) RSTV_DSP_INC();
+                  RSTV_DSP_D1((instruction >> 8) & 0xF, (u32)(signed char)(instruction & 0xFF));
+                  break;
+               case 3: // MOV [s],[d]
+                  RSTV_DSP_D1((instruction >> 8) & 0xF, RSTV_DSP_SRC(instruction & 0xF));
+                  break;
+               default: break;
+            }
+
+            break;
+         case 0x02: // Load Immediate Commands
+            if ((instruction >> 25) & 1)
+            {
+               switch ((instruction >> 19) & 0x3F) {
+                  case 0x01: // MVI Imm,[d]NZ
+                     if (!pcp.part.Z)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x02: // MVI Imm,[d]NS
+                     if (!pcp.part.S)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x03: // MVI Imm,[d]NZS
+                     if ( pcp.part.Z == 0 && pcp.part.S == 0)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x04: // MVI Imm,[d]NC
+                     if (!pcp.part.C)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x08: // MVI Imm,[d]NT0
+                     if (!pcp.part.T0)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x21: // MVI Imm,[d]Z
+                     if (pcp.part.Z)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x22: // MVI Imm,[d]S
+                     if (pcp.part.S)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x23: // MVI Imm,[d]ZS
+                     if (pcp.part.Z || pcp.part.S)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x24: // MVI Imm,[d]C
+                     if (pcp.part.C)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  case 0x28: // MVI Imm,[d]T0
+                     if (pcp.part.T0)
+                        RSTV_DSP_IMM((instruction >> 26) & 0xF, (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000));
+                     break;
+                  default: break;
+               }
+            }
+            else
+            {
+               // MVI Imm,[d]
+               int value = (instruction & 0x1FFFFFF);
+               if (value & 0x1000000) value |= 0xfe000000;
+               RSTV_DSP_IMM((instruction >> 26) & 0xF, value);
+             }
+            break;
+         case 0x03: // Other
+         {
+            switch((instruction >> 28) & 0xF) {
+              case 0x0C: // DMA Commands
+              {
+                // Finish Previous DMA operation
+                if (d->dsp_dma_wait > 0) {
+                  d->dsp_dma_wait = 0;
+                  RSTV_DSP_STEP();
+                }
+
+                d->dsp_dma_instruction = instruction;
+                pcp.part.T0 = 1;
+
+                int Counter = 0;
+                if ( ((instruction >> 10) & 0x1F) == 0x00 || 
+                     ((instruction >> 10) & 0x1F) == 0x04  || 
+                     ((instruction >> 11) & 0x0F) == 0x08 || 
+                     ((instruction >> 10) & 0x1F) == 0x14 )
+                {
+                   Counter = instruction & 0xFF;
+                }
+                else if (
+                  ((instruction >> 11) & 0x0F) == 0x04 || 
+                  ((instruction >> 10) & 0x1F) == 0x0C || 
+                  ((instruction >> 11) & 0x0F) == 0x0C || 
+                  ((instruction >> 10) & 0x1F) == 0x1C)
+                {
+                  switch ((instruction & 0x7))
+                  {
+                  case 0x00: Counter = d->MD[0][d->CT[0] & 0x3F]; break;
+                  case 0x01: Counter = d->MD[1][d->CT[1] & 0x3F]; break;
+                  case 0x02: Counter = d->MD[2][d->CT[2] & 0x3F]; break;
+                  case 0x03: Counter = d->MD[3][d->CT[3] & 0x3F]; break;
+                  case 0x04: Counter = d->MD[0][d->CT[0] & 0x3F]; d->CT[0]++; d->CT[0] &= 0x3F; break;
+                  case 0x05: Counter = d->MD[1][d->CT[1] & 0x3F]; d->CT[1]++; d->CT[1] &= 0x3F; break;
+                  case 0x06: Counter = d->MD[2][d->CT[2] & 0x3F]; d->CT[2]++; d->CT[2] &= 0x3F; break;
+                  case 0x07: Counter = d->MD[3][d->CT[3] & 0x3F]; d->CT[3]++; d->CT[3] &= 0x3F; break;
+                  }
+
+                }
+
+                d->dsp_dma_size = Counter;
+                d->dsp_dma_wait = 2; // DMA operation will be start when this count is zero
+                d->WA0M = d->WA0;
+                d->RA0M = d->RA0;
+                //LOG("Start DSP DMA RA=%08X WA=%08X inst=%08X count=%d wait = %d", d->RA0M, d->WA0M, d->dsp_dma_instruction, Counter, d->dsp_dma_wait );
+                break;
+               }
+               case 0x0D: // Jump Commands
+                 if (d->jmpaddr != 0xffffffff) {
+                   break;
+                 }
+                  switch ((instruction >> 19) & 0x7F) {
+                     case 0x00: // JMP Imm
+                        d->jmpaddr = instruction & 0xFF;
+                        d->delayed = 0;
+                        break;
+                     case 0x41: // JMP NZ, Imm
+                        if (!pcp.part.Z)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+                        break;
+                     case 0x42: // JMP NS, Imm
+                        if (!pcp.part.S)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+
+                        //LOG("scu\t: JMP NS: S = %d, jmpaddr = %08X\n", (unsigned int)pcp.part.S, (unsigned int)d->jmpaddr);
+                        break;
+                     case 0x43: // JMP NZS, Imm
+                        if ( pcp.part.Z==0 && pcp.part.S == 0)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+
+                        //LOG("scu\t: JMP NZS: Z = %d, S = %d, jmpaddr = %08X\n", (unsigned int)pcp.part.Z, (unsigned int)pcp.part.S, (unsigned int)d->jmpaddr);
+                        break;
+                     case 0x44: // JMP NC, Imm
+                        if (!pcp.part.C)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+                        break;
+                     case 0x48: // JMP NT0, Imm
+                        if (!pcp.part.T0)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+
+                        //LOG("scu\t: JMP NT0: T0 = %d, jmpaddr = %08X\n", (unsigned int)pcp.part.T0, (unsigned int)d->jmpaddr);
+                        break;
+                     case 0x61: // JMP Z,Imm
+                        if (pcp.part.Z)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+                        break;
+                     case 0x62: // JMP S, Imm
+                        if (pcp.part.S)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+
+                        //LOG("scu\t: JMP S: S = %d, jmpaddr = %08X\n", (unsigned int)pcp.part.S, (unsigned int)d->jmpaddr);
+                        break;
+                     case 0x63: // JMP ZS, Imm
+                        if (pcp.part.Z || pcp.part.S)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+
+                        //LOG("scu\t: JMP ZS: Z = %d, S = %d, jmpaddr = %08X\n", pcp.part.Z, (unsigned int)pcp.part.S, (unsigned int)d->jmpaddr);
+                        break;
+                     case 0x64: // JMP C, Imm
+                        if (pcp.part.C)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+                        break;
+                     case 0x68: // JMP T0,Imm
+                        if (pcp.part.T0)
+                        {
+                           d->jmpaddr = instruction & 0xFF;
+                           d->delayed = 0; 
+                        }
+                        break;
+                     default:
+                        LOG("scu\t: Unknown JMP instruction not implemented\n");
+                        break;
+                  }
+                  break;
+               case 0x0E: // Loop bottom Commands
+                  if (instruction & 0x8000000)
+                  {
+                     // LPS
+                     if (d->LOP != 0)
+                     {
+                        d->jmpaddr = d->PC;
+                        d->delayed = 0;
+                        d->LOP--;
+                     }
+                  }
+                  else
+                  {
+                     // BTM
+                     if (d->LOP != 0)
+                     {
+                        d->jmpaddr = d->TOP;
+                        d->delayed = 0;
+                        d->LOP--;
+                     }
+                  }
+
+                  break;
+               case 0x0F: // End Commands
+                  pcp.part.EX = 0;
+
+                  if (instruction & 0x8000000) {
+                     // End with Interrupt
+                     pcp.part.E = 1;
+                     RSTV_DSP_SYNC(); ScuSendDSPEnd();
+                  }
+
+                  LOG("dsp has ended\n");
+                  pcp.part.P = d->PC+1;
+                  dsp_counter = 1;
+                  break;
+               default: break;
+            }
+            break;
+         }
+         default: 
+            LOG("scu\t: Invalid DSP opcode %08X at offset %02X\n", instruction, d->PC);
+            break;
+      }
+
+      //d->MUL.all = (s64)d->RX * (s32)d->RY;
+      
+      if (inc) RSTV_DSP_INC();
+
+      d->PC++;
+
+      // Handle delayed jumps
+      if (d->jmpaddr != 0xFFFFFFFF)
+      {
+         if (d->delayed)
+         {
+            d->PC = (unsigned char)d->jmpaddr;
+            d->jmpaddr = 0xFFFFFFFF;
+            dsp_counter += 1; // hold clock
+         }
+         else
+            d->delayed = 1;
+      }
+      dsp_counter--;
+      ni++;
+   }
+   RSTV_DSP_SYNC();
+   rstv_dsp_insns += ni;
+   return dsp_counter;
+}
+#undef RSTV_DSP_SYNC
+#undef RSTV_DSP_LOAD
+#undef RSTV_DSP_STEP
+#undef RSTV_DSP_FIN
+#undef RSTV_DSP_SRC
+#undef RSTV_DSP_D1
+#undef RSTV_DSP_IMM
+#undef RSTV_DSP_INC
+
+/* ADR-169: compiled DSP code (rstv_scujit.c) where it can run, the interpreter above for the rest (DMA, END, a pending
+   jump, T0) */
+extern int rstv_scujit_prepare(scudspregs_struct *d);
+extern int rstv_scujit_run(scudspregs_struct *d, s32 *counter);
+extern void rstv_scujit_dirty(void);
+static void rstv_dsp_run(s32 c)
+{
+   if (rstv_scujit_prepare(ScuDsp)) {
+      while (c > 0) {
+         const s32 c0 = c;
+         if (rstv_scujit_run(ScuDsp, &c))
+            rstv_dsp_insns += (unsigned)(c0 - c);
+         else
+            c = rstv_dsp_interp_n(c, 1);
+      }
+      return;
+   }
+   rstv_dsp_interp_n(c, 0x7FFFFFFF);
+}
+
 void ScuExec(u32 timing) {
    int i;
    rstv_act = 20;
@@ -1466,6 +2215,15 @@ void ScuExec(u32 timing) {
      }
 #endif
      s32 dsp_counter = (s32)timing;
+#ifndef __vita__
+     struct timespec dsp_t0_;
+     clock_gettime(CLOCK_MONOTONIC, &dsp_t0_);
+#endif
+#ifndef DSPLOG
+      if (ScuBP->numcodebreakpoints == 0)
+         rstv_dsp_run(dsp_counter);
+      else
+#endif
       while (dsp_counter > 0) {
          u32 instruction;
 
@@ -1483,6 +2241,9 @@ void ScuExec(u32 timing) {
          }
 
          instruction = ScuDsp->ProgramRam[ScuDsp->PC];
+#ifndef __vita__
+         rstv_dsp_pchist[ScuDsp->PC & 0xFF]++;
+#endif
          //LOG("scu: dsp %08X @ %08X", instruction, ScuDsp->PC);
          incFlg[0] = 0;
          incFlg[1] = 0;
@@ -2071,6 +2832,13 @@ void ScuExec(u32 timing) {
          dsp_counter--;
          rstv_dsp_insns++;
       }
+#ifndef __vita__
+     {
+       struct timespec t1_;
+       clock_gettime(CLOCK_MONOTONIC, &t1_);
+       rstv_dsp_ns += (unsigned long long)(t1_.tv_sec - dsp_t0_.tv_sec) * 1000000000ull + (t1_.tv_nsec - dsp_t0_.tv_nsec);
+     }
+#endif
    }
 }
 
@@ -3243,6 +4011,13 @@ static INLINE void SendInterrupt(u8 vector, u8 level, u16 mask, u32 statusbit) {
        SH2SendInterrupt(SSH2, 0x41, 1);
      if( vector == 0x40 ) 
        SH2SendInterrupt(SSH2, 0x43, 2);
+#ifdef RSTV_DYNAREC
+     if (rstv_slave_on && (vector == 0x40 || vector == 0x42)) { /* ADR-136: wake the slave thread if it can take it */
+       extern int SH2DynInterruptMask(SH2_struct *context);
+       if (SH2DynInterruptMask(SSH2) < (vector == 0x40 ? 2 : 1))
+         rstv_slave_kick();
+     }
+#endif
   }
 }
 

@@ -3210,7 +3210,7 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
          static FILE *tf;
          if (!tf && context->regs.PC == rstv_trace_pc) tf = fopen("/tmp/rstv_pc.tr", "w");
          if (tf) {
-            fprintf(tf, "%08X\n", context->regs.PC);
+            fprintf(tf, "%08X %03X %d %d\n", context->regs.PC, (unsigned)context->regs.SR.all, (int)yabsys.frame_count, (int)yabsys.LineCount);
             if (!--rstv_trace_n) { fclose(tf); tf = NULL; }
          }
       }
@@ -3218,7 +3218,14 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
       if (trap_r0z < 0) trap_r0z = getenv("RSTV_TRAP_R0Z") != NULL;
       if (rstv_trap_pc && context->regs.PC == rstv_trap_pc && !who && (int)yabsys.frame_count >= rstv_trap_from &&
           (!trap_r0z || context->regs.R[0] == 0)) {
-         // harness --trap ADDR[@FRAME]: registers and stack, once
+         // harness --trap ADDR[@FRAME]: registers and stack, once (RSTV_TRAP_ALL=1: registers on every hit, no stack)
+         static int trap_all = -1;
+         if (trap_all < 0) trap_all = getenv("RSTV_TRAP_ALL") != NULL;
+         if (trap_all) {
+            printf("trap pc %08x pr %08x r4 %08x r5 %08x r6 %08x r7 %08x frame %d line %d\n", context->regs.PC, context->regs.PR,
+               context->regs.R[4], context->regs.R[5], context->regs.R[6], context->regs.R[7], (int)yabsys.frame_count, (int)yabsys.LineCount);
+            goto trap_done;
+         }
          rstv_trap_pc = 0;
          printf("trap pc %08x pr %08x sr %03x r15 %08x r4 %08x r5 %08x r6 %08x r7 %08x r0 %08x @r4 %08x frame %d line %d\n", context->regs.PC,
             context->regs.PR, (unsigned)context->regs.SR.all, context->regs.R[15], context->regs.R[4], context->regs.R[5], context->regs.R[6],
@@ -3226,6 +3233,7 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
          for (int k = 0; k < 24; k++)
             printf("  sp+%02x %08x\n", k * 4, MappedMemoryReadLongNocache(context->regs.R[15] + k * 4));
       }
+      trap_done:;
 #endif
    }
    if (context->cycles & RSTV_IDLE_FLAG) {

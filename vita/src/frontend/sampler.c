@@ -1,6 +1,6 @@
 // Sampling profiler (for measurement, only when ux0:data/restv/sampler exists).
 // The main thread only writes what it is doing (rstv_act) and the running SH-2 block address (rstv_act_pc) to globals;
-// a sampler thread on CPU1 reads them about every 250us and builds a histogram. No clock calls, so almost no cost on the main thread.
+// a sampler thread on CPU2 reads them about every 250us and builds a histogram. No clock calls, so almost no cost on the main thread.
 #include "sampler.h"
 
 #include <psp2/kernel/threadmgr.h>
@@ -47,7 +47,8 @@ static int sampler_thread(SceSize args, void *argp)
 void rstv_sampler_start(void)
 {
 	s_run = 1;
-	SceUID t = sceKernelCreateThread("rstv_sampler", sampler_thread, 64, 0x2000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
+	SceUID t = sceKernelCreateThread("rstv_sampler", sampler_thread, 64, 0x2000, 0, 0x80000, NULL); // CPU3 (shared with the system):
+	// on CPU1 the sound thread starved it (pblbeach), on CPU2 the prep and audio threads (34 samples a window in vfremix)
 	if (t >= 0)
 		sceKernelStartThread(t, 0, NULL);
 	RSTV_LOG("sampler: started (%d)", (int)t);
@@ -57,7 +58,7 @@ void rstv_sampler_report(char *out, int size)
 {
 	static const char *names[NACT] = { "?", "msh2", "ssh2", "loop", "hblank", "scsp", "scu", "vblankin",
 		"m68ksync", "front", "v2vout", "hbout", "hbin", "scudma", "erase", "v1change", "hbint", "hbdma", "v2start", "dsp",
-		"scutimer", "v1draw", "v2screens", "v1end", "v2end", "cfetch", "cemit", "cother", "csync", "ccopy", "?30", "?31" };
+		"scutimer", "v1draw", "v2screens", "v1end", "v2end", "cfetch", "cemit", "cother", "csync", "ccopy", "sndsync", "cheat" };
 	int n = snprintf(out, size, "sample %u:", s_total);
 	for (int a = 0; a < NACT && n < size; a++)
 		if (s_act[a])

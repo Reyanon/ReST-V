@@ -31,10 +31,12 @@ int nbgq_build(const RstvLayerCapture *c, int w, int h, const uint8_t *vram, Nbg
 // ADR-058: nbgq_track != 0 -> nbgq_build marks the VRAM 4KB pages it reads (pattern names and characters)
 extern int nbgq_track;
 extern uint32_t nbgq_track_pages[4];
+// ADR-137: and the 256-byte blocks read in each page (bit b = bytes b * 256 .. b * 256 + 255); cleared by the caller
+extern uint16_t nbgq_track_sub[128];
 
 // character atlas update: if VRAM 4KB page p changed, re-decode the blocks touching that page.
 //   a4: 4bpp decode (block = 32 bytes -> 8x8 nibbles), a8: 8bpp (block = 64 bytes from that unit)
 //   only pages where dirty(p) is nonzero (all if NULL)
-void nbgq_atlas_update(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram, const uint8_t *dirty);
+void nbgq_atlas_update(uint8_t *a4, uint8_t *a8, int pitch, const uint8_t *vram, const uint16_t *dirty);
 
 #endif

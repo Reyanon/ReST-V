@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "cdbase.h"
@@ -165,6 +166,42 @@ static double now_s(void)
 }
 
 u32 rstv_harness_frame; /* compile log (DynarecSh2.cpp RSTV_COMPLOG) */
+void rstv_log_printf(const char *fmt, ...) /* the Vita UDP log (core diags); printed with RSTV_LOG=1 */
+{
+	if (!getenv("RSTV_LOG")) return;
+	va_list ap;
+	va_start(ap, fmt);
+	printf("log ");
+	vprintf(fmt, ap);
+	putchar(10);
+	va_end(ap);
+}
+#ifdef RSTV_DYNAREC
+#include <pthread.h>
+void *rstv_watchdog(void *arg)
+{
+	(void)arg;
+	u32 last = 0;
+	int same = 0;
+	for (;;) {
+		sleep(3);
+		if (rstv_harness_frame == last) {
+			if (++same == 2) {
+				extern void rstv_slave_debug(char *out, int size);
+				char b[256];
+				rstv_slave_debug(b, sizeof(b));
+				extern volatile int rstv_act; extern volatile unsigned rstv_act_pc;
+				fprintf(stderr, "watchdog: stuck at frame %u line %d deciline %d: %s msh2 pc %08x ssh2 pc %08x act %d actpc %08x%c", last, (int)yabsys.LineCount,
+					(int)yabsys.DecilineCount, b, SH2Core->GetPC(MSH2), SH2Core->GetPC(SSH2), rstv_act, rstv_act_pc, 10);
+				fflush(stderr);
+			}
+		} else
+			same = 0;
+		last = rstv_harness_frame;
+	}
+	return NULL;
+}
+#endif
 static FILE *s68_fp;
 static long s68_left;
 static void trace68(unsigned pc)
@@ -179,6 +216,7 @@ static void trace68(unsigned pc)
 	fprintf(s68_fp, "%06x\n", pc & 0xFFFFFF);
 }
 
+static void harness_load_tick(void) {}
 int main(int argc, char **argv)
 {
 	const char *roms = "roms", *game = "sandor", *out = ".";
@@ -205,6 +243,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--mash") && i + 1 < argc) mash_at = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--dis") && i + 2 < argc) { dis_addr = strtoul(argv[++i], NULL, 16); dis_n = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "--no-idle")) no_idle = 1;
+		else if (!strcmp(argv[i], "--loadtick")) { extern void (*rstv_load_tick)(void); rstv_load_tick = harness_load_tick; } // inflate in steps (Vita)
 		else if (!strcmp(argv[i], "--no-icap-nested")) { extern int rstv_icap_nested; rstv_icap_nested = 0; }
 		else if (!strcmp(argv[i], "--dynarec")) {
 			use_dynarec = 1;
@@ -216,6 +255,8 @@ int main(int argc, char **argv)
 				rstv_chain_on = 0, rstv_memfast = 0;
 			if (getenv("RSTV_QLOG"))
 				rstv_memfast = 0;
+			if (getenv("RSTV_NOCHAIN")) // every block through Execute (cycle probes with RSTV_BTRACE)
+				rstv_chain_on = 0;
 			extern int rstv_tier_n;
 			if (getenv("RSTV_ICAPCYC")) { // dynarec: cycles the woken CPU runs inside an input-capture write
 				extern int rstv_icap_cycles;
@@ -223,6 +264,35 @@ int main(int argc, char **argv)
 			}
 			if (getenv("RSTV_NOTIER"))
 				rstv_tier_n = 0;
+			if (getenv("RSTV_DEVTRAP")) { extern unsigned int rstv_dev_trap; rstv_dev_trap = (unsigned)strtoul(getenv("RSTV_DEVTRAP"), NULL, 16); }
+			if (getenv("RSTV_CHTRACE")) { // "FROM TO": first-seen master block PCs (chained "c" or from Execute "x")
+				extern unsigned int rstv_dev_trace_from, rstv_dev_trace_to;
+				extern int rstv_chain_trace_on, rstv_chain_prof;
+				sscanf(getenv("RSTV_CHTRACE"), "%u %u", &rstv_dev_trace_from, &rstv_dev_trace_to);
+				rstv_chain_trace_on = rstv_chain_prof = 1;
+			}
+			extern int rstv_dyn_litc, rstv_dyn_lazyff; // ADR-134
+			if (getenv("RSTV_NOLITC"))
+				rstv_dyn_litc = 0;
+			if (getenv("RSTV_NOLAZYFF"))
+				rstv_dyn_lazyff = 0;
+			extern int rstv_dyn_rc, rstv_dyn_blkcap; // ADR-135
+			if (getenv("RSTV_NORC"))
+				rstv_dyn_rc = 0;
+			if (getenv("RSTV_BLKCAP"))
+				rstv_dyn_blkcap = atoi(getenv("RSTV_BLKCAP"));
+			extern int rstv_dyn_selfloop;
+			if (getenv("RSTV_NOSELFLOOP"))
+				rstv_dyn_selfloop = 0;
+			extern int rstv_dyn_rcbr;
+			if (getenv("RSTV_NORCBR"))
+				rstv_dyn_rcbr = 0;
+			extern int rstv_slave_cfg, rstv_slave_lead; // ADR-136: RSTV_ASYNC=lead runs the slave SH-2 on its own thread
+			if (getenv("RSTV_ASYNC")) {
+				rstv_slave_cfg = 1;
+				if (atoi(getenv("RSTV_ASYNC")) > 0)
+					rstv_slave_lead = atoi(getenv("RSTV_ASYNC"));
+			}
 			extern int rstv_hle_on;
 			if (getenv("RSTV_NOHLE"))
 				rstv_hle_on = 0;
@@ -232,6 +302,8 @@ int main(int argc, char **argv)
 			extern int rstv_sleep_max;
 			if (getenv("RSTV_NOSLEEP"))
 				rstv_sleep_max = 0;
+			if (getenv("RSTV_SLEEPMAX"))
+				rstv_sleep_max = atoi(getenv("RSTV_SLEEPMAX"));
 			extern int rstv_link_on;
 			if (getenv("RSTV_LINK"))
 				rstv_link_on = 1;
@@ -244,6 +316,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--vdp1thread")) rstv_vdp1_thread = 1;
 		else if (!strcmp(argv[i], "--merge")) { extern int rstv_deciline_merge; rstv_deciline_merge = 1; }
 		else if (!strcmp(argv[i], "--scspbatch") && i + 1 < argc) { extern int rstv_scsp_batch_mode; rstv_scsp_batch_mode = atoi(argv[++i]); }
+		else if (!strcmp(argv[i], "--dsppipe")) { extern int rstv_scsp_dsp_thread; rstv_scsp_dsp_thread = 2; } // ADR-158 check (inline)
 		else if (!strcmp(argv[i], "--trap") && i + 1 < argc) { extern u32 rstv_trap_pc; extern int rstv_trap_from; char *e; rstv_trap_pc = (u32)strtoul(argv[++i], &e, 16); if (*e == '@') rstv_trap_from = atoi(e + 1); }
 		else if (!strcmp(argv[i], "--tracepc") && i + 2 < argc) { extern u32 rstv_trace_pc, rstv_trace_n; rstv_trace_pc = (u32)strtoul(argv[++i], NULL, 16); rstv_trace_n = (u32)atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "--nofmbatch")) { extern int rstv_scsp_fm_batch; rstv_scsp_fm_batch = 0; }
@@ -280,6 +353,7 @@ int main(int argc, char **argv)
 	yinit.use_new_scsp = 1;
 	yinit.scsp_sync_count_per_frame = 1;
 	yinit.scsp_main_mode = 0;
+	{ extern int rstv_scsp_lag; if (getenv("RSTV_SNDLAG")) rstv_scsp_lag = 1; } // the Vita default (sound one frame behind)
 	yinit.stv_rom_dir = roms;
 	yinit.stv_romset = game;
 
@@ -290,6 +364,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	fprintf(stderr, "init %.2fs\n", now_s() - t0);
+	if (getenv("RSTV_NV")) { // EEPROM file like the Vita's ux0:data/restv/nvram/<set>.nv
+		extern int eeprom_load(const char *path);
+		fprintf(stderr, "eeprom %s: %s\n", getenv("RSTV_NV"), eeprom_load(getenv("RSTV_NV")) == 0 ? "loaded" : "failed");
+	}
 	if (no_idle)
 		STVSetIdleHacks(0);
 	extern void nbgcheck_install(void), nbgcheck_report(void);
@@ -302,6 +380,18 @@ int main(int argc, char **argv)
 		extern int rstv_v1watch;
 		rstv_v1watch = atoi(getenv("RSTV_V1WATCH")) > 1 ? 2 : 1; // 2 = also list level 0 DMA starts
 	}
+	if (getenv("RSTV_V1GPULOG")) { // diag: record VDP1 GPU lists like the Vita (no GPU here) and log them
+		extern int rstv_vdp1_gpu_on;
+		rstv_vdp1_gpu_on = 1;
+	}
+	if (getenv("RSTV_DMAINSTANT")) { // SCU DMA finishes when started (Vita: ux0:data/restv/dmainstant)
+		extern int rstv_dma_instant;
+		rstv_dma_instant = 1;
+	}
+	if (getenv("RSTV_V1RAMW")) { // diag: writes into VDP1 RAM [lo, hi) (hex offsets)
+		extern u32 rstv_v1ramw_lo, rstv_v1ramw_hi;
+		sscanf(getenv("RSTV_V1RAMW"), "%x,%x", &rstv_v1ramw_lo, &rstv_v1ramw_hi);
+	}
 	if (getenv("RSTV_HALF")) { // ADR-100: hi-res / interlace screens at half size (Vita default)
 		extern int rstv_hires_half;
 		rstv_hires_half = 1;
@@ -310,12 +400,31 @@ int main(int argc, char **argv)
 		extern int rstv_layer_off;
 		rstv_layer_off = atoi(getenv("RSTV_LAYEROFF"));
 	}
+#ifdef RSTV_DYNAREC
+	if (getenv("RSTV_ASYNC")) {
+		// diag: a watchdog prints the slave thread state when frames stop advancing (deadlock hunting)
+		extern void *rstv_watchdog(void *);
+		pthread_t wt;
+		pthread_create(&wt, NULL, rstv_watchdog, NULL);
+	}
+#endif
 	for (int f = 1; f <= frames; f++) {
 		rstv_harness_frame = (u32)f;
+		{ static int pl = -2; if (pl == -2) { const char *e = getenv("RSTV_PCLOG"); pl = e ? atoi(e) : -1; }
+		  if (pl >= 0 && f >= pl && f < pl + 8) // diag: dynarec PCs and PR at frame start
+			printf("pclog f%d m %08x pr %08x r11 %08x r13 %08x s %08x pr %08x%c", f, SH2Core->GetPC(MSH2), SH2Core->GetPR(MSH2), SH2Core->GetGPR(MSH2, 11), SH2Core->GetGPR(MSH2, 13), SH2Core->GetPC(SSH2), SH2Core->GetPR(SSH2), 10); }
+#ifdef RSTV_DYNAREC
+		{ extern void rstv_litwatch_check(u32 frame); rstv_litwatch_check((u32)f); }
+#endif
 		u8 sys = 0;
 		if (coin_at >= 0 && f >= coin_at && f < coin_at + 6) sys |= STV_SYS_COIN1;
 		if (start_at >= 0 && f >= start_at && f < start_at + 6) sys |= STV_SYS_START1;
 		u8 p1 = 0;
+		{ // RSTV_B1EVERY=FROM,PERIOD: button 1 for 6 frames every PERIOD frames from FROM (MAME coinstart.lua BTN_AT)
+			static int bf = -2, bp = 90;
+			if (bf == -2) { const char *e = getenv("RSTV_B1EVERY"); bf = -1; if (e) sscanf(e, "%d,%d", &bf, &bp); }
+			if (bf >= 0 && f >= bf && (f - bf) % bp < 6) p1 |= STV_IN_B1;
+		}
 		if (mash_at >= 0 && f >= mash_at) {
 			// deterministic random, same as MASH in vita/src/frontend/main.c: new combo every 8 frames, coin/start every 600 frames
 			static uint32_t rng = 0x12345678u;
@@ -338,6 +447,11 @@ int main(int argc, char **argv)
 			static int hf = -2, ht, hb;
 			if (hf == -2) { hf = -1; const char *e = getenv("RSTV_HOLD"); if (e) sscanf(e, "%d,%d,%i", &hf, &ht, &hb); }
 			if (hf >= 0 && f >= hf && f < ht) p1 |= (u8)hb;
+		}
+		{	// RSTV_SYSHOLD=from,to,bits: system bits (STV_SYS_*, e.g. 4 = TEST) held over [from, to)
+			static int sf = -2, st, sb;
+			if (sf == -2) { sf = -1; const char *e = getenv("RSTV_SYSHOLD"); if (e) sscanf(e, "%d,%d,%i", &sf, &st, &sb); }
+			if (sf >= 0 && f >= sf && f < st) sys |= (u8)sb;
 		}
 		StvIoSetInputs(p1, 0, sys);
 		{	// RSTV_MJ=from,to,row,bits: mahjong panel keys (row layout in stvio.h)
@@ -404,6 +518,60 @@ int main(int argc, char **argv)
 			printf("loadstate f%d %s: %d\n", f, load_path, rstv_state_load(load_path));
 		if (f == save_at)
 			printf("savestate f%d %s: %d\n", f, save_path, rstv_state_save(save_path));
+		if (getenv("RSTV_SCSPDSP") && f == atoi(getenv("RSTV_SCSPDSP"))) {
+			extern void rstv_scsp_dsp_report(void);
+			rstv_scsp_dsp_report();
+		}
+		if (getenv("RSTV_DSPPROF")) { // "F0 F1": SCU DSP instructions per frame over [F0, F1], then the hot program addresses
+			static unsigned i0;
+			int f0 = 0, f1 = 0;
+			sscanf(getenv("RSTV_DSPPROF"), "%d %d", &f0, &f1);
+			extern unsigned rstv_dsp_insns, rstv_dsp_pchist[256];
+			extern unsigned long long rstv_dsp_ns;
+			static unsigned long long ns0;
+			extern scudspregs_struct *ScuDsp;
+			if (f == f0) {
+				i0 = rstv_dsp_insns;
+				ns0 = rstv_dsp_ns;
+				memset(rstv_dsp_pchist, 0, sizeof(rstv_dsp_pchist));
+			}
+			if (f == f1 && f1 > f0) {
+				printf("dspprof f%d-f%d: %.0f insns a frame, %.1f ns an insn, hash %08x%c", f0, f1, (double)(rstv_dsp_insns - i0) / (f1 - f0),
+					(double)(rstv_dsp_ns - ns0) / (rstv_dsp_insns - i0 + 1), 0u, 10);
+				if (getenv("RSTV_DSPQUIET"))
+					memset(rstv_dsp_pchist, 0, sizeof(rstv_dsp_pchist));
+				for (int a = 0; a < 256; a++)
+					if (rstv_dsp_pchist[a]) {
+						char buf[128];
+						ScuDspDisasm((u8)a, buf);
+						printf("dsp %02x %8.1f %08x %s%c", a, (double)rstv_dsp_pchist[a] / (f1 - f0), (unsigned)ScuDsp->ProgramRam[a], buf, 10);
+					}
+			}
+		}
+		if (getenv("RSTV_V2DIFF")) { // "F0 F1": VDP2 VRAM bytes changed this frame, per 4KB page (first..last offset)
+			static u8 *prev;
+			int f0 = 0, f1 = 0;
+			sscanf(getenv("RSTV_V2DIFF"), "%d %d", &f0, &f1);
+			extern u8 *Vdp2Ram;
+			if (f >= f0 && f <= f1 && prev) {
+				printf("v2diff f%d:", f);
+				for (int pg = 0; pg < 128; pg++) {
+					int n = 0, a = -1, b = -1;
+					for (int k = 0; k < 4096; k++)
+						if (Vdp2Ram[pg * 4096 + k] != prev[pg * 4096 + k]) {
+							n++;
+							if (a < 0) a = k;
+							b = k;
+						}
+					if (n)
+						printf(" p%d:%d[%03x-%03x]", pg, n, a, b);
+				}
+				printf("%c", 10);
+			}
+			if (!prev)
+				prev = (u8 *)malloc(0x80000);
+			memcpy(prev, Vdp2Ram, 0x80000);
+		}
 		if (getenv("RSTV_V2VRAM") && f == atoi(getenv("RSTV_V2VRAM"))) { // VDP2 VRAM 512KB (as the SH-2 reads it) -> /tmp/v2vram.bin
 			FILE *vf = fopen("/tmp/v2vram.bin", "wb");
 			for (u32 a = 0; vf && a < 0x80000; a += 4) {
@@ -490,8 +658,8 @@ int main(int argc, char **argv)
 				rstv_capture_mode = 1;
 				extern int rstv_rot_dbg[4];
 				if (rstv_rot_why != last || (rstv_rot_why & 0x100))
-					printf("rotwhy f%d %x dkax %d dkast %d mode %d kast %d\n", f, rstv_rot_why, rstv_rot_dbg[0], rstv_rot_dbg[1],
-						rstv_rot_dbg[2], rstv_rot_dbg[3]);
+					printf("rotwhy f%d %x dkax %d dkast %d mode %d kast %d KTCTL %04x LNCLEN %04x RPMD %04x\n", f, rstv_rot_why, rstv_rot_dbg[0], rstv_rot_dbg[1],
+						rstv_rot_dbg[2], rstv_rot_dbg[3], Vdp2Regs->KTCTL, Vdp2Regs->LNCLEN, Vdp2Regs->RPMD);
 				last = rstv_rot_why;
 			}
 		}
@@ -552,8 +720,92 @@ int main(int argc, char **argv)
 					}
 				}
 				if (vf) fclose(vf);
-				printf("vdp1 fb %dx%d ps %d TVMR %04x FBCR %04x PTMR %04x | VDP2 SPCTL %04x BGON %04x PRISA %04x TVMD %04x\n", vw, vh, vps,
-					Vdp1Regs->TVMR, Vdp1Regs->FBCR, Vdp1Regs->PTMR, Vdp2Regs->SPCTL, Vdp2Regs->BGON, Vdp2Regs->PRISA, Vdp2Regs->TVMD);
+				printf("vdp1 fb %dx%d ps %d TVMR %04x FBCR %04x PTMR %04x EW %04x %04x %04x local %d,%d | VDP2 SPCTL %04x BGON %04x PRISA %04x TVMD %04x\n", vw, vh, vps,
+					Vdp1Regs->TVMR, Vdp1Regs->FBCR, Vdp1Regs->PTMR, Vdp1Regs->EWDR, Vdp1Regs->EWLR, Vdp1Regs->EWRR, (int)Vdp1Regs->localX, (int)Vdp1Regs->localY, Vdp2Regs->SPCTL, Vdp2Regs->BGON, Vdp2Regs->PRISA, Vdp2Regs->TVMD);
+			}
+		}
+		{
+			// RSTV_TVMDLOG: VDP2 TVMD changes and VDP1 command y range (local + vertices), for frame alignment with MAME
+			static int tl = -1, lastv = -1;
+			if (tl < 0) tl = getenv("RSTV_TVMDLOG") != NULL;
+			if (tl) {
+				if (Vdp2Regs->TVMD != lastv) { printf("tvmd f%d %04x\n", f, Vdp2Regs->TVMD); lastv = Vdp2Regs->TVMD; }
+				if (f == 1600) {
+					printf("cram f%d CRAOFA %04x CRAOFB %04x RAMCTL %04x:", f, Vdp2Regs->CRAOFA, Vdp2Regs->CRAOFB, Vdp2Regs->RAMCTL);
+					for (int k = 0x60; k < 0x68; k++)
+						printf(" %04x", T2ReadWord(Vdp2ColorRam, k * 2));
+					printf("\n");
+					printf("pri f%d PRINA %04x PRINB %04x PRIR %04x SFPRMD %04x SFSEL %04x SFCODE %04x BGON %04x CHCTLA %04x CHCTLB %04x PNCN0 %04x PNCN1 %04x PNCN2 %04x PNCN3 %04x PNCR %04x WCTLA %04x WCTLB %04x WCTLC %04x WCTLD %04x\n",
+						f, Vdp2Regs->PRINA, Vdp2Regs->PRINB, Vdp2Regs->PRIR, Vdp2Regs->SFPRMD, Vdp2Regs->SFSEL, Vdp2Regs->SFCODE,
+						Vdp2Regs->BGON, Vdp2Regs->CHCTLA, Vdp2Regs->CHCTLB, Vdp2Regs->PNCN0, Vdp2Regs->PNCN1, Vdp2Regs->PNCN2,
+						Vdp2Regs->PNCN3, Vdp2Regs->PNCR, Vdp2Regs->WCTLA, Vdp2Regs->WCTLB, Vdp2Regs->WCTLC, Vdp2Regs->WCTLD);
+				}
+				if (f % 50 == 0)
+					printf("clip f%d user %d,%d-%d,%d sys %d,%d-%d,%d\n", f, Vdp1Regs->userclipX1, Vdp1Regs->userclipY1, Vdp1Regs->userclipX2,
+						Vdp1Regs->userclipY2, Vdp1Regs->systemclipX1, Vdp1Regs->systemclipY1, Vdp1Regs->systemclipX2, Vdp1Regs->systemclipY2);
+				if (f % 100 == 0)
+					printf("cc f%d CCCTL %04x SPCTL %04x CCRSA %04x CCRSB %04x CCRSC %04x CCRSD %04x SFCCMD %04x CCRLB %04x PRISA %04x PRISB %04x\n",
+						f, Vdp2Regs->CCCTL, Vdp2Regs->SPCTL, Vdp2Regs->CCRSA, Vdp2Regs->CCRSB, Vdp2Regs->CCRSC, Vdp2Regs->CCRSD,
+						Vdp2Regs->SFCCMD, Vdp2Regs->CCRLB, Vdp2Regs->PRISA, Vdp2Regs->PRISB);
+				int a = 0, n = 0, ymin = 9999, ymax = -9999, ly = 0;
+				for (int i = 0; i < 2000; i++) {
+					const u16 ctrl = T1ReadWord(Vdp1Ram, a);
+					if (ctrl & 0x8000) break;
+					const int cm = ctrl & 15;
+					if (!(ctrl & 0x4000)) {
+						if (cm == 0xA) ly = (s16)T1ReadWord(Vdp1Ram, a + 0xE);
+						if (cm <= 6 && cm != 1 && cm != 3) {
+							for (int k = 0; k < 4; k++) { const int y = (s16)T1ReadWord(Vdp1Ram, a + 0xE + k * 4) + ly; if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+							n++;
+						}
+					}
+					a = (((ctrl >> 12) & 3) == 1) ? T1ReadWord(Vdp1Ram, a + 2) * 8 : a + 32;
+					a &= 0x7FFFF;
+				}
+				if (f % 10 == 0) printf("v1y f%d cmds %d y %d..%d\n", f, n, ymin, ymax);
+				if (getenv("RSTV_TEXH") && f == atoi(getenv("RSTV_CMDDUMP") ? getenv("RSTV_CMDDUMP") : "0")) {
+					// diag: hash of VDP1 RAM ranges listed in the file ("hexaddr bytes" lines), same hash as scratchpad mame/texh.lua
+					FILE *tf = fopen(getenv("RSTV_TEXH"), "r");
+					unsigned ad, nb;
+					while (tf && fscanf(tf, "%x %u", &ad, &nb) == 2) {
+						unsigned long long h = 0;
+						for (unsigned i = 0; i < nb; i++)
+							h = (h * 31 + T1ReadByte(Vdp1Ram, (ad + i) & 0x7FFFF)) % 4294967296ULL;
+						printf("texh %05x %u %08llx\n", ad, nb, h);
+					}
+					if (tf) fclose(tf);
+				}
+				if (getenv("RSTV_CMDDUMP") && f == atoi(getenv("RSTV_CMDDUMP"))) {
+					int b = 0;
+					for (int i = 0; i < 2000; i++) {
+						const u16 ctrl = T1ReadWord(Vdp1Ram, b);
+						if (ctrl & 0x8000) break;
+						if (!(ctrl & 0x4000))
+							printf("cmd f%d i%d ctrl %04x pmod %04x colr %04x srca %05x size %04x xy %d,%d %d,%d %d,%d %d,%d\n", f, i, ctrl,
+								T1ReadWord(Vdp1Ram, b + 4), T1ReadWord(Vdp1Ram, b + 6), T1ReadWord(Vdp1Ram, b + 8) * 8, T1ReadWord(Vdp1Ram, b + 10),
+								(s16)T1ReadWord(Vdp1Ram, b + 12), (s16)T1ReadWord(Vdp1Ram, b + 14), (s16)T1ReadWord(Vdp1Ram, b + 16),
+								(s16)T1ReadWord(Vdp1Ram, b + 18), (s16)T1ReadWord(Vdp1Ram, b + 20), (s16)T1ReadWord(Vdp1Ram, b + 22),
+								(s16)T1ReadWord(Vdp1Ram, b + 24), (s16)T1ReadWord(Vdp1Ram, b + 26));
+						b = (((ctrl >> 12) & 3) == 1) ? T1ReadWord(Vdp1Ram, b + 2) * 8 : b + 32;
+						b &= 0x7FFFF;
+					}
+				}
+			}
+			// RSTV_STAMPCHK: VDP1 RAM pages whose bytes changed this frame without a write stamp (the Vita GPU path
+			// keeps decoded textures until a stamp says the page changed)
+			static int on = -1;
+			static u8 *shadow;
+			static u32 seen[128];
+			if (on < 0) on = getenv("RSTV_STAMPCHK") != NULL;
+			if (on) {
+				extern u32 rstv_vdp1_page_stamp[128];
+				if (!shadow) { shadow = (u8 *)malloc(0x80000); memcpy(shadow, Vdp1Ram, 0x80000); memcpy(seen, rstv_vdp1_page_stamp, sizeof(seen)); }
+				for (int p = 0; p < 128; p++) {
+					if (memcmp(shadow + p * 4096, Vdp1Ram + p * 4096, 4096) && rstv_vdp1_page_stamp[p] == seen[p])
+						printf("stampchk f%d page %d (0x%05x) changed without a stamp\n", f, p, p * 4096);
+					memcpy(shadow + p * 4096, Vdp1Ram + p * 4096, 4096);
+					seen[p] = rstv_vdp1_page_stamp[p];
+				}
 			}
 		}
 		if (checkpoint > 0 && f % checkpoint == 0) {
@@ -588,6 +840,14 @@ int main(int argc, char **argv)
 			}
 			if (getenv("RSTV_FRC")) // diag: master/slave FRT (FRC value, TCR divider)
 				printf("  frc m %04x tcr %02x | s %04x tcr %02x\n", MSH2->onchip.FRC.all, MSH2->onchip.TCR, SSH2->onchip.FRC.all, SSH2->onchip.TCR);
+			if (getenv("RSTV_DMACLOG")) { // diag: on-chip DMA units since the last checkpoint per region pair (type, last addresses)
+				extern unsigned rstv_dmac_hist[64][3];
+				for (int k = 0; k < 64; k++)
+					if (rstv_dmac_hist[k][0])
+						printf("  dmac %02x: %u units/frame type %u last sar %08x dar %07x%c", k, rstv_dmac_hist[k][0] / checkpoint,
+							rstv_dmac_hist[k][2] >> 28, rstv_dmac_hist[k][1], rstv_dmac_hist[k][2] & 0x0FFFFFFF, 10);
+				memset(rstv_dmac_hist, 0, sizeof(rstv_dmac_hist));
+			}
 			if (getenv("RSTV_DMAREG")) { // diag: master/slave on-chip DMA channels 0/1
 				for (int c = 0; c < 2; c++) {
 					SH2_struct *sh = c ? SSH2 : MSH2;
@@ -652,6 +912,44 @@ int main(int argc, char **argv)
 			printf("pc distinct %llu, total %.0f/frame (06070xxx %.0f/frame)\n", distinct, (double)tot / (frames - pchist_from + 1), (double)lo / (frames - pchist_from + 1));
 			(void)0;
 		}
+		if (getenv("RSTV_OPHIST")) {
+			// executed instructions by shape (disassembly with register numbers and immediates removed)
+			enum { NSH = 512 };
+			static char shape[NSH][48];
+			static unsigned long long shn[NSH];
+			int ns = 0;
+			unsigned long long tot = 0;
+			for (u32 k = 0; k < 0x80000; k++) {
+				if (!rstv_pc_hist[k])
+					continue;
+				char str[128], s[48];
+				const u32 a = 0x06000000 + k * 2;
+				SH2Disasm(a, MappedMemoryReadWord(a, NULL), 0, NULL, str);
+				const char *p = strstr(str, ": ");
+				p = p ? p + 2 : str;
+				int n = 0;
+				for (; *p && *p != ';' && n < 47; p++) {
+					if ((p[0] == 'r' && p[1] >= '0' && p[1] <= '9')) { s[n++] = 'R'; while (p[1] >= '0' && p[1] <= '9') p++; }
+					else if (p[0] == '0' && p[1] == 'x') { s[n++] = '#'; p++; while (isxdigit((unsigned char)p[1])) p++; }
+					else if (*p != ' ' || (n && s[n - 1] != ' ')) s[n++] = *p;
+				}
+				while (n && s[n - 1] == ' ') n--;
+				s[n] = 0;
+				int j = 0;
+				while (j < ns && strcmp(shape[j], s)) j++;
+				if (j == ns && ns < NSH) strcpy(shape[ns++], s);
+				if (j < NSH) shn[j] += rstv_pc_hist[k];
+				tot += rstv_pc_hist[k];
+			}
+			for (int t = 0; t < 70; t++) {
+				int b = -1;
+				for (int j = 0; j < ns; j++)
+					if (shn[j] && (b < 0 || shn[j] > shn[b])) b = j;
+				if (b < 0) break;
+				printf("op %5.1f%%  %s\n", 100.0 * shn[b] / tot, shape[b]);
+				shn[b] = 0;
+			}
+		}
 		for (int t = 0; t < (getenv("RSTV_PCN") ? atoi(getenv("RSTV_PCN")) : 40); t++) {
 			u32 best = 0, bi = 0;
 			for (u32 k = 0; k < 0x80000; k++)
@@ -701,7 +999,9 @@ int main(int argc, char **argv)
 	{ extern unsigned rstv_dsp_slices; printf("scu dsp slices %u\n", rstv_dsp_slices); }
 	{ extern unsigned rstv_dsp_insns; printf("scu dsp insns %u\n", rstv_dsp_insns); }
 #ifdef RSTV_DYNAREC
-	{ extern unsigned rstv_dyn_div32_n, rstv_dyn_cont_n, rstv_dyn_divfx_n; printf("dyn div32 %u cont %u divfx %u\n", rstv_dyn_div32_n, rstv_dyn_cont_n, rstv_dyn_divfx_n); }
+	{ extern unsigned rstv_dyn_div32_n, rstv_dyn_cont_n, rstv_dyn_divfx_n, rstv_dyn_litc_n; printf("dyn div32 %u cont %u divfx %u litc %u\n", rstv_dyn_div32_n, rstv_dyn_cont_n, rstv_dyn_divfx_n, rstv_dyn_litc_n); }
+	{ extern unsigned long long rstv_icount[2]; if (rstv_icount[1]) printf("icount arm %llu sh2 %llu (%.2f per sh2 instruction)\n", rstv_icount[0], rstv_icount[1], (double)rstv_icount[0] / rstv_icount[1]); }
+	{ extern unsigned rstv_dyn_rc_n, rstv_dyn_rc_miss[16]; printf("rc native %u miss", rstv_dyn_rc_n); for (int k = 0; k < 16; k++) printf(" %x:%u", k, rstv_dyn_rc_miss[k]); printf("\n"); }
 #endif
 	printf("sh2 core id %d\n", SH2Core ? SH2Core->id : -1);
 	{ extern unsigned rstv_icap_count[2]; printf("input capture writes: master %u slave %u\n", rstv_icap_count[0], rstv_icap_count[1]); }

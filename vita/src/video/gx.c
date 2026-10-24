@@ -342,11 +342,66 @@ static const SceGxmProgram *compile(const char *src, int fragment)
 	return compile_uncached(src, fragment, h);
 }
 
+// ADR-193: while the loading screen is up (gx_busy_cb set, main thread), a compile runs on a helper thread and the
+// main thread calls gx_busy_cb about every 50 ms (the loading bar moves instead of the screen freezing for seconds)
+void (*gx_busy_cb)(void);
+volatile int gx_compiling; // a compile is running on the helper thread (the loading screen says so)
+static SceUID s_busy_thread_owner = -1; // the thread allowed to use gx_busy_cb (the one that set it)
+void gx_set_busy(void (*cb)(void))
+{
+	gx_busy_cb = cb;
+	s_busy_thread_owner = cb ? sceKernelGetThreadId() : -1;
+}
+struct ShJob { const char *src; uint32_t size; int fragment; SceGxmProgram *prog; };
+static int shark_job(SceSize args, void *argp)
+{
+	struct ShJob *j = *(struct ShJob **)argp;
+	(void)args;
+	j->prog = shark_compile_shader_extended(j->src, &j->size, j->fragment ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER,
+		SHARK_OPT_FAST, 1, 0, 1);
+	return 0;
+}
+static SceGxmProgram *shark_compile_busy(const char *src, uint32_t *size, int fragment)
+{
+	if (gx_busy_cb && sceKernelGetThreadId() == s_busy_thread_owner) {
+		struct ShJob j = { src, *size, fragment, NULL }, *jp = &j;
+		// CPU2: the render worker is not running yet; on CPU1 the spinning sound thread would starve it (ADR-185)
+		SceUID t = sceKernelCreateThread("rstv_shjob", shark_job, 160, 0x400000, 0, SCE_KERNEL_CPU_MASK_USER_2, NULL);
+		if (t >= 0 && sceKernelStartThread(t, sizeof(jp), &jp) >= 0) {
+			gx_compiling = 1;
+			for (;;) {
+				SceUInt to = 50000;
+				if (sceKernelWaitThreadEnd(t, NULL, &to) >= 0)
+					break;
+				gx_busy_cb();
+			}
+			sceKernelDeleteThread(t);
+			gx_compiling = 0;
+			*size = j.size;
+			return j.prog;
+		}
+		if (t >= 0)
+			sceKernelDeleteThread(t);
+	}
+	return shark_compile_shader_extended(src, size, fragment ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, SHARK_OPT_FAST, 1, 0, 1);
+}
+
 static const SceGxmProgram *compile_uncached(const char *src, int fragment, uint32_t h)
 {
 	char path[96];
 	snprintf(path, sizeof(path), SHADER_DIR "/%08x.gxp", (unsigned)h);
-	FILE *f = fopen(path, "rb");
+	FILE *f = NULL;
+#ifdef RSTV_DEBUG_TOOLS
+	static int s_fresh = -1; // test: ux0:data/restv/shcfresh compiles fragment shaders again instead of reading the cache
+	if (s_fresh < 0) {
+		FILE *ff = fopen("ux0:data/restv/shcfresh", "rb");
+		s_fresh = ff != NULL;
+		if (ff)
+			fclose(ff);
+	}
+	if (!(s_fresh && fragment))
+#endif
+	f = fopen(path, "rb");
 	if (f) {
 		fseek(f, 0, SEEK_END);
 		long n = ftell(f);
@@ -363,8 +418,7 @@ static const SceGxmProgram *compile_uncached(const char *src, int fragment, uint
 	shark_install_log_cb(shark_log);
 	uint32_t size = (uint32_t)strlen(src); // in: source length, out: GXP size
 	// same options as vitaGL defaults (FAST, fastmath, fastint)
-	SceGxmProgram *prog = shark_compile_shader_extended(src, &size, fragment ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER,
-		SHARK_OPT_FAST, 1, 0, 1);
+	SceGxmProgram *prog = shark_compile_busy(src, &size, fragment);
 	if (!prog || !size) {
 		shark_clear_output();
 		{

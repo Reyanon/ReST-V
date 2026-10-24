@@ -272,7 +272,7 @@ extern _EachClock, _DelayEachClock, _DebugEachClock, _DebugDelayClock
 // r9   <- Clock Counter
 .global prologue
 prologue:
-push {r4-r10, lr}   // push regs
+push {r3-r11, lr}   // push regs (ReST-V ADR-135: r11 for the register cache, r3 keeps 8-byte alignment)
 mov r7, r0      // GenReg( r0 has adress of m_pDynaSh2)
 LDR_PC r8       // PC
 LDR_COUNT r9    // ClockCounter
@@ -365,7 +365,7 @@ STR_COUNT r9  // store to memory
 CALL_EACHCLOCK
 tst r0, #1
 bne seperator_d_normal.continue
-pop {r4-r10, pc} // pop regs and resturn
+pop {r3-r11, pc} // pop regs and resturn
 seperator_d_normal.continue:
 
 //------------------------------------------------------
@@ -383,7 +383,7 @@ add r8, #2    // PC += 2
 STR_PC r8
 add r9, #1    // Clock += 1  
 STR_COUNT r9
-pop {r4-r10, pc} // pop regs and resturn
+pop {r3-r11, pc} // pop regs and resturn
 seperator_d_delay.continue:
 mov r8, r0    // copy jump addr
 sub r8, #2    // PC -= 2

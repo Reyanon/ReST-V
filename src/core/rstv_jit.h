@@ -15,6 +15,8 @@ extern "C" {
 // rstv_jit_code_alloc then hands out this reservation.
 int rstv_jit_code_reserve(size_t size);
 void *rstv_jit_code_alloc(size_t size);
+// bytes rstv_jit_code_alloc can still hand out (Vita; (size_t)-1 elsewhere)
+size_t rstv_jit_code_avail(void);
 // Reserved region (Vita), for the startup self test. NULL if nothing reserved
 void *rstv_jit_code_region(size_t *size);
 // Call before writing generated code (or any data inside the code region)

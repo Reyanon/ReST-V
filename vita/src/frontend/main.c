@@ -38,6 +38,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include "platform/log.h"
 #include "platform/timer.h"
 #include "video/gvdp2.h"
+#include "video/gx.h"
 #include "video/video.h"
 
 #define DATA_DIR "ux0:data/restv"
@@ -68,6 +69,7 @@ static volatile int s_ee_pending;
 // ADR-090: the exit request file (ux0:data/restv/exit) is also checked by this thread. The main loop called sceIoGetstat every 120 frames
 // and stalled 0.5-1.8 s when that overlapped a card write (g2 f5820·f6060, underruns 85·320)
 static volatile int s_exit_req;
+static volatile int s_exit_next; // the exit file says "next": relaunch the app (autostart picks the next game, no home screen)
 static int async_writer_thread(SceSize args, void *argp)
 {
 	(void)args;
@@ -77,6 +79,13 @@ static int async_writer_thread(SceSize args, void *argp)
 		if (tick % 10 == 9) {
 			SceIoStat st;
 			if (sceIoGetstat(DATA_DIR "/exit", &st) >= 0) {
+				char c = 0;
+				SceUID xf = sceIoOpen(DATA_DIR "/exit", SCE_O_RDONLY, 0);
+				if (xf >= 0) {
+					sceIoRead(xf, &c, 1);
+					sceIoClose(xf);
+				}
+				s_exit_next = c == 'n';
 				sceIoRemove(DATA_DIR "/exit");
 				s_exit_req = 1;
 			}
@@ -110,7 +119,7 @@ static void writer_start(void)
 	if (started)
 		return;
 	started = 1;
-	SceUID t = sceKernelCreateThread("rstv_writer", async_writer_thread, 120, 0x4000, 0, SCE_KERNEL_CPU_MASK_USER_0, NULL);
+	SceUID t = sceKernelCreateThread("rstv_writer", async_writer_thread, 120, 0x4000, 0, 0x80000, NULL); // CPU3 (ADR-147)
 	if (t >= 0)
 		sceKernelStartThread(t, 0, NULL);
 }
@@ -155,8 +164,95 @@ static int file_exists(const char *path)
 	return sceIoGetstat(path, &st) >= 0;
 }
 
+// Measurement (ux0:data/restv/coretest): how much a spinning thread gets on each core mask, and the thread pointer register
+static volatile unsigned s_ct_count, s_ct_tp;
+static int core_test_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	unsigned tp;
+	__asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+	s_ct_tp = tp;
+	const uint64_t t0 = rstv_time_us();
+	unsigned n = 0;
+	while (rstv_time_us() - t0 < 300000)
+		n++;
+	s_ct_count = n;
+	return 0;
+}
+static volatile int s_ct_block;
+static int core_block_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	const uint64_t t0 = rstv_time_us();
+	while (s_ct_block && rstv_time_us() - t0 < 700000) // ends by itself: never leave spinning threads behind
+		__asm__ volatile("" ::: "memory");
+	return 0;
+}
+static void rstv_core_test(void)
+{
+	unsigned tp;
+	__asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+	RSTV_LOG("coretest: main tp %08x", tp);
+	static const int masks[5] = { 0x10000, 0x20000, 0x40000, 0x80000, 0 };
+	for (int k = 0; k < 5; k++) {
+		s_ct_count = 0;
+		s_ct_tp = 0;
+		SceUID t = sceKernelCreateThread("rstv_coretest", core_test_thread, 64, 0x4000, 0, masks[k], NULL);
+		int rs = t >= 0 ? sceKernelStartThread(t, 0, NULL) : -1;
+		SceUInt t1 = 2000000;
+		if (t >= 0 && rs >= 0)
+			sceKernelWaitThreadEnd(t, NULL, &t1);
+		RSTV_LOG("coretest: mask %05x create %08x start %08x count %u tp %08x", masks[k], (unsigned)t, (unsigned)rs, s_ct_count, s_ct_tp);
+		sceKernelDelayThread(100000);
+		if (t >= 0)
+			sceKernelDeleteThread(t);
+	}
+	// cores 1 and 2 busy with spinning threads of the same priority (core 0 stays free for the main thread), then each mask again
+	for (int k = 1; k < 4; k++) {
+		SceUID b[3];
+		s_ct_block = 1;
+		for (int c = 1; c < 3; c++) {
+			b[c] = sceKernelCreateThread("rstv_coreblk", core_block_thread, 64, 0x4000, 0, 0x10000 << c, NULL);
+			sceKernelStartThread(b[c], 0, NULL);
+		}
+		s_ct_count = 0;
+		SceUID t = sceKernelCreateThread("rstv_coretest", core_test_thread, 64, 0x4000, 0, masks[k], NULL);
+		sceKernelStartThread(t, 0, NULL);
+		SceUInt tmo = 2000000;
+		sceKernelWaitThreadEnd(t, NULL, &tmo);
+		s_ct_block = 0;
+		for (int c = 1; c < 3; c++) {
+			SceUInt tb = 2000000;
+			sceKernelWaitThreadEnd(b[c], NULL, &tb);
+			sceKernelDeleteThread(b[c]);
+		}
+		sceKernelDeleteThread(t);
+		RSTV_LOG("coretest: busy 1-2, mask %05x count %u", masks[k], s_ct_count);
+		sceKernelDelayThread(100000); // the log sends at most 30 lines a second
+	}
+}
+
 // One-shot autostart request from measurement tools (ux0:data/restv/autostart = set name). Read and delete. If present, start that set without the menu
 static int s_autostart;
+// Measurement auto input (ux0:data/restv/autoinput.txt): debug builds only, and only for a game the measurement tools
+// started (autostart). The file is deleted once read, so a left-over file never presses keys in normal play (owner).
+static FILE *auto_input_open(void)
+{
+#ifdef RSTV_DEBUG_TOOLS
+	if (s_autostart)
+		return fopen(DATA_DIR "/autoinput.txt", "r");
+#endif
+	return NULL;
+}
+static void auto_input_close(FILE *af)
+{
+	if (af) {
+		fclose(af);
+		sceIoRemove(DATA_DIR "/autoinput.txt");
+	}
+}
 static const char *pick_game(char *buf, int len)
 {
 	SceUID fd = sceIoOpen(DATA_DIR "/autostart", SCE_O_RDONLY, 0);
@@ -202,6 +298,13 @@ static const char *pick_game(char *buf, int len)
 // Input (ADR-094·095): d-pad and analog stick (setting: off/left/right/both) = lever, buttons 1-4 = configured Vita buttons, SELECT = coin,
 // START = start. Buttons of system combos (SELECT+START menu, SELECT+L quick save, SELECT+R quick load; same as Reirem) are not passed
 // to the game
+static int s_test_frames; // frames left of the TEST switch press from the menu
+#ifdef RSTV_DEBUG_TOOLS
+// debug only (owner: not in released builds): ux0:data/restv/fastboot = frame number (empty: 1300). Up to that frame the
+// emulation runs flat out without composing or presenting (the BIOS boot screens), then normally. Measuring helper
+int rstv_fastboot_until, rstv_fastboot_now;
+#endif
+int rstv_test_session;     // after the menu's TEST switch press: L = SERVICE (move), R = TEST (enter) in the BIOS test menu
 static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigned frame)
 {
 	uint32_t b = pad->buttons;
@@ -229,6 +332,16 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 		if (pad->rx < 80) p |= STV_IN_LEFT;
 		if (pad->rx > 176) p |= STV_IN_RIGHT;
 	}
+	if (rstv_input_rot) {
+		// ADR-190: the Vita is held turned (Vertical L / R): turn the screen directions back into the game's
+		// (90: screen right = game up; 270: screen left = game up)
+		const int u = (p & STV_IN_UP) != 0, d = (p & STV_IN_DOWN) != 0, l = (p & STV_IN_LEFT) != 0, r = (p & STV_IN_RIGHT) != 0;
+		p &= (uint8_t)~(STV_IN_UP | STV_IN_DOWN | STV_IN_LEFT | STV_IN_RIGHT);
+		if (rstv_input_rot == 90)
+			p |= (r ? STV_IN_UP : 0) | (l ? STV_IN_DOWN : 0) | (u ? STV_IN_LEFT : 0) | (d ? STV_IN_RIGHT : 0);
+		else
+			p |= (l ? STV_IN_UP : 0) | (r ? STV_IN_DOWN : 0) | (d ? STV_IN_LEFT : 0) | (u ? STV_IN_RIGHT : 0);
+	}
 	static const uint8_t stv_btn[4] = { STV_IN_B1, STV_IN_B2, STV_IN_B3, STV_IN_B4 };
 	// ADR-097·126 turbo (same as Reirem): while the turbo key (None = off) is held, the turbo button is pressed for the first half of each period
 	// (Turbo speed: 4/6/8 frames) and released for the second half. The turbo key's normal mapping is not used
@@ -247,6 +360,16 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 		s |= STV_SYS_COIN1;
 	if (nb & rstv_key_code(g_set.keymap[RSTV_ACT_START]))
 		s |= STV_SYS_START1;
+	if (s_test_frames > 0) { // menu "Test mode (BIOS menu)"
+		s_test_frames--;
+		s |= STV_SYS_TEST;
+	}
+	if (rstv_test_session) {
+		if (b & SCE_CTRL_LTRIGGER)
+			s |= STV_SYS_SERVICE;
+		if (b & SCE_CTRL_RTRIGGER)
+			s |= STV_SYS_TEST;
+	}
 	*p1 = p;
 	*sys = s;
 	if (stv_io_type == STV_IO_MAHJONG) {
@@ -289,9 +412,13 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 
 // Start screen (ADR-094, Reirem list style): supported sets in roms. Cursor starts on the last picked game (game.txt); waits until one is picked.
 // Measurement tools skip it with the autostart file (pick_game). Starts directly if there is only one set. The picked set is kept in game.txt
+// ADR-191: the loading bar: ROMs 0-70%, GPU set-up (shaders, preloaded variants: seconds) 70-100%
+static void load_rom_progress(int p) { rstv_loading_progress(p * 7 / 10); }
+static void load_gpu_progress(int p) { rstv_loading_progress(700 + p * 3 / 10); }
+
 static const char *game_menu(char *buf, int len)
 {
-	const char *set = rstv_game_select(buf, ROM_DIR);
+	const char *set = rstv_game_select(buf[0] ? buf : NULL, ROM_DIR);
 	snprintf(buf, len, "%s", set);
 	write_text_file(DATA_DIR "/game.txt", buf, 0);
 	return buf;
@@ -316,10 +443,11 @@ static void fatal_screen(uint32_t abgr)
 
 // vita-elf-create appends SCE data (a few KB) to the end of the text segment. If text ends just below a 1MB boundary it overlaps the data segment
 // and fails, so push text past the boundary with read-only padding (adjust the size if build error "segment 1 overlaps" shows up again)
-__attribute__((used)) static const unsigned char s_text_pad[24 * 1024] = { 1 };
+__attribute__((used)) static const unsigned char s_text_pad[28 * 1024] = { 1 };
 
 static unsigned s_spike_us = 25000; // late frame log threshold (us)
 static int s_spike_sampler;         // if the sampling profiler is on, log top blocks on every late frame
+extern unsigned long long rstv_snd_wall_us, rstv_snd_lat_us, rstv_snd_gap_us; extern unsigned rstv_snd_posts; // sound thread wall time of its frames, wake latency (scsp.c)
 static int s_quit_mode;             // ADR-094 menu: 1 = quit, 2 = back to game select (relaunch app)
 
 // ---- Sega System C / C2 (ADR-107): 68000 board. Video via CPU texture, sound at 44.1kHz into the same audio ring buffer ----
@@ -404,7 +532,7 @@ static void c2_loop(const char *game, const char *jit_msg)
 	uint8_t auto_bits[64], auto_p1[64];
 	int n_auto = 0;
 	{
-		FILE *af = fopen(DATA_DIR "/autoinput.txt", "r");
+		FILE *af = auto_input_open();
 		unsigned fno;
 		char what[16];
 		while (af && n_auto < 64 && fscanf(af, "%u %15s", &fno, what) == 2) {
@@ -415,8 +543,7 @@ static void c2_loop(const char *game, const char *jit_msg)
 				!strcmp(what, "b3") ? STV_IN_B3 : !strcmp(what, "b4") ? STV_IN_B4 : 0;
 			n_auto++;
 		}
-		if (af)
-			fclose(af);
+		auto_input_close(af);
 	}
 	// capture for measurement: shot_<frame>_gpu.ppm for each frame number in ux0:data/restv/shot.txt (same name as ST-V, fetched by stshots.sh)
 	unsigned shot_at[16];
@@ -534,8 +661,9 @@ static void c2_loop(const char *game, const char *jit_msg)
 			rstv_video_present();
 			static uint64_t s_last;
 			const uint64_t now = rstv_time_us();
-			if (s_last && now - s_last > 17500 && now - tp0 < 1500)
-				sceKernelDelayThread(1000); // late frame: yield to the shell (vitacompanion) and the exit watcher thread
+			static unsigned s_late;
+			if (s_last && now - s_last > 17500 && now - tp0 < 1500 && (++s_late & 3) == 0)
+				sceKernelDelayThread(1000); // late frames: yield to the shell (vitacompanion), every 4th (ADR-147)
 			s_last = rstv_time_us();
 		}
 		++frame;
@@ -590,7 +718,9 @@ static void c2_loop(const char *game, const char *jit_msg)
 	}
 }
 
-int main(void)
+unsigned rstv_v1log_from, rstv_v1log_to;
+int rstv_v1log_n; // diag: VDP1 GPU list lines left to log (ux0:data/restv/v1log)
+int main(int argc, char *argv[])
 {
 	// main (SH-2, SCU, VDP) = CPU0, SCSP/68K thread = CPU1 (thr-restv.c), helper drawing = CPU2
 	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
@@ -599,6 +729,14 @@ int main(void)
 	rstv_clock_boost();
 	const int mhz_start = rstv_clock_measure_arm_mhz(); // measured before any other thread exists
 	rstv_log_init();
+	{
+		int restarted = 0; // (started again by rstv_kctrl_init: "kctrl" among the arguments)
+		for (int i = 0; i < argc; i++)
+			restarted |= argv[i] && !strcmp(argv[i], "kctrl");
+		rstv_kctrl_init(restarted);
+	}
+	if (file_exists(DATA_DIR "/coretest"))
+		rstv_core_test(); // before any other thread exists
 	sceIoMkdir(DATA_DIR, 0777);
 	sceIoMkdir(ROM_DIR, 0777);
 
@@ -619,7 +757,9 @@ int main(void)
 	rstv_settings_load();
 	rstv_settings_apply_video();
 	const char *game = pick_game(game_buf, sizeof(game_buf));
-	if (game && !s_autostart)
+	if (!game)
+		game_buf[0] = 0; // owner: the game list also without ROMs (R in the list reads the folder again)
+	if (!s_autostart)
 		game = game_menu(game_buf, sizeof(game_buf));
 	if (!game) {
 		write_text_file(DATA_DIR "/last_error.txt", "no supported set in " ROM_DIR "\n", 0);
@@ -653,22 +793,90 @@ int main(void)
 		rstv_prof_clock = NULL;
 	// SH-2 and other fine timing (inside loops) only when ux0:data/restv/proffine exists
 	rstv_prof_fine = file_exists(DATA_DIR "/proffine");
+	{
+		extern int rstv_chain_prof; // ADR-135: block chaining with the sampler's block PC and the chain count
+		rstv_chain_prof = rstv_prof_fine || file_exists(DATA_DIR "/sampler");
+		// ADR-136: slave SH-2 on its own thread (CPU2) when ux0:data/restv/slaveasync exists; its content: slices of lag
+		extern int rstv_slave_cfg, rstv_slave_lead;
+		FILE *sf = fopen(DATA_DIR "/slaveasync", "r");
+		if (sf) {
+			int lead = 0, spin = -1;
+			extern int rstv_slave_spin;
+			if (fscanf(sf, "%d %d", &lead, &spin) >= 1 && lead > 0 && lead <= 48)
+				rstv_slave_lead = lead;
+			if (spin >= 0)
+				rstv_slave_spin = spin;
+			fclose(sf);
+			rstv_slave_cfg = 1;
+		}
+	}
+	{ // diag: VDP1 GPU list / FBCR lines for frames "from to" in ux0:data/restv/v1log
+		extern int rstv_v1log_n;
+		FILE *lf = fopen(DATA_DIR "/v1log", "r");
+		if (lf) {
+			rstv_v1log_n = 3000;
+			if (fscanf(lf, "%u %u", &rstv_v1log_from, &rstv_v1log_to) != 2) { rstv_v1log_from = 0; rstv_v1log_to = 0xFFFFFFFFu; }
+			fclose(lf);
+		}
+	}
+	{ extern int rstv_v1_fullsnap; rstv_v1_fullsnap = file_exists(DATA_DIR "/v1full"); }
 	// VDP1 drawing helper thread (CPU2). Disabled if ux0:data/restv/novdp1thr exists
 	extern int rstv_vdp1_thread;
 	rstv_vdp1_thread = !file_exists(DATA_DIR "/novdp1thr");
 	// sound runs one frame behind (overlapped with SH-2). Disabled if ux0:data/restv/nosndlag exists
 	extern int rstv_scsp_lag;
 	rstv_scsp_lag = !file_exists(DATA_DIR "/nosndlag");
+	{ // ADR-158: SCSP DSP on CPU3, one batch behind the slots (ux0:data/restv/nodspthr = on the sound thread)
+		extern int rstv_scsp_dsp_thread;
+		rstv_scsp_dsp_thread = !file_exists(DATA_DIR "/nodspthr");
+	}
 	// run the 9 decilines before HBlankIN as one SH-2 slice (1/5 the calls). Disabled if ux0:data/restv/nomerge exists
 	extern int rstv_deciline_merge;
 	rstv_deciline_merge = !file_exists(DATA_DIR "/nomerge");
 	// recompiler fast memory functions for high-speed RAM (ADR-017). Disabled if ux0:data/restv/nomemfast exists
 	extern int rstv_memfast;
 	rstv_memfast = !file_exists(DATA_DIR "/nomemfast");
+#ifdef RSTV_DEBUG_TOOLS
+	{
+		FILE *ff = fopen(DATA_DIR "/fastboot", "r");
+		if (ff) {
+			int n = 0;
+			rstv_fastboot_until = fscanf(ff, "%d", &n) == 1 && n > 0 ? n : 1300;
+			fclose(ff);
+			RSTV_LOG("fastboot: to f%d (debug build)", rstv_fastboot_until);
+		}
+	}
+#endif
+	{ // diag: ux0:data/restv/pctrap = hex PC of a master block to log registers at (DynarecSh2.cpp)
+		extern u32 rstv_dev_trap;
+		FILE *tf = fopen(DATA_DIR "/pctrap", "r");
+		if (tf) {
+			unsigned v = 0, f0 = 0, f1 = 0;
+			extern u32 rstv_dev_trace_from, rstv_dev_trace_to;
+			const int n = fscanf(tf, "%x %u %u", &v, &f0, &f1);
+			if (n >= 1)
+				rstv_dev_trap = v;
+			if (n == 3) {
+				rstv_dev_trace_from = f0;
+				rstv_dev_trace_to = f1;
+				extern int rstv_chain_trace_on, rstv_chain_prof;
+				rstv_chain_trace_on = 1;
+				rstv_chain_prof = 1; // the chain variant with the trace hook
+			}
+			fclose(tf);
+		}
+	}
 	// recompiler block chaining (ADR-018). Disabled if ux0:data/restv/nochain exists
 	// SCU DMA completes instantly (ux0:data/restv/dmainstant, experimental)
 	extern int rstv_dma_instant;
 	rstv_dma_instant = file_exists(DATA_DIR "/dmainstant");
+	extern int rstv_v1_force_cpu;
+	rstv_v1_force_cpu = file_exists(DATA_DIR "/v1cpu"); // diag: VDP1 on the CPU (reference for the GPU renderer)
+	{ // diag: ux0:data/restv/v1skip = bit mask of VDP1 GPU item kinds to leave out (1 tex, 2 poly, 4 erase, 8 line)
+		extern int v1gpu_skip_kinds;
+		FILE *kf = fopen(DATA_DIR "/v1skip", "r");
+		if (kf) { if (fscanf(kf, "%d", &v1gpu_skip_kinds) != 1) v1gpu_skip_kinds = 0; fclose(kf); }
+	}
 	extern int rstv_chain_on;
 	rstv_chain_on = !file_exists(DATA_DIR "/nochain");
 	{
@@ -692,17 +900,21 @@ int main(void)
 		extern void (*rstv_load_progress)(int permille);
 		const StvGameInfo *gi = STVFindGame(game);
 		rstv_loading_title(gi && gi->name ? gi->name : game);
-		rstv_load_progress = rstv_loading_progress;
+		rstv_load_progress = load_rom_progress;
+		extern void (*rstv_load_tick)(void);
+		rstv_load_tick = rstv_loading_tick;
 		rstv_loading_progress(0);
 	}
 	const int init_rc = rstv_emu_init(ROM_DIR, game, use_dynarec, err, sizeof(err));
 	{
 		extern void (*rstv_load_progress)(int permille);
 		rstv_load_progress = NULL;
-		rstv_loading_progress(1000);
-		rstv_loading_done();
+		extern void (*rstv_load_tick)(void);
+		rstv_load_tick = NULL;
+		rstv_loading_progress(700); // the GPU set-up below fills the rest (ADR-191)
 	}
 	if (init_rc != 0) {
+		rstv_loading_done();
 		RSTV_LOG("init failed: %s", err);
 		write_text_file(DATA_DIR "/last_error.txt", err, 0);
 		fatal_screen(0xFF0000C0u); // red: init failed
@@ -724,6 +936,31 @@ int main(void)
 	}
 	if (file_exists(DATA_DIR "/spike17"))
 		s_spike_us = 17000;
+	// ADR-175: RAX DSP block compiler, opt-in while it is being checked on the device (ux0:data/restv/raxjit)
+	{ // ADR-177 RAX block compiler (on by default): ux0:data/restv/raxjit holds 0 = off, 1 = copy blocks only, 2 = on
+		SceUID jf = sceIoOpen(DATA_DIR "/raxjit", SCE_O_RDONLY, 0);
+		if (jf >= 0) {
+			char c = 0;
+			sceIoRead(jf, &c, 1);
+			sceIoClose(jf);
+			extern int rstv_rax_jit_on;
+			rstv_rax_jit_on = c == '0' ? 0 : c == '1' ? 1 : 2; // 0 off, 1 copy only (check), 2 on
+		}
+	}
+	{ // ADR-176 (check): ux0:data/restv/raxthr = 2 or 3 runs the RAX board on its own thread on that CPU
+		SceUID tf = sceIoOpen(DATA_DIR "/raxthr", SCE_O_RDONLY, 0);
+		if (tf >= 0) {
+			char c = 0;
+			sceIoRead(tf, &c, 1);
+			sceIoClose(tf);
+			extern int rstv_rax_thread_cpu;
+			rstv_rax_thread_cpu = c - '0';
+		}
+	}
+	if (file_exists(DATA_DIR "/raxbench")) { // ADR-175 diag: RAX handler timing
+		extern void rstv_rax_bench(void);
+		rstv_rax_bench();
+	}
 	// disable native execution of game C library routines (ux0:data/restv/nohle, ADR-045)
 	if (file_exists(DATA_DIR "/nohle")) {
 		extern int rstv_hle_on;
@@ -767,7 +1004,14 @@ int main(void)
 		rstv_probe_on = file_exists(DATA_DIR "/probe"); // measurement: per-section times on spike lines
 	}
 	gvdp2_set_game(game);
+	extern void (*gvdp2_progress)(int permille);
+	gvdp2_progress = load_gpu_progress;
+	gx_set_busy(rstv_loading_tick); // ADR-193: shader compiles keep the loading bar moving
 	const int use_gpu = !file_exists(DATA_DIR "/cpucompose") && gvdp2_init() == 0;
+	gx_set_busy(NULL);
+	gvdp2_progress = NULL;
+	rstv_loading_progress(1000);
+	rstv_loading_done();
 
 	// perf log: average and max every 60 frames, appended to file every 600 frames
 	char perf_path[128];
@@ -815,7 +1059,7 @@ int main(void)
 			RSTV_LOG("poke: %d entries (first %08x = %02x)", n_poke, poke_addr[0], poke_val[0]);
 	}
 	{
-		FILE *af = fopen(DATA_DIR "/autoinput.txt", "r");
+		FILE *af = auto_input_open();
 		unsigned fno;
 		char what[16];
 		while (af && n_auto < 64 && fscanf(af, "%u %15s", &fno, what) == 2) {
@@ -830,8 +1074,7 @@ int main(void)
 			else
 				n_auto++;
 		}
-		if (af)
-			fclose(af);
+		auto_input_close(af);
 	}
 	// Save state: ux0:data/restv/state/<set>.yss. L+START saves immediately, holding R+START for 1 s loads.
 	// Measurement: if ux0:data/restv/loadstate exists (content = frame number, after BIOS boot), auto-load at that frame and
@@ -877,7 +1120,7 @@ int main(void)
 	writer_start(); // exit request check (ADR-090)
 	if (use_sampler) {
 		rstv_sampler_start();
-		s_spike_sampler = 1;
+		s_spike_sampler = !file_exists(DATA_DIR "/sampwhole"); // sampwhole: whole windows only (late frames do not reset them)
 	}
 	uint64_t win_start = rstv_time_us(), emu_sum = 0, emu_max = 0, pres_sum = 0, pres_max = 0;
 	uint32_t frame = 0;
@@ -909,6 +1152,7 @@ int main(void)
 					break;
 				case RSTV_MENU_RESET:
 					rstv_emu_reset();
+					rstv_test_session = 0;
 					rstv_osd_show("Game reset");
 					done = 1;
 					break;
@@ -931,6 +1175,15 @@ int main(void)
 					break;
 				case RSTV_MENU_EXIT:
 					s_quit_mode = 1;
+					done = 1;
+					break;
+				case RSTV_MENU_TEST:
+					// owner: an action, not a toggle: every press is one TEST switch press (the board enters its test
+					// menu on one press and leaves it on the next). L / R work as SERVICE / TEST until the next press
+					s_test_frames = 12; // the TEST switch held for 12 frames
+					rstv_test_session = !rstv_test_session;
+					rstv_osd_show(rstv_test_session ? "TEST switch pressed - in the test menu: L = Service (select), R = Test (enter)"
+						: "TEST switch pressed");
 					done = 1;
 					break;
 				default:
@@ -991,12 +1244,16 @@ int main(void)
 		}
 		unsigned long long sp_pw, sp_pwait, sp_draw;
 		gvdp2_peek_times(&sp_pw, &sp_pwait, &sp_draw);
+		const u64 sp_v1t = rstv_prof_us[RSTV_PROF_VDP1_THREAD], sp_v1w = rstv_prof_us[RSTV_PROF_VDP1_WAIT];
 		extern unsigned rstv_hle_runs, rstv_hle_bytes, rstv_hle_us[8];
 		const unsigned sp_hr = rstv_hle_runs, sp_hb = rstv_hle_bytes;
 		unsigned sp_hus = 0;
 		for (int k = 0; k < 8; k++)
 			sp_hus += rstv_hle_us[k];
 		uint64_t t0 = rstv_time_us();
+#ifdef RSTV_DEBUG_TOOLS
+		rstv_fastboot_now = frame < rstv_fastboot_until;
+#endif
 		rstv_emu_run_frame(p1, 0, sys);
 		for (int k = 0; k < n_poke; k++)
 			MappedMemoryWriteByteNocache(poke_addr[k], poke_val[k]);
@@ -1017,7 +1274,9 @@ int main(void)
 				extern unsigned rstv_probe_us[12], rstv_probe_smpc_cmd, rstv_probe_smpc_us;
 				unsigned long long pw, pwait, pdraw;
 				gvdp2_peek_times(&pw, &pwait, &pdraw);
-				RSTV_LOG("spike f%u video prep %llu wait %llu draw %llu us", frame, pw - sp_pw, pwait - sp_pwait, pdraw - sp_draw);
+				RSTV_LOG("spike f%u video prep %llu wait %llu draw %llu us v1thr %u v1wait %u us", frame, pw - sp_pw, pwait - sp_pwait,
+					pdraw - sp_draw, (unsigned)(rstv_prof_us[RSTV_PROF_VDP1_THREAD] - sp_v1t),
+					(unsigned)(rstv_prof_us[RSTV_PROF_VDP1_WAIT] - sp_v1w));
 				if (rstv_probe_on)
 					RSTV_LOG("spike f%u probe msh2 %u ssh2 %u vbin %u vbout %u scu %u m68k %u smpc %u (cmd %02x %u) scsp %u hbin %u hbout %u cs2 %u us", frame,
 						rstv_probe_us[0], rstv_probe_us[1], rstv_probe_us[2], rstv_probe_us[3], rstv_probe_us[4], rstv_probe_us[5],
@@ -1072,6 +1331,9 @@ int main(void)
 		}
 
 		uint64_t tp0 = rstv_time_us();
+#ifdef RSTV_DEBUG_TOOLS
+		if (!rstv_fastboot_now)
+#endif
 		rstv_video_present();
 		uint64_t tp = rstv_time_us() - tp0;
 		pres_sum += tp;
@@ -1082,7 +1344,9 @@ int main(void)
 		{
 			static uint64_t s_last_present;
 			const uint64_t now = rstv_time_us();
-			if (s_last_present && now - s_last_present > 17500 && tp < 1500)
+			// ADR-147: every 4th late frame only (1 ms a frame was 5% of a 48 fps game); the exit watcher is on CPU3 now
+			static unsigned s_late;
+			if (s_last_present && now - s_last_present > 17500 && tp < 1500 && (++s_late & 3) == 0)
 				sceKernelDelayThread(1000);
 			s_last_present = rstv_time_us();
 		}
@@ -1142,7 +1406,7 @@ int main(void)
 			const uint32_t ain = as.in_total - s_in_prev, aout = as.out_total - s_out_prev;
 			s_in_prev = as.in_total;
 			s_out_prev = as.out_total;
-			snprintf(line, sizeof(line), "f%u emu %.2f/%.2fms fps %.2f %dx%d aud %d %dppm und %u ovf %u in %u out %u | msh2 %.1f ssh2 %.1f vdp %.1f (v1 %.1f v2 %.1f cmp %.1f) snd %.1f oth %.1f | sndthr %.1f (68k %.1f dsp %.1f slots %.1f) sndwait %.1f v1thr %.1f v1wait %.1f | lt N0 %.2f N1 %.2f N2 %.2f N3 %.2f R0 %.2f\n",
+			snprintf(line, sizeof(line), "f%u emu %.2f/%.2fms fps %.2f %dx%d aud %d %dppm und %u ovf %u in %u out %u | msh2 %.1f ssh2 %.1f vdp %.1f (v1 %.1f v2 %.1f cmp %.1f) snd %.1f oth %.1f | sndthr %.1f (68k %.1f dsp %.1f slots %.1f) sndwait %.1f wall %.1f lat %.2f gap %.1f/%u v1thr %.1f v1wait %.1f | lt N0 %.2f N1 %.2f N2 %.2f N3 %.2f R0 %.2f\n",
 				frame, emu_sum / 60 / 1000.0, emu_max / 1000.0, 60.0 * 1e6 / (double)(now - win_start), w, h, as.fill, as.drc_ppm,
 				und, as.overflows, ain, aout,
 				rstv_prof_us[RSTV_PROF_MSH2] / 60000.0, rstv_prof_us[RSTV_PROF_SSH2] / 60000.0,
@@ -1151,11 +1415,31 @@ int main(void)
 				rstv_prof_us[RSTV_PROF_SOUND] / 60000.0, rstv_prof_us[RSTV_PROF_OTHER] / 60000.0,
 				rstv_prof_us[RSTV_PROF_SND_THREAD] / 60000.0, rstv_prof_us[RSTV_PROF_SND_68K] / 60000.0,
 				rstv_prof_us[RSTV_PROF_SND_DSP] / 60000.0, rstv_prof_us[RSTV_PROF_SND_SLOTS] / 60000.0,
-				rstv_prof_us[RSTV_PROF_SND_WAIT] / 60000.0,
+				rstv_prof_us[RSTV_PROF_SND_WAIT] / 60000.0, rstv_snd_wall_us / 60000.0, rstv_snd_lat_us / 60000.0, rstv_snd_posts ? rstv_snd_gap_us / 1000.0 / rstv_snd_posts : 0.0, rstv_snd_posts,
 				rstv_prof_us[RSTV_PROF_VDP1_THREAD] / 60000.0,
 				rstv_prof_us[RSTV_PROF_VDP1_WAIT] / 60000.0, rstv_prof_us[RSTV_PROF_L_N0] / 60000.0,
 				rstv_prof_us[RSTV_PROF_L_N1] / 60000.0, rstv_prof_us[RSTV_PROF_L_N2] / 60000.0, rstv_prof_us[RSTV_PROF_L_N3] / 60000.0,
 				rstv_prof_us[RSTV_PROF_L_R0] / 60000.0);
+			rstv_snd_wall_us = rstv_snd_lat_us = rstv_snd_gap_us = 0;
+			rstv_snd_posts = 0;
+			{ // ADR-173: batmanfr sound board DSP (time on the sound thread, instructions a frame)
+				extern int rstv_rax_active;
+				extern unsigned rstv_rax_insns;
+				extern u64 rstv_rax_us, rstv_rax_cpu_us;
+				extern unsigned rstv_rax_jit_gens, rstv_rax_jit_insns, rstv_rax_jit_blocks, rstv_rax_nl_insns;
+				static unsigned s_rax_prev, s_raxj_prev, s_raxn_prev;
+				size_t n = strlen(line);
+				if (rstv_rax_active && n > 0 && line[n - 1] == '\n')
+					snprintf(line + n - 1, sizeof(line) - n + 1, " | rax %.1fms cpu %.1fms %uk jit %uk nl %uk gen %u blk %u\n",
+						rstv_rax_us / 60000.0, rstv_rax_cpu_us / 60000.0, (rstv_rax_insns - s_rax_prev) / 60000,
+						(rstv_rax_jit_insns - s_raxj_prev) / 60000, (rstv_rax_nl_insns - s_raxn_prev) / 60000,
+						rstv_rax_jit_gens, rstv_rax_jit_blocks);
+				s_rax_prev = rstv_rax_insns;
+				s_raxj_prev = rstv_rax_jit_insns;
+				s_raxn_prev = rstv_rax_nl_insns;
+				rstv_rax_us = 0;
+				rstv_rax_cpu_us = 0;
+			}
 			{
 				gvdp2_stats gs;
 				gvdp2_get_stats(&gs);
@@ -1272,6 +1556,16 @@ int main(void)
 					if (n > 0 && line[n - 1] == '\n')
 						snprintf(line + n - 1, sizeof(line) - n + 1, " | dma %u\n", rstv_dma_units / 60);
 					rstv_dma_units = 0;
+					{
+						// ADR-136: slave SH-2 thread (ms/frame): its busy time, main waiting for it, I/O lock waits; wakes/frame
+						extern volatile int rstv_slave_on;
+						extern unsigned rstv_slave_busy_us, rstv_slave_wait_us, rstv_slave_lockwait_us, rstv_slave_wakes;
+						n = strlen(line);
+						if (rstv_slave_on && n > 0 && line[n - 1] == '\n')
+							snprintf(line + n - 1, sizeof(line) - n + 1, " | slv busy %.1f wait %.1f lock %.1f wakes %u\n", rstv_slave_busy_us / 60000.0,
+								rstv_slave_wait_us / 60000.0, rstv_slave_lockwait_us / 60000.0, rstv_slave_wakes / 60);
+						rstv_slave_busy_us = rstv_slave_wait_us = rstv_slave_lockwait_us = rstv_slave_wakes = 0;
+					}
 				}
 				memset(rstv_v1s_n, 0, sizeof(rstv_v1s_n));
 				memset(rstv_v1s_px, 0, sizeof(rstv_v1s_px));
@@ -1319,7 +1613,7 @@ out:
 	rstv_audio_fini();
 	rstv_video_shutdown();
 	rstv_log_shutdown();
-	if (s_quit_mode == 2) // menu "Select game": relaunch the app to the start screen
+	if (s_quit_mode == 2 || s_exit_next) // menu "Select game" / measuring tools: relaunch the app
 		sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
 	sceKernelExitProcess(0);
 	return 0;

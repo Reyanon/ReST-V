@@ -1044,12 +1044,34 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 // CS1 = rom[0x2000000..]. Protection chips are not emulated (not needed by target sets).
 //////////////////////////////////////////////////////////////////////////////
 
-static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr) { return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF); }
-static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr) { return T1ReadWord(CartridgeArea->rom, addr & 0x1FFFFFF); }
-static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr) { return T1ReadLong(CartridgeArea->rom, addr & 0x1FFFFFF); }
-static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val) { (void)addr; (void)val; }
-static void FASTCALL ROMSTVCs0WriteWord(u32 addr, u16 val) { (void)addr; (void)val; }
-static void FASTCALL ROMSTVCs0WriteLong(u32 addr, u32 val) { (void)addr; (void)val; }
+/* ReST-V (ADR-132): 315-5838 family decompression chip ports on carts that have it (stv.c) */
+extern int stv_5838_enabled;
+u32 stv_5838_read_long(u32 off, u32 mask);
+void stv_5838_write(u32 off, u32 data, u32 mask);
+void stv_5838_control_w(u16 data, u16 mask);
+#define STV_5838_RD(o) (stv_5838_enabled && ((o) & 0x7FFFFC) == 0x7FFFF8 && (o) < 0x1800000)
+#define STV_5838_WR(o) (stv_5838_enabled && ((o) & 0x7FFFF8) == 0x7FFFF0 && (o) < 0x1800000)
+static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_RD(o)) { const int sh = 8 * (3 - (o & 3)); return (u8)(stv_5838_read_long(o, 0xFFu << sh) >> sh); }
+   return T1ReadByte(CartridgeArea->rom, o); }
+static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_RD(o)) { const int sh = (o & 2) ? 0 : 16; return (u16)(stv_5838_read_long(o, 0xFFFFu << sh) >> sh); }
+   return T1ReadWord(CartridgeArea->rom, o); }
+static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_RD(o)) return stv_5838_read_long(o, 0xFFFFFFFFu);
+   return T1ReadLong(CartridgeArea->rom, o); }
+static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_WR(o)) { const int sh = 8 * (3 - (o & 3)); stv_5838_write(o, (u32)val << sh, 0xFFu << sh); } }
+static void FASTCALL ROMSTVCs0WriteWord(u32 addr, u16 val) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_WR(o)) { const int sh = (o & 2) ? 0 : 16; stv_5838_write(o, (u32)val << sh, 0xFFFFu << sh); } }
+static void FASTCALL ROMSTVCs0WriteLong(u32 addr, u32 val) {
+   const u32 o = addr & 0x1FFFFFF;
+   if (STV_5838_WR(o)) stv_5838_write(o, val, 0xFFFFFFFFu); }
 /* ReST-V: the ST-V cartridge ROM as one block (0x02000000 = offset 0), for native routines reading it; NULL otherwise */
 u8 *rstv_cart_rom(void) { return CartridgeArea && CartridgeArea->carttype == CART_ROMSTV ? CartridgeArea->rom : NULL; }
 /* ReST-V: 0x04FFFFF0-0x04FFFFFF is the A-bus protection chip on protected carts (stv.c, 315-5881) */
@@ -1068,9 +1090,16 @@ static u32 FASTCALL ROMSTVCs1ReadLong(u32 addr) {
    return T1ReadLong(&CartridgeArea->rom[0x2000000], addr & 0xFFFFFF); }
 static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val) {
    if (STV_PROT(addr)) { const int sh = 8 * (3 - (addr & 3)); stv_prot_write(addr, (u32)val << sh, 0xFFu << sh); } }
+/* ReST-V (ADR-173): batmanfr sound board command port 0x04800000 (MAME batmanfr_sound_comms_w: upper word only) */
+#include "rstv_rax.h"
+#define STV_RAX(a) (rstv_rax_active && ((a) & 0xFFFFFC) == 0x800000)
 static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val) {
+   if (STV_RAX(addr)) { if (!(addr & 2)) rstv_rax_data_w(val); return; }
+   if (stv_5838_enabled && (addr & 0xFFFFFE) == 0x200000) { stv_5838_control_w(val, 0xFFFF); return; }
    if (STV_PROT(addr)) { const int sh = (addr & 2) ? 0 : 16; stv_prot_write(addr, (u32)val << sh, 0xFFFFu << sh); } }
 static void FASTCALL ROMSTVCs1WriteLong(u32 addr, u32 val) {
+   if (STV_RAX(addr)) { rstv_rax_data_w((u16)(val >> 16)); return; }
+   if (stv_5838_enabled && (addr & 0xFFFFFC) == 0x200000) { stv_5838_control_w((u16)(val >> 16), 0xFFFF); return; }
    if (STV_PROT(addr)) stv_prot_write(addr, val, 0xFFFFFFFFu); }
 
 //////////////////////////////////////////////////////////////////////////////

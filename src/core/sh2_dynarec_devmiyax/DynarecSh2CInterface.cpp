@@ -172,6 +172,8 @@ void SH2DynReset(SH2_struct *context) {
   static int rstv_blocks_ready;
   if (!rstv_blocks_ready || !context->isslave) {
     block->Init();
+    if (CompileBlocks::at(1))
+      CompileBlocks::at(1)->Init(); // ADR-136: the slave's own blocks start over with the master's
     rstv_blocks_ready = 1;
   }
 #else
@@ -206,6 +208,34 @@ void FASTCALL SH2DynExec(SH2_struct *context, u32 cycles){
   DynarecSh2* pctx = ((DynarecSh2*)context->ext);
   pctx->SetCurrentContext();
   pctx->ExecuteCount(cycles);
+}
+
+// ADR-136: the I mask of a CPU (another thread may read it: only a hint for waking it)
+extern "C" int SH2DynInterruptMask(SH2_struct *context)
+{
+  DynarecSh2 *pctx = (DynarecSh2 *)context->ext;
+  return pctx ? (int)((pctx->GET_SR() >> 4) & 15) : 15;
+}
+// ADR-136: end an idle sleep (ADR-050) from another thread (it polls a flag that just changed)
+extern "C" void SH2DynWake(SH2_struct *context)
+{
+  DynarecSh2 *pctx = (DynarecSh2 *)context->ext;
+  if (pctx)
+    pctx->WakeSleep();
+}
+// ADR-136: the slave thread compiles into its own block cache
+extern "C" int SH2DynUseOwnBlocks(SH2_struct *context)
+{
+  DynarecSh2 *pctx = (DynarecSh2 *)context->ext;
+  if (!pctx)
+    return 0;
+  // the slave's block cache comes from the code region: not enough left -> stay on the shared cache (no async)
+  if (CompileBlocks::at(1) == NULL && rstv_jit_code_avail() < sizeof(Block) * 2048 + 64) {
+    fprintf(stderr, "dynarec: no code memory for the slave block cache (%u bytes left)%c", (unsigned)rstv_jit_code_avail(), 10);
+    return 0;
+  }
+  pctx->UseCompiler(CompileBlocks::getSlaveInstance());
+  return 1;
 }
 
 void SH2DynSendInterrupt(SH2_struct *context, u8 vector, u8 level){
@@ -355,34 +385,37 @@ void SH2DynAddCycle(SH2_struct *context, u32 value) {
 }
 
 
+// ADR-136: a write drops the code it hits in every block cache (master's, and the slave's when it has its own)
+#define RSTV_CB_INVAL(tbl, idx) do { for (int k_ = 0; k_ < 2; k_++) { CompileBlocks *b_ = CompileBlocks::at(k_); if (!b_) continue;     Block *&e_ = b_->tbl[idx]; if (e_) { e_ = NULL; rstv_link_gen++; } } } while (0)
+#define RSTV_CB_DIRTY(a) do { for (int k_ = 0; k_ < 2; k_++) { CompileBlocks *b_ = CompileBlocks::at(k_); if (b_) b_->setDirty(a); } } while (0)
 void SH2DynWriteNotify(u32 start, u32 length){
   CompileBlocks * block = CompileBlocks::getInstance();
   
   switch (start & 0x0FF00000){
     // ROM
   case 0x00000000:
-      { Block *&e_ = block->LookupTableRom[(start&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableRom, (start&0x000FFFFF)>>1);
     break;
 
   // Low Memory
   case 0x00200000:
     for (u32 addr = start; addr< start + length; addr += 2)
-      { Block *&e_ = block->LookupTableLow[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableLow, (addr&0x000FFFFF)>>1);
     break;
     // High Memory
   case 0x06000000:
     for( u32 addr = start; addr< start+length; addr+=2 )
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
+    RSTV_CB_DIRTY(addr);
 #else
-    { Block *&e_ = block->LookupTable[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTable, (addr&0x000FFFFF)>>1);
 #endif
     break;
 
     // Cache
   default:
     if ((start & 0xFF000000) == 0xC0000000){
-      { Block *&e_ = block->LookupTableC[(start&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableC, (start&0x000FFFFF)>>1);
     }
     break;
   }
@@ -455,8 +488,29 @@ static inline int rstv_mem_region(u32 a)
 #define RSTV_MEMCNT(a)
 #define RSTV_HCNT(w)
 #endif
+#if !defined(__vita__)
+// harness diag (RSTV_WWATCH=addr): log CPU stores to one high work RAM byte (its chunk is marked as code so the asm fast
+// path sends them here)
+extern "C" u8 rstv_code_chunk[0x100000 >> 5];
+static u32 rstv_ww = 1;
+static void rstv_wwatch(u32 addr, u32 size, u32 data)
+{
+  if (rstv_ww == 1) { const char *e = getenv("RSTV_WWATCH"); rstv_ww = e ? (u32)strtoul(e, NULL, 16) & 0xFFFFF : 0; if (rstv_ww) rstv_code_chunk[rstv_ww >> 5] = 1; }
+  if (!rstv_ww) return;
+  if ((addr & 0xDFF00000) != 0x06000000) return;
+  const u32 o = addr & 0xFFFFF;
+  if (o <= rstv_ww && o + size > rstv_ww) {
+    extern u32 rstv_harness_frame;
+    printf("ww f%u %s %08x=%0*x pc %08x%c", rstv_harness_frame, DynarecSh2::Cur()->IsSlave() ? "S" : "M", addr, (int)(size * 2), data, DynarecSh2::Cur()->GET_PC(), 10);
+  }
+}
+#define RSTV_WW(a, n, d) rstv_wwatch(a, n, d)
+#else
+#define RSTV_WW(a, n, d)
+#endif
 void memSetByte(u32 addr , u8 data )
 {
+  RSTV_WW(addr, 1, data);
   dynaLock();
   u32 cycle = 0;
   //LOG("memSetWord %08X, %08X\n", addr, data);
@@ -465,24 +519,24 @@ void memSetByte(u32 addr , u8 data )
   {
   // Low Memory
   case 0x00200000:
-    { Block *&e_ = block->LookupTableLow[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTableLow, (addr&0x000FFFFF)>>1);
     RSTV_HCNT(1);
     RSTV_UNDO(LowWram, addr & 0xFFFFF, 1);
     T2WriteByte(LowWram, addr & 0xFFFFF, data);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 7;
     dynaFree();
     return;
     break;
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
+    RSTV_CB_DIRTY(addr);
 #else
-    { Block *&e_ = block->LookupTable[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTable, (addr&0x000FFFFF)>>1);
 #endif
     RSTV_UNDO(HighWram, addr & 0xFFFFF, 1);
     T2WriteByte(HighWram, addr & 0xFFFFF, data);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return;
     break;
@@ -491,17 +545,18 @@ void memSetByte(u32 addr , u8 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      { Block *&e_ = block->LookupTableC[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableC, (addr&0x000FFFFF)>>1);
     }
   }
   RSTV_MEMCNT(addr);
   MappedMemoryWriteByte(addr, data, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
 }
 
 void memSetWord(u32 addr, u16 data )
 {
+  RSTV_WW(addr, 2, data);
   dynaLock();
   u32 cycle = 0;
   //LOG("memSetWord %08X, %08X\n", addr, data);
@@ -511,24 +566,24 @@ void memSetWord(u32 addr, u16 data )
   {
   // Low Memory
    case 0x00200000:
-    { Block *&e_ = block->LookupTableLow[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTableLow, (addr&0x000FFFFF)>>1);
     RSTV_HCNT(1);
     RSTV_UNDO(LowWram, addr & 0xFFFFF, 2);
     T2WriteWord(LowWram, addr & 0xFFFFF, data);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 7;
     dynaFree();
     return;
     break;
   // High Memory
    case 0x06000000:  {
 #if defined(SET_DIRTY)
-     block->setDirty(addr);
+     RSTV_CB_DIRTY(addr);
 #else
-     { Block *&e_ = block->LookupTable[(addr & 0x000FFFFF) >> 1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+     RSTV_CB_INVAL(LookupTable, (addr & 0x000FFFFF) >> 1);
 #endif
     RSTV_UNDO(HighWram, addr & 0xFFFFF, 2);
     T2WriteWord(HighWram, addr & 0xFFFFF, data);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return;
    }
@@ -537,17 +592,18 @@ void memSetWord(u32 addr, u16 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      { Block *&e_ = block->LookupTableC[(addr&0x000FFFFF) >> 1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableC, (addr&0x000FFFFF) >> 1);
     }
   }
   RSTV_MEMCNT(addr);
   MappedMemoryWriteWord(addr, data, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
 }
 
 void memSetLong(u32 addr , u32 data )
 {
+  RSTV_WW(addr, 4, data);
   dynaLock();
   //LOG("memSetLong %08X, %08X\n", addr, data);
   u32 cycle = 0;
@@ -557,30 +613,30 @@ void memSetLong(u32 addr , u32 data )
   {  
     // Low Memory
   case 0x00200000:
-    { Block *&e_ = block->LookupTableLow[(addr & 0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
-    { Block *&e_ = block->LookupTableLow[((addr & 0x000FFFFF)>>1) + 1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTableLow, (addr & 0x000FFFFF)>>1);
+    RSTV_CB_INVAL(LookupTableLow, ((addr & 0x000FFFFF)>>1) + 1);
     RSTV_HCNT(1);
     RSTV_UNDO(LowWram, addr & 0xFFFFF, 4);
     T2WriteLong(LowWram, addr & 0xFFFFF, data);
-    if(addr&0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
+    if(addr&0x20000000) DynarecSh2::Cur()->memcycle_ += 7;
     dynaFree();
     return;
     break;
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
-    block->setDirty(addr+2);
+    RSTV_CB_DIRTY(addr);
+    RSTV_CB_DIRTY(addr+2);
 #else
-    { Block *&e_ = block->LookupTable[(addr & 0x000FFFFF) >> 1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
-    { Block *&e_ = block->LookupTable[((addr & 0x000FFFFF) >> 1) + 1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+    RSTV_CB_INVAL(LookupTable, (addr & 0x000FFFFF) >> 1);
+    RSTV_CB_INVAL(LookupTable, ((addr & 0x000FFFFF) >> 1) + 1);
 #endif
     RSTV_UNDO(HighWram, addr & 0xFFFFF, 4);
 #ifdef RSTV_IOREPLAY
     { extern void rstv_qlog(u32, u32); rstv_qlog(addr, data); }
 #endif
     T2WriteLong(HighWram, addr & 0xFFFFF, data);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return;
     break;
@@ -589,12 +645,12 @@ void memSetLong(u32 addr , u32 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      { Block *&e_ = block->LookupTableC[(addr&0x000FFFFF)>>1]; if (e_) { e_ = NULL; rstv_link_gen++; } }
+      RSTV_CB_INVAL(LookupTableC, (addr&0x000FFFFF)>>1);
     }
   }
   RSTV_MEMCNT(addr);
   MappedMemoryWriteLong(addr, data, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
 }
 
@@ -610,21 +666,21 @@ u8 memGetByte(u32 addr)
   case 0x00200000:
     RSTV_HCNT(0);
     val = T2ReadByte(LowWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 4;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 4;
     dynaFree();
     return val;
     break;
     // High Memory
   case 0x06000000:
     val = T2ReadByte(HighWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return val;
     break;
   }
   RSTV_MEMCNT(addr);
   val = MappedMemoryReadByte(addr, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
   return val;
 }
@@ -641,21 +697,21 @@ u16 memGetWord(u32 addr)
   case 0x00200000:
     RSTV_HCNT(0);
     val = T2ReadWord(LowWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 4;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 4;
     dynaFree();
     return val;
     break;
     // High Memory
   case 0x06000000:
     val = T2ReadWord(HighWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return val;
     break;
   }
   RSTV_MEMCNT(addr);
   val = MappedMemoryReadWord(addr, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
   return val;
 }
@@ -671,21 +727,21 @@ u32 memGetLong(u32 addr)
   case 0x00200000:
     RSTV_HCNT(0);
     val = T2ReadLong(LowWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 4;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 4;
     dynaFree();
     return val;
     break;
     // High Memory
   case 0x06000000:
     val = T2ReadLong(HighWram, addr & 0xFFFFF);
-    if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+    if (addr & 0x20000000) DynarecSh2::Cur()->memcycle_ += 2;
     dynaFree();
     return val;
     break;
   }
   RSTV_MEMCNT(addr);
   val = MappedMemoryReadLong(addr, &cycle);
-  DynarecSh2::CurrentContext->memcycle_ += cycle;
+  DynarecSh2::Cur()->memcycle_ += cycle;
   dynaFree();
   return val;
 }
@@ -721,7 +777,7 @@ int DelayEachClock() {
 
 int DebugDelayClock() {
   dynaLock();
-  DynaCheckBreakPoint(DynarecSh2::CurrentContext->GET_PC());
+  DynaCheckBreakPoint(DynarecSh2::Cur()->GET_PC());
   dynaFree();
   return 0;
 }
@@ -732,38 +788,38 @@ int DebugEachClock() {
   #define INSTRUCTION_B(x) ((x & 0x0F00) >> 8)
   #define INSTRUCTION_C(x) ((x & 0x00F0) >> 4)
 
-  //printf("PC:%08X\n",DynarecSh2::CurrentContext->GET_PC());
+  //printf("PC:%08X\n",DynarecSh2::Cur()->GET_PC());
 
 #if 0
-  u32 pc = DynarecSh2::CurrentContext->GET_PC();
+  u32 pc = DynarecSh2::Cur()->GET_PC();
   u16 inst = memGetWord(pc);
   s32 m = INSTRUCTION_C(inst);
   s32 n = INSTRUCTION_B(inst);
 
   LOG("%08X: rotcrout R%d=%08X, SR=%08X\n", 
-    DynarecSh2::CurrentContext->GET_PC(), 
-    n,DynarecSh2::CurrentContext->GetGenRegPtr()[n], 
-    DynarecSh2::CurrentContext->GET_SR());
+    DynarecSh2::Cur()->GET_PC(), 
+    n,DynarecSh2::Cur()->GetGenRegPtr()[n], 
+    DynarecSh2::Cur()->GET_SR());
 #endif
 
 #if 0  
   LOG("%08X: subc R%d=%08X R%d=%08X SR=%08X\n", 
-    DynarecSh2::CurrentContext->GET_PC(), 
-    m,DynarecSh2::CurrentContext->GetGenRegPtr()[m], 
-    n,DynarecSh2::CurrentContext->GetGenRegPtr()[n], 
-    DynarecSh2::CurrentContext->GET_SR());
+    DynarecSh2::Cur()->GET_PC(), 
+    m,DynarecSh2::Cur()->GetGenRegPtr()[m], 
+    n,DynarecSh2::Cur()->GetGenRegPtr()[n], 
+    DynarecSh2::Cur()->GET_SR());
 #endif
 
 #if 0
-if( DynarecSh2::CurrentContext->GET_PC() >= 0x0602E3C2 &&  DynarecSh2::CurrentContext->GET_PC() < 0x0602E468 ) {
-   u32 addrn = DynarecSh2::CurrentContext->GetGenRegPtr()[6]-4;
-   u32 addrm = DynarecSh2::CurrentContext->GetGenRegPtr()[7]-4;
+if( DynarecSh2::Cur()->GET_PC() >= 0x0602E3C2 &&  DynarecSh2::Cur()->GET_PC() < 0x0602E468 ) {
+   u32 addrn = DynarecSh2::Cur()->GetGenRegPtr()[6]-4;
+   u32 addrm = DynarecSh2::Cur()->GetGenRegPtr()[7]-4;
    printf("%08X: MACL R[%d]=%08X@%08X,R[%d]=%08X@%08X,MACH=%08X,MACL=%08X\n",
-      DynarecSh2::CurrentContext->GET_PC(),
+      DynarecSh2::Cur()->GET_PC(),
       6,addrn,MappedMemoryReadLong(addrn),
       7,addrm,MappedMemoryReadLong(addrm),
-      DynarecSh2::CurrentContext->GET_MACH(),
-      DynarecSh2::CurrentContext->GET_MACL()
+      DynarecSh2::Cur()->GET_MACH(),
+      DynarecSh2::Cur()->GET_MACL()
    );
 }
 #endif
@@ -772,41 +828,41 @@ if( DynarecSh2::CurrentContext->GET_PC() >= 0x0602E3C2 &&  DynarecSh2::CurrentCo
   #define INSTRUCTION_B(x) ((x & 0x0F00) >> 8)
   #define INSTRUCTION_C(x) ((x & 0x00F0) >> 4)
 
-  u32 pc = DynarecSh2::CurrentContext->GET_PC();
+  u32 pc = DynarecSh2::Cur()->GET_PC();
   u16 inst = memGetWord(pc);
   s32 m = INSTRUCTION_C(inst);
   s32 n = INSTRUCTION_B(inst);
   printf("%08X: DIV0S %04X R[%d]:%08X,R[%d]:%08X,SR:%08X\n", 
-    DynarecSh2::CurrentContext->GET_PC(), 
+    DynarecSh2::Cur()->GET_PC(), 
     inst,
-    m,DynarecSh2::CurrentContext->GetGenRegPtr()[m], 
-    n,DynarecSh2::CurrentContext->GetGenRegPtr()[n], 
-    DynarecSh2::CurrentContext->GET_SR());
+    m,DynarecSh2::Cur()->GetGenRegPtr()[m], 
+    n,DynarecSh2::Cur()->GetGenRegPtr()[n], 
+    DynarecSh2::Cur()->GET_SR());
 #endif
 
 #if 0
-u32 pc = DynarecSh2::CurrentContext->GET_PC();
+u32 pc = DynarecSh2::Cur()->GET_PC();
 if( pc == 0x060133C8 ) {
   u16 inst = memGetWord(pc);
   s32 m = INSTRUCTION_C(inst);
   s32 n = INSTRUCTION_B(inst);
   printf("%08X: DIV1(O) m:%08X,n:%08X,SR:%08X\n", 
-    DynarecSh2::CurrentContext->GET_PC(), 
-    DynarecSh2::CurrentContext->GetGenRegPtr()[m], 
-    DynarecSh2::CurrentContext->GetGenRegPtr()[n], 
-    DynarecSh2::CurrentContext->GET_SR());
+    DynarecSh2::Cur()->GET_PC(), 
+    DynarecSh2::Cur()->GetGenRegPtr()[m], 
+    DynarecSh2::Cur()->GetGenRegPtr()[n], 
+    DynarecSh2::Cur()->GET_SR());
 }
 #endif
 
 
 #ifdef DMPHISTORY
   CurrentSH2->pchistory_index++;
-  CurrentSH2->pchistory[CurrentSH2->pchistory_index & (MAX_DMPHISTORY-1) ] = DynarecSh2::CurrentContext->GET_PC();
+  CurrentSH2->pchistory[CurrentSH2->pchistory_index & (MAX_DMPHISTORY-1) ] = DynarecSh2::Cur()->GET_PC();
   //CurrentSH2->regshistory[CurrentSH2->pchistory_index & 0xFF] = NULL;
 #endif
-  DynaCheckBreakPoint(DynarecSh2::CurrentContext->GET_PC());
+  DynaCheckBreakPoint(DynarecSh2::Cur()->GET_PC());
 
-  if (DynarecSh2::CurrentContext->CheckOneStep()){
+  if (DynarecSh2::Cur()->CheckOneStep()){
     dynaFree();
     return 1;
   }
@@ -817,7 +873,7 @@ if( pc == 0x060133C8 ) {
   
 int EachClock() {
   dynaLock();
-  if (DynarecSh2::CurrentContext->CheckInterupt()) {
+  if (DynarecSh2::Cur()->CheckInterupt()) {
       dynaFree();
       return 1;
   }

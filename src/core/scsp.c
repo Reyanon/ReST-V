@@ -4818,14 +4818,42 @@ c68k_byte_read (const u32 adr)
 
 //////////////////////////////////////////////////////////////////////////////
 
+#if !defined(__vita__)
+/* harness diag (RSTV_SWATCH=offset): log accesses to one sound RAM byte; w = 'S' SH-2 store, 'K' 68K store, 'r' SH-2 read */
+static int rstv_sw = -2;
+static void rstv_swatch(char w, u32 addr, u32 size, u32 data)
+{
+  if (rstv_sw == -2) { const char *e = getenv("RSTV_SWATCH"); rstv_sw = e ? (int)strtoul(e, NULL, 16) : -1; }
+  if (rstv_sw < 0) return;
+  addr &= 0x7FFFF;
+  if (addr <= (u32)rstv_sw && addr + size > (u32)rstv_sw) {
+    extern u32 rstv_harness_frame;
+    printf("sw f%u %c %05x=%0*x line %d %s pc %08x pr %08x%c", rstv_harness_frame, w, addr, (int)(size * 2), data, yabsys.LineCount, CurrentSH2 == SSH2 ? "S" : "M", CurrentSH2->regs.PC, CurrentSH2->regs.PR, 10);
+  }
+}
+#define RSTV_SW(w, a, n, d) rstv_swatch(w, a, n, d)
+#else
+#define RSTV_SW(w, a, n, d)
+#endif
+
+/* ReST-V (ADR-151): coin mailbox latch (astrass, stv.c). The BIOS writes the coin byte to sound RAM 0x4F1 and the
+   game's VBlank handler reads it; the BIOS sound driver on the 68K answers in the same byte, and on the Vita (68K on
+   its own thread, a frame behind) it overwrote the coins first: the game counted a coin edge and stopped at
+   SYSTEM CHECKING. While latched (SH-2 wrote 0x4F1, has not read it yet) the 68K does not change that byte. */
+extern int rstv_coin_mailbox_latch;
+static volatile int rstv_4f1_latched;
+
 static void FASTCALL
 c68k_byte_write (const u32 adr, u32 data)
 {
+  if (rstv_4f1_latched && (adr & 0xFFFFF) == 0x4F1)
+    return;
   if (adr < 0x100000){
     //if ((adr & 0xFFF) == 0x790){
     //  SCSPLOG("c68k_word_write %08X:%02X\n", adr, data);
     //}
     if (adr < 0x80000) {
+      RSTV_SW('K', adr, 1, data);
       T2WriteByte(SoundRam, adr & 0x7FFFF, data);
     }
   }
@@ -4856,11 +4884,16 @@ c68k_word_read (const u32 adr)
 static void FASTCALL
 c68k_word_write (const u32 adr, u32 data)
 {
+  if (rstv_4f1_latched && (adr & 0xFFFFE) == 0x4F0) { /* keep the 0x4F1 half (big-endian: the low byte) */
+    c68k_byte_write(adr & ~1u, data >> 8);
+    return;
+  }
   if (adr < 0x100000){
 //    if ((adr & 0x7FFF0) == 0x3c20){
 //      SCSPLOG("c68k_word_write %08X:%04X @ %d\n", adr, data, (m68kcycle >> CLOCK_SYNC_SHIFT) );
 //    }
     if (adr < 0x80000) {
+      RSTV_SW('K', adr, 2, data);
       T2WriteWord(SoundRam, adr, data);
     }
   }
@@ -4902,6 +4935,9 @@ SoundRamReadByte (u32 addr)
     val = 0xFF;
 
   val = T2ReadByte(SoundRam, addr);
+  RSTV_SW('r', addr, 1, val);
+  if (addr == 0x4F1)
+    rstv_4f1_latched = 0;
   //SCSPLOG("SoundRamReadByte %08X:%02X",addr,val);
   return val;
 }
@@ -4920,6 +4956,9 @@ SoundRamWriteByte (u32 addr, u8 val)
     return;
 
   //SCSPLOG("SoundRamWriteByte %08X:%02X", addr, val);
+  RSTV_SW('S', addr, 1, val);
+  if (rstv_coin_mailbox_latch && addr == 0x4F1)
+    rstv_4f1_latched = 1;
   T2WriteByte (SoundRam, addr, val);
   M68K->WriteNotify (addr, 1);
 }
@@ -4933,6 +4972,14 @@ u8 *rstv_sound_ram(u32 off, u32 n)
   const u32 lim = scsp.mem4b ? 0x80000 : 0x40000;
   if (!SoundRam || off >= lim || n > lim - off)
     return NULL;
+  return SoundRam;
+}
+
+/* ReST-V (ADR-162): sound RAM for native word stores at any SH-2 address in 0x05A00000-0x05AFFFFF, masked as
+   SoundRamWriteWord does it: *mem4b = 1 means offsets above 0x7FFFF are dropped, else they mirror every 256 KB */
+u8 *rstv_sound_ram_any(int *mem4b)
+{
+  *mem4b = scsp.mem4b != 0;
   return SoundRam;
 }
 
@@ -5007,6 +5054,7 @@ SoundRamWriteWord (u32 addr, u16 val)
   else if (addr > 0x7FFFF)
     return;
   //LOG("SoundRamWriteWord %08X:%04X", addr, val);
+  RSTV_SW('S', addr, 2, val);
   T2WriteWord (SoundRam, addr, val);
   M68K->WriteNotify (addr, 2);
   //SyncSh2And68k();
@@ -5081,6 +5129,7 @@ SoundRamWriteLong (u32 addr, u32 val)
     return;
 
   //LOG("SoundRamWriteLong %08X:%08X", addr, val);
+  RSTV_SW('S', addr, 4, val);
   T2WriteLong (SoundRam, addr, val);
   M68K->WriteNotify (addr, 4);
   //SyncSh2And68k();
@@ -5241,9 +5290,23 @@ ScspDeInit (void)
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* ReST-V (ADR-151): the 68K reset line (ST-V PDR2) is driven from the emu thread while the sound thread may be running
+   the 68K through its frame (one frame behind, ADR-005). Resetting Musashi under it is a data race: let the sound
+   thread finish its frame first, as ScspReset does. */
+static void rstv_m68k_quiesce(void)
+{
+#if defined(RSTV)
+  extern int rstv_scsp_lag;
+  extern void rstv_sound_quiesce(void);
+  if (rstv_scsp_lag && g_scsp_main_mode == 0)
+    rstv_sound_quiesce();
+#endif
+}
+
 void
 M68KStart (void)
 {
+  rstv_m68k_quiesce();
   M68K->Reset ();
   //ScspReset();
   savedcycles = 0;
@@ -5255,6 +5318,7 @@ M68KStart (void)
 void
 M68KStop (void)
 {
+  rstv_m68k_quiesce();
   M68K->Reset();
   //ScspReset();
   IsM68KRunning = 0;
@@ -5674,12 +5738,197 @@ int rstv_scsp_batch_slots(int n)
    return 1;
 }
 
+#ifndef __vita__
+/* harness diag (RSTV_SCSPDSP=F): the DSP program size and the effect send levels */
+void rstv_scsp_dsp_report(void)
+{
+   int nz = 0, i;
+   for (i = 0; i < 128; i++)
+      nz += scsp_dsp.mpro[i] != 0;
+   printf("scspdsp: last_step %d nonzero %d efsdl:", scsp_dsp.last_step, nz);
+   for (i = 0; i < 18; i++)
+      printf(" %d", new_scsp.slots[i].regs.efsdl);
+   printf(" imxl>0 slots:");
+   for (i = 0; i < 32; i++)
+      if (new_scsp.slots[i].regs.imxl)
+         printf(" %d", i);
+   printf(" rbl %d mvol %d%c", scsp.rbl, scsp.mvol, 10);
+}
+#endif
+
+/* ReST-V (ADR-158): the SCSP DSP of a batch runs on its own core while the sound thread does the 68K and the slots of
+   the next batch (kiwames' 115-step reverb was ~8 ms of a 16 ms sound frame). The batch keeps the dry mix and the DSP
+   inputs per sample; the DSP runs the samples in order exactly as before, and the batch is mixed out when its DSP is
+   done (one batch, at most 0.7 ms, later; nothing crosses a frame: the last batch of a frame is drained). */
+typedef struct {
+   int n, rbp, rbl, mvol;
+   s32 mixs[RSTV_SCSP_MAX_BATCH][16];
+   s16 exts[RSTV_SCSP_MAX_BATCH][2];
+   s32 dry_l[RSTV_SCSP_MAX_BATCH], dry_r[RSTV_SCSP_MAX_BATCH];
+   s16 efreg[RSTV_SCSP_MAX_BATCH][16];
+} RstvDspBatch;
+static RstvDspBatch rstv_dspb[2];
+static int rstv_dspb_cur, rstv_dspb_pending = -1;
+int rstv_scsp_dsp_thread = 0; /* the frontend turns it on (Vita: a thread on CPU3); 2 = inline (harness check) */
+static YabEventQueue *rstv_q_dsp_go, *rstv_q_dsp_done;
+
+static void rstv_dsp_batch_run(RstvDspBatch *b)
+{
+   int i;
+   for (i = 0; i < b->n; i++) {
+      memcpy(scsp_dsp.mixs, b->mixs[i], sizeof(scsp_dsp.mixs));
+      scsp_dsp.rbp = b->rbp;
+      scsp_dsp.rbl = b->rbl;
+      scsp_dsp.exts[0] = b->exts[i][0];
+      scsp_dsp.exts[1] = b->exts[i][1];
+      if (scsp_dsp.updated) {
+         int j;
+         for (j = 127; j >= 0; --j)
+            if (scsp_dsp.mpro[j] != 0)
+               break;
+         scsp_dsp.last_step = j + 1;
+         scsp_dsp.updated = 0;
+         rstv_dspjit_dirty();
+      }
+      {
+         u64 pt_dsp = RSTV_PROF_TF();
+         if (!rstv_dspjit_run(&scsp_dsp, SoundRam))
+            ScspDspRun(&scsp_dsp, scsp_dsp.last_step, SoundRam);
+         RSTV_PROF_ADDF(RSTV_PROF_SND_DSP, pt_dsp);
+      }
+      if (!scsp_dsp.mdec_ct)
+         scsp_dsp.mdec_ct = (0x2000 << b->rbl);
+      scsp_dsp.mdec_ct--;
+      memcpy(b->efreg[i], scsp_dsp.efreg, sizeof(scsp_dsp.efreg));
+   }
+   memset(scsp_dsp.mixs, 0, sizeof(scsp_dsp.mixs));
+}
+
+static void *rstv_dsp_thread_main(void *arg)
+{
+   (void)arg;
+   for (;;) {
+      const int k = YabWaitEventQueue(rstv_q_dsp_go);
+      if (k < 0)
+         break;
+      rstv_dsp_batch_run(&rstv_dspb[k & 1]);
+      YabAddEventQueue(rstv_q_dsp_done, k);
+   }
+   return NULL;
+}
+
+/* the effect mix and master volume of a batch whose DSP is done (scsp_finish_sample's second half) */
+static void rstv_dsp_batch_out(const RstvDspBatch *b)
+{
+   struct Scsp * s = &new_scsp;
+   int i, ch;
+   for (i = 0; i < b->n; i++) {
+      s32 outl32 = b->dry_l[i], outr32 = b->dry_r[i];
+      for (ch = 0; ch < 18; ch++) {
+         const int efsdl = get_sdl_shift(s->slots[ch].regs.efsdl);
+         const s16 v = ch < 16 ? (s16)(b->efreg[i][ch] >> efsdl) : (s16)(b->exts[i][ch - 16] >> efsdl);
+         int pan_val_l = 0, pan_val_r = 0;
+         get_panning(s->slots[ch].regs.efpan, &pan_val_l, &pan_val_r);
+         outl32 += (s16)((v >> pan_val_l) >> 1);
+         outr32 += (s16)((v >> pan_val_r) >> 1);
+      }
+      const int mvol_shift = 0xf - b->mvol;
+      outl32 >>= mvol_shift;
+      outr32 >>= mvol_shift;
+      if (new_scsp_outbuf_pos < 900) {
+         new_scsp_outbuf_l[new_scsp_outbuf_pos] = min(SHRT_MAX, max(SHRT_MIN, outl32));
+         new_scsp_outbuf_r[new_scsp_outbuf_pos] = min(SHRT_MAX, max(SHRT_MIN, outr32));
+      }
+      scsp_update_monitor();
+      new_scsp_outbuf_pos++;
+   }
+}
+
+/* wait for the batch in flight and mix it out (frame end, and before the next batch is handed over) */
+void rstv_scsp_dsp_drain(void)
+{
+   if (rstv_dspb_pending < 0)
+      return;
+   if (rstv_scsp_dsp_thread == 1)
+      YabWaitEventQueue(rstv_q_dsp_done);
+   else
+      rstv_dsp_batch_run(&rstv_dspb[rstv_dspb_pending]);
+   rstv_dsp_batch_out(&rstv_dspb[rstv_dspb_pending]);
+   rstv_dspb_pending = -1;
+}
+
+static int rstv_scsp_dsp_pipe(void)
+{
+   static int started;
+   if (rstv_scsp_dsp_thread != 1)
+      return rstv_scsp_dsp_thread == 2;
+   if (!started) {
+      started = 1;
+      rstv_q_dsp_go = YabThreadCreateQueue(2);
+      rstv_q_dsp_done = YabThreadCreateQueue(2);
+      if (!rstv_q_dsp_go || !rstv_q_dsp_done || YabThreadStart(YAB_THREAD_SCSPDSP, rstv_dsp_thread_main, NULL) != 0) {
+         rstv_scsp_dsp_thread = 0;
+         return 0;
+      }
+   }
+   return 1;
+}
+
 void rstv_scsp_batch_mix(int n)
 {
    static s16 (*const slot_out)[RSTV_SCSP_MAX_BATCH] = rstv_slot_out;
    const int * const nz = rstv_slot_nz;
    int i, k;
    struct Scsp * s = &new_scsp;
+
+   if (rstv_scsp_dsp_pipe()) {
+      RstvDspBatch *b = &rstv_dspb[rstv_dspb_cur];
+      b->n = n;
+      b->rbp = scsp.rbp;
+      b->rbl = scsp.rbl;
+      b->mvol = scsp.mvol;
+      for (i = 0; i < n; i++) {
+         s32 temp = cdda_next_in - cdda_out_left;
+         s32 outpos = (temp < 0) ? temp + sizeof(cddabuf.data) : temp;
+         u8 *buf = &cddabuf.data[outpos];
+         s16 cd_in_l = 0, cd_in_r = 0;
+         s32 outl32 = 0, outr32 = 0;
+         s32 *mx = b->mixs[i];
+         memset(mx, 0, sizeof(b->mixs[i]));
+         if ((s32)cdda_out_left > 0) {
+            cd_in_l = (s16)((buf[1] << 8) | buf[0]);
+            cd_in_r = (s16)((buf[3] << 8) | buf[2]);
+            cdda_out_left -= 4;
+         }
+         for (k = 0; k < 32; k++) {
+            if (!nz[k])
+               continue;
+            const s16 o = slot_out[k][i];
+            if (o == 0)
+               continue;
+            const struct SlotRegs * r = &s->slots[k].regs;
+            const s16 disdl_applied = o >> get_sdl_shift(r->disdl);
+            const s16 mixs_input = o >> get_sdl_shift(r->imxl);
+            int pan_val_l = 0, pan_val_r = 0;
+            get_panning(r->dipan, &pan_val_l, &pan_val_r);
+            outl32 += (disdl_applied >> pan_val_l) >> 1;
+            outr32 += (disdl_applied >> pan_val_r) >> 1;
+            mx[r->isel] += mixs_input << 4;
+         }
+         b->exts[i][0] = cd_in_l;
+         b->exts[i][1] = cd_in_r;
+         b->dry_l[i] = outl32;
+         b->dry_r[i] = outr32;
+      }
+      rstv_scsp_dsp_drain(); /* the previous batch: its DSP ran meanwhile */
+      if (rstv_scsp_dsp_thread == 1)
+         YabAddEventQueue(rstv_q_dsp_go, rstv_dspb_cur);
+      rstv_dspb_pending = rstv_dspb_cur;
+      rstv_dspb_cur ^= 1;
+      if (rstv_scsp_dsp_thread == 2)
+         rstv_scsp_dsp_drain(); /* inline check: no delay, the output must equal the plain path */
+      return;
+   }
 
    for (i = 0; i < n; i++) {
       s32 temp = cdda_next_in - cdda_out_left;
@@ -5993,6 +6242,7 @@ void ScspAsynMainCpuTime( void * p ){
         RSTV_PROF_ADD(RSTV_PROF_SND_68K, pt_68k);
         rstv_scsp_batch_mix(nbatch);
       } else {
+        rstv_scsp_dsp_drain(); /* ADR-158: generate_sample runs the DSP here */
         for (int b = 0; b < nbatch; b++) {
           MM68KExec(samplecnt);
           if (use_new_scsp)
@@ -6009,13 +6259,29 @@ void ScspAsynMainCpuTime( void * p ){
         frame = frame - framecnt;
         ScspInternalVars->scsptiming2 = 0;
         ScspInternalVars->scsptiming1 = scsplines;
+        rstv_scsp_dsp_drain(); /* ADR-158: nothing crosses a frame */
         ScspExecAsync();
 
-        YabAddEventQueue( q_scsp_finish , 0);
-        pre_m68k_cycle = 0;
-        m68k_inc = 0;
-        //LOG("[SCSP] WAIT SH2");
-        YabWaitEventQueue(q_scsp_frame_start);
+        {
+          /* ReST-V: wall time from the frame start to its end (performance line "wall"; preemption shows here) */
+          extern unsigned long long rstv_snd_wall_us;
+          static u64 t_wall;
+          const u64 t_end = RSTV_PROF_T();
+          if (t_wall)
+            rstv_snd_wall_us += t_end - t_wall;
+          YabAddEventQueue( q_scsp_finish , 0);
+          pre_m68k_cycle = 0;
+          m68k_inc = 0;
+          //LOG("[SCSP] WAIT SH2");
+          YabWaitEventQueue(q_scsp_frame_start);
+          t_wall = RSTV_PROF_T();
+          {
+            extern volatile u64 rstv_snd_post_t;
+            extern unsigned long long rstv_snd_lat_us;
+            if (rstv_snd_post_t && t_wall > rstv_snd_post_t)
+              rstv_snd_lat_us += t_wall - rstv_snd_post_t;
+          }
+        }
         now = YabauseGetTicks() * 1000000000 / yabsys.tickfreq;
         //LOG(" SCSPTIME = %d/16666666 %d/735", (s32)(now - before), hzcheck);
         hzcheck = 0;
@@ -6246,6 +6512,7 @@ void ScspExecAsync() {
         new_scsp_update_samples(bufL, bufR, scspsoundlen);
      else
         scsp_update(bufL, bufR, scspsoundlen);
+     { extern void rstv_rax_mix(s32 *l, s32 *r, int n); rstv_rax_mix(bufL, bufR, scspsoundlen); } /* ADR-173 */
      scspsoundgenpos += scspsoundlen;
      scspsoundoutleft += scspsoundlen;
   }

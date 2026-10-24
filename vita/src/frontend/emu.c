@@ -42,14 +42,26 @@ static int snd_init(void) { return 0; }
 static void snd_deinit(void) {}
 static int snd_reset(void) { return 0; }
 static int snd_vf(int f) { (void)f; return 0; }
+// ADR-192 (owner): the output was about half of MAME's (6 dB lower in dnmtdeka, diehard, vfkids). Doubled, with a soft
+// limit above 75% of full scale instead of clipping (loud sets such as thuntk already peak near full scale): past the
+// knee the curve bends smoothly towards full scale (same slope at the knee, never reaches it)
+static inline int16_t snd_out(int32_t v)
+{
+	enum { KNEE = 24576, ROOM = 32767 - KNEE };
+	v *= 2;
+	const int32_t m = v < 0 ? -v : v;
+	if (m <= KNEE)
+		return (int16_t)v;
+	const int32_t e = m - KNEE, y = KNEE + (int32_t)((int64_t)e * ROOM / (e + ROOM));
+	return (int16_t)(v < 0 ? -y : y);
+}
 static void snd_update(u32 *l, u32 *r, u32 n)
 {
 	while (n > 0) {
 		u32 k = n > 4096 ? 4096 : n;
 		for (u32 i = 0; i < k; i++) {
-			int32_t a = (int32_t)l[i], b = (int32_t)r[i];
-			s_snd_buf[i * 2] = (int16_t)(a > 32767 ? 32767 : a < -32768 ? -32768 : a);
-			s_snd_buf[i * 2 + 1] = (int16_t)(b > 32767 ? 32767 : b < -32768 ? -32768 : b);
+			s_snd_buf[i * 2] = snd_out((int32_t)l[i]);
+			s_snd_buf[i * 2 + 1] = snd_out((int32_t)r[i]);
 		}
 		rstv_audio_push(s_snd_buf, (int)k);
 		l += k;
@@ -150,6 +162,22 @@ void rstv_emu_run_frame(uint8_t p1, uint8_t p2, uint8_t system)
 	YabauseExec();
 	rstv_v1watch_frame();
 	rstv_cheats_frame();
+	if ((yabsys.frame_count & 127) == 0)
+		rstv_log_flush(); // diag file (logfile flag)
+	// diag: ux0:data/restv/pclog = "from to" frames: master/slave PC and PR after each frame in that range
+	static int pl_from = -2, pl_to;
+	if (pl_from == -2) {
+		FILE *pf = fopen("ux0:data/restv/pclog", "r");
+		pl_from = -1;
+		if (pf) {
+			if (fscanf(pf, "%d %d", &pl_from, &pl_to) != 2)
+				pl_from = -1;
+			fclose(pf);
+		}
+	}
+	if (pl_from >= 0 && (int)yabsys.frame_count >= pl_from && (int)yabsys.frame_count <= pl_to)
+		RSTV_LOG("pclog f%u m %08x pr %08x sr %03x s %08x", (unsigned)yabsys.frame_count, (unsigned)SH2Core->GetPC(MSH2),
+			(unsigned)SH2Core->GetPR(MSH2), (unsigned)SH2Core->GetSR(MSH2), (unsigned)SH2Core->GetPC(SSH2));
 }
 
 void rstv_emu_reset(void)

@@ -50,6 +50,8 @@ enum {
    YAB_THREAD_VIDSOFT_PRIORITY_3,
    YAB_THREAD_VIDSOFT_PRIORITY_4,
    YAB_THREAD_VIDSOFT_LAYER_SPRITE,
+   YAB_THREAD_SCSPDSP,     // ReST-V (ADR-158): SCSP DSP pipeline
+   YAB_THREAD_RAX,         // ReST-V (ADR-176): batmanfr sound board DSP
    YAB_NUM_THREADS      // Total number of subthreads
 };
 

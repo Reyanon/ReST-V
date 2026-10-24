@@ -12,6 +12,7 @@
 
 void rstv_log_init(void);
 void rstv_log_shutdown(void);
+void rstv_log_flush(void); // diag file (ux0:data/restv/logfile): write the buffered lines
 void rstv_log_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #define RSTV_LOG(...) rstv_log_printf(__VA_ARGS__)
@@ -20,6 +21,7 @@ void rstv_log_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
 
 #define rstv_log_init()     ((void)0)
 #define rstv_log_shutdown() ((void)0)
+#define rstv_log_flush()    ((void)0)
 #define RSTV_LOG(...)       ((void)0)
 
 #endif

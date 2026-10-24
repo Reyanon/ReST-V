@@ -39,6 +39,7 @@ typedef struct {
    int isbitmap, bm_charaddr, bm_paladdr, bm_scf; /* bitmap layer (ADR-039): VRAM address, palette, special colour function */
    float zx;       /* != 1 when some line is zoomed (the cell-quad path cannot draw it; pixel path uses row zx) */
    int mosx;       /* horizontal mosaic size (> 1 = on): drawn without it, the GPU compose snaps x (ADR-129) */
+   int swin;       /* sprite window alone (ADR-161): 1 = hidden where the window bit is set, 2 = where it is clear */
    int nrows;
    RstvCapRow row[RSTV_CAP_ROWS];
 } RstvLayerCapture;

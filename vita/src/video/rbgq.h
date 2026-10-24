@@ -41,7 +41,7 @@ int rbgq_prepare(RbgqState *st, const RstvRotCapture *c, const uint8_t *vram, co
 	uint32_t frame, uint8_t *pages, uint8_t *table, int flat);
 
 // RGB555 character atlas (RGBA, 8x8 per unit, a = MSB): only units touching 4KB pages with dirty[p] (NULL = all)
-void rbgq_atlas_rgb_update(uint8_t *argb, int pitch_px, const uint8_t *vram, const uint8_t *dirty);
+void rbgq_atlas_rgb_update(uint8_t *argb, int pitch_px, const uint8_t *vram, const uint16_t *dirty);
 
 // same math as the shader (for harness comparison). Layer texture format: rgb | (priority | ratio used << 3) << 24, transparent 0
 //   flat = 1: pages is map-order cell layout (table ignored)

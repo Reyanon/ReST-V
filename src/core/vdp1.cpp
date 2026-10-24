@@ -124,8 +124,21 @@ extern "C" u32 FASTCALL Vdp1RamReadLong(u32 addr) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+// diag (harness RSTV_V1RAMW=lo,hi): report writes into VDP1 RAM [lo, hi)
+extern "C" u32 rstv_v1ramw_lo, rstv_v1ramw_hi;
+u32 rstv_v1ramw_lo, rstv_v1ramw_hi;
+extern "C" int rstv_dma_busy;
+extern "C" void rstv_v1ramw_log(u32 addr, u32 val, int size)
+{
+  static unsigned n;
+  if (n++ < 40)
+    fprintf(stderr, "v1ramw f%u l%d %05X=%0*X dma %d msh2 pc %08X pr %08X\n", (unsigned)yabsys.frame_count, yabsys.LineCount,
+            addr, size * 2, val, rstv_dma_busy, MSH2->regs.PC, MSH2->regs.PR);
+}
+#define V1RAMW(a, v, n) do { if ((a) < rstv_v1ramw_hi && (a) + (n) > rstv_v1ramw_lo) rstv_v1ramw_log(a, v, n); } while (0)
 extern "C" void FASTCALL Vdp1RamWriteByte(u32 addr, u8 val) {
    addr &= 0x7FFFF;
+   V1RAMW(addr, val, 1);
    rstv_vdp1_page_stamp[addr >> 12] = rstv_vdp1_serial;
    T1WriteByte(Vdp1Ram, addr, val);
    vdp1_clock = 0;
@@ -134,6 +147,7 @@ extern "C" void FASTCALL Vdp1RamWriteByte(u32 addr, u8 val) {
 //////////////////////////////////////////////////////////////////////////////
 extern "C" void FASTCALL Vdp1RamWriteWord(u32 addr, u16 val) {
    addr &= 0x7FFFF;
+   V1RAMW(addr, val, 2);
    rstv_vdp1_page_stamp[addr >> 12] = rstv_vdp1_serial;
    T1WriteWord(Vdp1Ram, addr, val);
    vdp1_clock = 0;
@@ -150,6 +164,7 @@ extern "C" void rstv_vdp1_ram_touch(u32 addr, u32 bytes) {
 
 extern "C" void FASTCALL Vdp1RamWriteLong(u32 addr, u32 val) {
    addr &= 0x7FFFF;
+   V1RAMW(addr, val, 4);
    //if(addr == 0x00000)
    //LOG("Vdp1RamWriteLong @ %08X", CurrentSH2->regs.PC);
    rstv_vdp1_page_stamp[addr >> 12] = rstv_vdp1_serial;
@@ -185,6 +200,19 @@ extern "C" u16 FASTCALL Vdp1FrameBufferReadWord(u32 addr) {
    return T1ReadWord(Vdp1FrameBuffer[Vdp1External.current_frame], addr);
 }
 
+// ReST-V (ADR-165): n words into high work RAM offset hwoff (same as n Vdp1FrameBufferReadWord calls)
+extern "C" void rstv_vidsoft_fb_read_words_hw(u32 addr, u32 hwoff, int n);
+extern "C" void VIDSoftVdp1ReadFrameBuffer(u32 type, u32 addr, void * out);
+extern "C" void Vdp1FrameBufferReadWordsHw(u32 addr, u32 hwoff, int n) {
+   addr &= 0x3FFFF;
+   if (VIDCore->Vdp1ReadFrameBuffer == VIDSoftVdp1ReadFrameBuffer) {
+      rstv_vidsoft_fb_read_words_hw(addr, hwoff, n);
+      return;
+   }
+   for (int k = 0; k < n; k++)
+      T2WriteWord(HighWram, (hwoff + 2 * k) & 0xFFFFF, Vdp1FrameBufferReadWord((addr + 2 * k) & 0x3FFFF));
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 extern "C" u32 FASTCALL Vdp1FrameBufferReadLong(u32 addr) {
@@ -201,8 +229,19 @@ extern "C" u32 FASTCALL Vdp1FrameBufferReadLong(u32 addr) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+extern "C" void rstv_vdp1_manual_erase_req(void); // vidsoft.c, ADR-133
+extern "C" void rstv_vdp1_mode_change(void);
+extern "C" int rstv_vdp1_back_idx_get(void);
+#ifdef __vita__
+extern "C" int rstv_v1log_n;
+extern "C" unsigned rstv_v1log_from, rstv_v1log_to;
+extern "C" void rstv_log_printf(const char *fmt, ...);
+#endif
+extern "C" unsigned rstv_v1fb_writes; // CPU / DMA writes into the VDP1 framebuffer (diag)
+unsigned rstv_v1fb_writes;
 extern "C" void FASTCALL Vdp1FrameBufferWriteByte(u32 addr, u8 val) {
    addr &= 0x3FFFF;
+   rstv_v1fb_writes++;
 
    if (VIDCore->Vdp1WriteFrameBuffer)
    {
@@ -218,6 +257,7 @@ extern "C" void FASTCALL Vdp1FrameBufferWriteByte(u32 addr, u8 val) {
 
 extern "C" void FASTCALL Vdp1FrameBufferWriteWord(u32 addr, u16 val) {
    addr &= 0x3FFFF;
+   rstv_v1fb_writes++;
 
    if (VIDCore->Vdp1WriteFrameBuffer)
    {
@@ -229,10 +269,27 @@ extern "C" void FASTCALL Vdp1FrameBufferWriteWord(u32 addr, u16 val) {
    T1WriteWord(Vdp1FrameBuffer[Vdp1External.current_frame], addr, val);
 }
 
+// ReST-V (ADR-142): n words from high work RAM offset hwoff (same as n Vdp1FrameBufferWriteWord calls)
+extern "C" void rstv_vidsoft_fb_words_hw(u32 addr, u32 hwoff, int n);
+extern "C" void VIDSoftVdp1WriteFrameBuffer(u32 type, u32 addr, u32 val);
+extern "C" void Vdp1FrameBufferWriteWordsHw(u32 addr, u32 hwoff, int n) {
+   addr &= 0x3FFFF;
+   rstv_v1fb_writes += (unsigned)n;
+   if (VIDCore->Vdp1WriteFrameBuffer == VIDSoftVdp1WriteFrameBuffer)
+      rstv_vidsoft_fb_words_hw(addr, hwoff, n);
+   else if (VIDCore->Vdp1WriteFrameBuffer)
+      for (int k = 0; k < n; k++)
+         VIDCore->Vdp1WriteFrameBuffer(1, (addr + 2 * k) & 0x3FFFF, T2ReadWord(HighWram, (hwoff + 2 * k) & 0xFFFFF));
+   u8 *fb = Vdp1FrameBuffer[Vdp1External.current_frame];
+   for (int k = 0; k < n; k++)
+      T1WriteWord(fb, (addr + 2 * k) & 0x3FFFF, T2ReadWord(HighWram, (hwoff + 2 * k) & 0xFFFFF));
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 extern "C" void FASTCALL Vdp1FrameBufferWriteLong(u32 addr, u32 val) {
    addr &= 0x3FFFF;
+   rstv_v1fb_writes++;
 
    if (VIDCore->Vdp1WriteFrameBuffer)
    {
@@ -505,12 +562,20 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
   addr &= 0xFF;
   switch(addr) {
     case 0x0:
+#ifdef RSTV
+      if ((Vdp1Regs->TVMR ^ val) & 7)
+        rstv_vdp1_mode_change();
+#endif
       Vdp1Regs->TVMR = val;
       FRAMELOG("[VDP1] Write VBE=%d line = %d", (Vdp1Regs->TVMR >> 3) & 0x01, yabsys.LineCount);
     break;
     case 0x2:
       FRAMELOG("[VDP1] Write FCM=%d FCT=%d line = %d", (val & 0x02) >> 1, (val & 0x01), yabsys.LineCount);
       Vdp1Regs->FBCR = val;
+#if defined(RSTV) && defined(__vita__)
+      {
+        if (rstv_v1log_n > 0 && (unsigned)yabsys.frame_count >= rstv_v1log_from && (unsigned)yabsys.frame_count <= rstv_v1log_to) { rstv_v1log_n--; rstv_log_printf("fbcr f%u l%d %x back %d", (unsigned)yabsys.frame_count, yabsys.LineCount, val, rstv_vdp1_back_idx_get()); } }
+#endif
       if ((Vdp1Regs->FBCR & 3) == 3) {
         //FRAMELOG("[VDP1] FCBR swtich to manual change");
         Vdp1External.manualchange = 1;
@@ -518,6 +583,9 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       else if ((Vdp1Regs->FBCR & 3) == 2) {
         //FRAMELOG("[VDP1] FBCR swtich to manual erase");
         Vdp1External.manualerase = 1;
+#ifdef RSTV
+        rstv_vdp1_manual_erase_req();
+#endif
       }
       break;
     case 0x4:

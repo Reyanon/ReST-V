@@ -49,7 +49,11 @@ static void *thread_entry(void *p)
 {
 	StartInfo *si = (StartInfo *)p;
 #ifdef __vita__
-	int mask = (si->id == YAB_THREAD_SCSP) ? SCE_KERNEL_CPU_MASK_USER_1 : SCE_KERNEL_CPU_MASK_USER_2;
+	extern int rstv_rax_thread_cpu;
+	int mask = (si->id == YAB_THREAD_SCSP) ? SCE_KERNEL_CPU_MASK_USER_1 :
+		(si->id == YAB_THREAD_SCSPDSP) ? 0x80000 :                             // ADR-158: CPU3 (no SDK constant)
+		(si->id == YAB_THREAD_RAX) ? (rstv_rax_thread_cpu == 3 ? 0x80000 : SCE_KERNEL_CPU_MASK_USER_2) : // ADR-176
+		SCE_KERNEL_CPU_MASK_USER_2;
 	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
 #endif
 	return si->func(si->arg);
