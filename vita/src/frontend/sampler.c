@@ -19,6 +19,8 @@ static volatile int s_run;
 static unsigned s_act[NACT];
 static unsigned s_pc[HSIZE], s_pcn[HSIZE];
 static unsigned s_total;
+static unsigned s_rax[8]; // RAX board state of the sound thread (rstv_rax_act)
+extern volatile int rstv_rax_act;
 
 static int sampler_thread(SceSize args, void *argp)
 {
@@ -29,6 +31,7 @@ static int sampler_thread(SceSize args, void *argp)
 		const int a = rstv_act & (NACT - 1);
 		s_act[a]++;
 		s_total++;
+		s_rax[rstv_rax_act & 7]++;
 		if (a == 1 || a == 2) {
 			const unsigned pc = rstv_act_pc | (a == 2 ? 1u : 0u); // slave marked with an odd address
 			unsigned h = (pc * 2654435761u) >> (32 - HBITS);
@@ -46,6 +49,8 @@ static int sampler_thread(SceSize args, void *argp)
 
 void rstv_sampler_start(void)
 {
+	extern int rstv_rax_act_on;
+	rstv_rax_act_on = 1;
 	s_run = 1;
 	SceUID t = sceKernelCreateThread("rstv_sampler", sampler_thread, 64, 0x2000, 0, 0x80000, NULL); // CPU3 (shared with the system):
 	// on CPU1 the sound thread starved it (pblbeach), on CPU2 the prep and audio threads (34 samples a window in vfremix)
@@ -60,6 +65,15 @@ void rstv_sampler_report(char *out, int size)
 		"m68ksync", "front", "v2vout", "hbout", "hbin", "scudma", "erase", "v1change", "hbint", "hbdma", "v2start", "dsp",
 		"scutimer", "v1draw", "v2screens", "v1end", "v2end", "cfetch", "cemit", "cother", "csync", "ccopy", "sndsync", "cheat" };
 	int n = snprintf(out, size, "sample %u:", s_total);
+	if (s_total && s_total != s_rax[0]) { // the board's share of wall time: native loops, blocks, interpreter, frame loop, dispatch
+		static const char *rn[8] = { "-", "nl", "jit", "int", "frame", "disp", "6", "7" };
+		n += snprintf(out + n, size - n, " rax");
+		for (int k = 1; k < 8 && n < size; k++)
+			if (s_rax[k])
+				n += snprintf(out + n, size - n, " %s %.1f%%", rn[k], 100.0 * s_rax[k] / s_total);
+		n += snprintf(out + n, size - n, " |");
+	}
+	memset(s_rax, 0, sizeof(s_rax));
 	for (int a = 0; a < NACT && n < size; a++)
 		if (s_act[a])
 			n += snprintf(out + n, size - n, " %s %.1f%%", names[a], 100.0 * s_act[a] / s_total);

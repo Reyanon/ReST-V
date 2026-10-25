@@ -71,8 +71,12 @@ template <int X> static RAX_AI uint16_t nalux(const RaxN &r)
 }
 template <int Y> static RAX_AI uint16_t naluy(const RaxN &r) { return Y == 0 ? r.ay0 : Y == 1 ? r.ay1 : Y == 2 ? r.af : r.zero; }
 
+// MD (ADR-200): bit 0: the flags are not kept (an iteration before the last one of a body that reads none), bit 1: the
+// MSTAT modes are fixed at compile time, bit 2: AR saturation on, bit 3: fractional MAC (shift 1)
+enum { MD_NF = 1, MD_FIX = 2, MD_SAT = 4, MD_FRAC = 8 };
+
 // ---- MAC (mac_op_mr / mac_op_mf, not the xop == yop forms) ----
-template <uint32_t OP> static RAX_AI int64_t nmac(const RaxN &r)
+template <uint32_t OP, int MD = 0> static RAX_AI int64_t nmac(const RaxN &r)
 {
 	enum { X = (OP >> 8) & 7, Y = (OP >> 11) & 3, F = (OP >> 13) & 15 };
 	const int32_t xs = (int16_t)nmacx<X>(r), ys = (int16_t)nmacy<Y>(r);
@@ -80,7 +84,7 @@ template <uint32_t OP> static RAX_AI int64_t nmac(const RaxN &r)
 	// signed / unsigned operands by function: SS for 1-4, 8, 12; SU 5, 9, 13; US 6, 10, 14; UU 7, 11, 15
 	const int32_t xo = (F == 6 || F == 7 || F == 10 || F == 11 || F == 14 || F == 15) ? xu : xs;
 	const int32_t yo = (F == 5 || F == 7 || F == 9 || F == 11 || F == 13 || F == 15) ? yu : ys;
-	int32_t temp = (int32_t)((uint32_t)((uint32_t)xo * (uint32_t)yo) << r.shift);
+	int32_t temp = (int32_t)((uint32_t)((uint32_t)xo * (uint32_t)yo) << ((MD & MD_FIX) ? (MD & MD_FRAC ? 1 : 0) : r.shift));
 	const int64_t mr = (int64_t)r.mr;
 	int64_t res;
 	switch (F) {
@@ -97,24 +101,26 @@ template <uint32_t OP> static RAX_AI int64_t nmac(const RaxN &r)
 	}
 	return res;
 }
-template <uint32_t OP> static RAX_AI void nmac_mr(RaxN &r)
+template <uint32_t OP, int MD = 0> static RAX_AI void nmac_mr(RaxN &r)
 {
 	if (((OP >> 13) & 15) == 0)
 		return;
-	const int64_t res = nmac<OP>(r);
-	const uint32_t t = (uint32_t)(res >> 31) & 0x1ff;
-	r.mv = t != 0x000 && t != 0x1ff;
+	const int64_t res = nmac<OP, MD>(r);
+	if (!(MD & MD_NF)) {
+		const uint32_t t = (uint32_t)(res >> 31) & 0x1ff;
+		r.mv = t != 0x000 && t != 0x1ff;
+	}
 	r.mr = (uint64_t)res;
 }
-template <uint32_t OP> static RAX_AI void nmac_mf(RaxN &r)
+template <uint32_t OP, int MD = 0> static RAX_AI void nmac_mf(RaxN &r)
 {
 	if (((OP >> 13) & 15) == 0)
 		return;
-	r.mf = (uint16_t)((uint32_t)nmac<OP>(r) >> 16);
+	r.mf = (uint16_t)((uint32_t)nmac<OP, MD>(r) >> 16);
 }
 
 // ---- ALU (alu_op_ar / alu_op_af and their constant forms, without ABS or DIVS / DIVQ) ----
-template <uint32_t OP, int TO_AR, int CONST> static RAX_AI void nalu(RaxN &r)
+template <uint32_t OP, int TO_AR, int CONST, int MD = 0> static RAX_AI void nalu(RaxN &r)
 {
 	enum { X = (OP >> 8) & 7, Y = (OP >> 11) & 3, F = (OP >> 13) & 15 };
 	const int32_t x = nalux<X>(r), y = CONST ? constants[((OP >> 5) & 7) | ((OP >> 11) & 3) << 3] : naluy<Y>(r);
@@ -142,12 +148,21 @@ template <uint32_t OP, int TO_AR, int CONST> static RAX_AI void nalu(RaxN &r)
 		v = ((uint32_t)(s ^ d ^ res ^ (res >> 1)) >> 15) & 1;
 		c = nzvc == 1 ? ((uint32_t)res >> 16) & 1 : ((uint32_t)~res >> 16) & 1;
 	}
+	if (MD & MD_NF) { // (sticky V off here)
+		if (TO_AR && ((MD & MD_FIX) ? (MD & MD_SAT) != 0 : r.sat) && v)
+			res = c ? -32768 : 32767;
+		if (TO_AR)
+			r.ar = (uint16_t)res;
+		else
+			r.af = (uint16_t)res;
+		return;
+	}
 	r.an = ((uint32_t)res >> 15) & 1;
 	r.az = (res & 0xffff) == 0;
 	r.av = (r.sticky & r.av) | v; // CLR_FLAGS keeps V in sticky mode
 	r.ac = c;
 	if (TO_AR) {
-		if (r.sat && r.av)
+		if (((MD & MD_FIX) ? (MD & MD_SAT) != 0 : r.sat) && r.av)
 			res = r.ac ? -32768 : 32767;
 		r.ar = (uint16_t)res;
 	} else
@@ -155,13 +170,13 @@ template <uint32_t OP, int TO_AR, int CONST> static RAX_AI void nalu(RaxN &r)
 }
 
 // function on the 4 kinds of ALU / MAC with a data move (op bits 16-17: MAC to MR, ALU to AR, MAC to MF, ALU to AF)
-template <uint32_t OP, int K, int CONST = 0> static RAX_AI void namf(RaxN &r)
+template <uint32_t OP, int K, int CONST = 0, int MD = 0> static RAX_AI void namf(RaxN &r)
 {
 	switch (K & 3) {
-	case 0: nmac_mr<OP>(r); break;
-	case 1: nalu<OP, 1, CONST>(r); break;
-	case 2: nmac_mf<OP>(r); break;
-	case 3: nalu<OP, 0, CONST>(r); break;
+	case 0: nmac_mr<OP, MD>(r); break;
+	case 1: nalu<OP, 1, CONST, MD>(r); break;
+	case 2: nmac_mf<OP, MD>(r); break;
+	case 3: nalu<OP, 0, CONST, MD>(r); break;
 	}
 }
 
@@ -215,8 +230,11 @@ template <int I, int M, uint32_t CM> static RAX_AI uint32_t ndag(RaxN &r)
 		r.i[I] = a + r.m[M]; // no wrap in this run
 	return a;
 }
+#define NX_REV 0x100u // DY bit 8: MSTAT bit reverse on: DAG1 addresses go through the reverse table (all I dynamic)
 template <int I, uint32_t DY> static RAX_AI uint16_t *nmem(RaxN &r, uint32_t a) // the word at data address a
 {
+	if ((DY & NX_REV) && I < 4)
+		a = s_cpu.m_reverse_table[a & 0x3fff];
 	return (DY >> I & 1) ? (a < 0x2000 ? &r.db[a] : &s_iram[a - 0x2000]) : &r.mp[I][a];
 }
 template <uint32_t OP, uint32_t CM, uint32_t DY> static RAX_AI uint16_t &ndm1(RaxN &r) // DM(I, M) through DAG1 (op bits 0-3)
@@ -302,7 +320,7 @@ template <uint32_t OP, uint32_t DY, uint32_t TOP, uint32_t LEN> static RAX_AI in
 {
 	int ok = 1;
 	if (nx_dm1(OP) && (DY >> ((OP >> 2) & 3) & 1))
-		ok &= r.i[(OP >> 2) & 3] < 0x3fe0;
+		ok &= ((DY & NX_REV) ? (uint32_t)s_cpu.m_reverse_table[r.i[(OP >> 2) & 3] & 0x3fff] : r.i[(OP >> 2) & 3]) < 0x3fe0;
 	if (nx_dm2(OP) && (DY >> (4 + ((OP >> 2) & 3)) & 1))
 		ok &= r.i[4 + ((OP >> 2) & 3)] < 0x3fe0;
 	if (nx_pmw(OP) && (DY >> (4 + ((OP >> 2) & 3)) & 1))
@@ -311,7 +329,7 @@ template <uint32_t OP, uint32_t DY, uint32_t TOP, uint32_t LEN> static RAX_AI in
 }
 
 // one instruction at TOP + POS (exec order: data writes before the function, reads after it)
-template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, uint32_t POS, uint32_t OP> static RAX_AI void nx(RaxN &r)
+template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, uint32_t POS, uint32_t OP, int MD = 0> static RAX_AI void nx(RaxN &r)
 {
 	static_assert(nx_ok(OP), "RAX native loop: unsupported instruction");
 	enum { T = OP >> 16, D = (OP >> 4) & 15 };
@@ -352,10 +370,10 @@ template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, uint32_t POS, ui
 			}
 		}
 	} else if (T >= 0x20 && T <= 0x27) {
-		namf<OP, (T >> 1) & 3, (T & 2) && ((OP >> 4) & 1)>(r); // MAC MR, ALU AR, MAC MF, ALU AF (condition TRUE)
+		namf<OP, (T >> 1) & 3, (T & 2) && ((OP >> 4) & 1), MD>(r); // MAC MR, ALU AR, MAC MF, ALU AF (condition TRUE)
 	} else if (T == 0x28 || T == 0x29) {
 		const int32_t v = nrd0<OP & 15>(r);
-		nmac_mr<OP>(r);
+		nmac_mr<OP, MD>(r);
 		nwr0<D>(r, v);
 	} else if (nx_imm1(OP)) {
 		ndm1<OP, CM, DY>(r) = (uint16_t)(OP >> 4);
@@ -371,17 +389,17 @@ template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, uint32_t POS, ui
 				ndm1<OP, CM, DY>(r) = (uint16_t)v;
 			else
 				ndm2<OP, CM, DY>(r) = (uint16_t)v;
-			namf<OP, (T >> 1) & 3>(r);
+			namf<OP, (T >> 1) & 3, 0, MD>(r);
 		} else {
-			namf<OP, (T >> 1) & 3>(r);
+			namf<OP, (T >> 1) & 3, 0, MD>(r);
 			const uint32_t v = T < 0x60 ? npm_r<OP, CM, DY>(r) : T < 0x70 ? ndm1<OP, CM, DY>(r) : ndm2<OP, CM, DY>(r);
 			nwr0<D>(r, (int32_t)v);
 		}
 	} else if (T >= 0xc0) {
 		if ((OP >> 17) & 1)
-			nalu<OP, 1, 0>(r);
+			nalu<OP, 1, 0, MD>(r);
 		else
-			nmac_mr<OP>(r);
+			nmac_mr<OP, MD>(r);
 		const uint16_t d = ndm1<OP, CM, DY>(r);
 		switch ((OP >> 18) & 3) {
 		case 0: r.ax0 = d; break;
@@ -401,7 +419,7 @@ template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, uint32_t POS, ui
 
 // a body with jumps or dynamic I registers (CF) skips the words a jump passes over and stops at a jump out of the loop
 // or before a word whose address is not fine (the usual paths go on from there, mid-loop)
-template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, uint32_t POS, uint32_t OP> static RAX_AI void nstep(RaxN &r)
+template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, uint32_t POS, uint32_t OP, int MD> static RAX_AI void nstep(RaxN &r)
 {
 	if (CF) {
 		if (r.skip) {
@@ -415,19 +433,31 @@ template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, uint32_t
 			return;
 		}
 	}
-	nx<CM, DY, TOP, LEN, POS, OP>(r);
+	nx<CM, DY, TOP, LEN, POS, OP, MD>(r);
 	if (CF) {
 		r.ran++;
 		r.last = TOP + POS;
 	}
 }
-template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, uint32_t POS> static RAX_AI void nseq(RaxN &) {}
-template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, uint32_t POS, uint32_t OP, uint32_t... REST>
+template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, int MD, uint32_t POS> static RAX_AI void nseq(RaxN &) {}
+template <uint32_t CM, uint32_t DY, uint32_t TOP, uint32_t LEN, int CF, int MD, uint32_t POS, uint32_t OP, uint32_t... REST>
 static RAX_AI void nseq(RaxN &r)
 {
-	nstep<CM, DY, TOP, LEN, CF, POS, OP>(r);
-	nseq<CM, DY, TOP, LEN, CF, POS + 1, REST...>(r);
+	nstep<CM, DY, TOP, LEN, CF, POS, OP, MD>(r);
+	nseq<CM, DY, TOP, LEN, CF, MD, POS + 1, REST...>(r);
 }
+
+// a word that reads a flag (a condition, MR saturation, an ALU function with the carry in): its body keeps them all
+static constexpr bool nx_alu_c(uint32_t op) { return ((op >> 13) & 15) == 2 || ((op >> 13) & 15) == 6 || ((op >> 13) & 15) == 10; }
+static constexpr bool nx_flr(uint32_t op)
+{
+	return nx_jmp(op) || nx_t(op) == 0x05 ||
+		(nx_t(op) >= 0x20 && nx_t(op) <= 0x27 && ((nx_t(op) >> 1) & 1) && nx_alu_c(op)) ||
+		(nx_t(op) >= 0x50 && nx_t(op) <= 0x7f && ((nx_t(op) >> 1) & 1) && nx_alu_c(op)) ||
+		(nx_t(op) >= 0xc0 && ((op >> 17) & 1) && nx_alu_c(op));
+}
+static constexpr bool nf_flr() { return false; }
+template <class... T> static constexpr bool nf_flr(uint32_t a, T... r) { return nx_flr(a) || nf_flr(r...); }
 
 // ---- the registers a body uses (compile time), so a run loads and stores only those ----
 // bits 0-14: AX0 AX1 MX0 MX1 AY0 AY1 MY0 MY1 SI SE AR AF MF SR0 SR1, 15 MR, 16 flags, 17 PX, 18 the zero register,
@@ -541,7 +571,7 @@ struct RaxNRes { int ins, full, xpc; uint32_t last; };
 // up to k iterations (the caller checked the static I registers' ranges and set mp)
 template <uint32_t CM, uint32_t TOP, uint32_t... OPS> static RaxNRes nl_run(adsp21xx_device *c, uint16_t *const *mp, int k)
 {
-	enum : uint32_t { LEN = sizeof...(OPS), DY = nf_dyn<OPS...>() };
+	enum : uint32_t { LEN = sizeof...(OPS), DY = CM == 0xffffffffu ? 0xffu | NX_REV : nf_dyn<OPS...>() };
 	enum { CF = DY != 0 || nf_jmp(OPS...) };
 	static constexpr uint64_t U = nf_use(OPS...);
 	RaxN r;
@@ -552,8 +582,18 @@ template <uint32_t CM, uint32_t TOP, uint32_t... OPS> static RaxNRes nl_run(adsp
 	r.xpc = -1;
 	r.last = TOP + LEN - 1;
 	int n = 0;
+	if (!CF && !nf_flr(OPS...) && !r.sticky && k >= 2) {
+		// ADR-200: no word reads a flag: all iterations but the last one without them, the MSTAT modes as constants
+		enum : uint32_t { C2 = CM & ~DY & 0xff };
+		switch ((r.sat ? MD_SAT : 0) | (r.shift ? MD_FRAC : 0)) {
+		case 0: for (; n < k - 1; n++) nseq<C2, DY, TOP, LEN, 0, MD_NF | MD_FIX, 0, OPS...>(r); break;
+		case MD_SAT: for (; n < k - 1; n++) nseq<C2, DY, TOP, LEN, 0, MD_NF | MD_FIX | MD_SAT, 0, OPS...>(r); break;
+		case MD_FRAC: for (; n < k - 1; n++) nseq<C2, DY, TOP, LEN, 0, MD_NF | MD_FIX | MD_FRAC, 0, OPS...>(r); break;
+		default: for (; n < k - 1; n++) nseq<C2, DY, TOP, LEN, 0, MD_NF | MD_FIX | MD_SAT | MD_FRAC, 0, OPS...>(r); break;
+		}
+	}
 	for (; n < k; n++) {
-		nseq<CM & ~DY, DY, TOP, LEN, CF, 0, OPS...>(r);
+		nseq<(CM & ~DY & 0xff), DY, TOP, LEN, CF, 0, 0, OPS...>(r);
 		if (CF && r.skip) // stopped (skip -1)
 			break;
 	}
@@ -574,11 +614,11 @@ struct RaxNLoop
 	uint16_t top;
 	uint8_t len, cm[2]; // the I registers stepped with the wrap in the two compiled forms (the second one covers the first)
 	uint32_t ops[9];
-	RaxNRes (*run[2])(adsp21xx_device *, uint16_t *const *, int);
+	RaxNRes (*run[3])(adsp21xx_device *, uint16_t *const *, int); // [2]: MSTAT bit reverse on (ADR-199)
 	RaxNReg reg[8];
 	uint8_t nreg, dy; // dy: the dynamic I registers (no range check before the run)
 };
-#define RAX_NL(top, cm, cm2, ...) { top, sizeof((uint32_t[]){ __VA_ARGS__ }) / 4, { cm, cm2 }, { __VA_ARGS__ }, 	{ nl_run<cm, top, __VA_ARGS__>, nl_run<cm2, top, __VA_ARGS__> }, {}, 0, 0 }
+#define RAX_NL(top, cm, cm2, ...) { top, sizeof((uint32_t[]){ __VA_ARGS__ }) / 4, { cm, cm2 }, { __VA_ARGS__ }, 	{ nl_run<cm, top, __VA_ARGS__>, nl_run<cm2, top, __VA_ARGS__>, nl_run<0xffffffffu, top, __VA_ARGS__> }, {}, 0, 0 }
 static RaxNLoop s_nloops[] = {
 	RAX_NL(0x316c, 0x00, 0x30, 0x60803c, 0x606940, 0x632458, 0x6a64a1, 0x6881a5, 0xf84844, 0x526c60, 0x6b2cad, 0x6800a9), // FFT
 	RAX_NL(0x318a, 0x00, 0x30, 0x708039, 0x606940, 0x632458, 0x6a64a1, 0x6881a5, 0xf84844, 0x526c60, 0x6b2cad, 0x6800a9),
@@ -597,6 +637,7 @@ static RaxNLoop s_nloops[] = {
 	RAX_NL(0x30da, 0x00, 0xff, 0x600000, 0x60004c, 0x680042, 0x68000f),
 	RAX_NL(0x3c91, 0x00, 0xff, 0x638609, 0x1bc940, 0x600009, 0x2278df, 0x1bca07, 0x0d047a, 0x12160b), // bit unpack (jumps out)
 	RAX_NL(0x3daa, 0x00, 0xff, 0x608aa6, 0x6800c7),
+	RAX_NL(0x3149, 0x00, 0xff, 0x626057, 0x7ae0a1, 0x7a69a1, 0x7ae9a5, 0x7800a5, 0x600002, 0x600042, 0x600017), // bit-reversed input (ADR-199)
 	RAX_NL(0x00ad, 0x00, 0xff, 0x500001, 0x680005), // copies and fills
 	RAX_NL(0x3a6a, 0x00, 0xff, 0xa00001),
 	RAX_NL(0x3a7f, 0x00, 0xff, 0x6800a1),
@@ -607,6 +648,7 @@ static RaxNLoop s_nloops[] = {
 enum { RAX_NLN = sizeof(s_nloops) / sizeof(s_nloops[0]) };
 static uint8_t s_nl_at[0x4000];    // loop index + 1 at its top address
 unsigned rstv_rax_nl_runs, rstv_rax_nl_insns, rstv_rax_nl_miss; // diag
+extern "C" { int rstv_raxnl_prof; extern volatile int rstv_rax_act; extern int rstv_rax_act_on; } // diag (Vita): per-loop time, sampler state
 static int s_nl_on = -1;
 static void rax_nl_init()
 {
@@ -711,6 +753,19 @@ static int rax_nr_unpack_ok(const adsp21xx_device *c)
 	return c->m_loop == 0x3c97 && c->m_loop_condition == 14 && !(c->m_mstat & MSTAT_REVERSE) &&
 		!memcmp(&s_pram[0x3c91], s_nr_unpack_a, sizeof(s_nr_unpack_a)) && !memcmp(&s_pram[0x3ca0], s_nr_unpack_b, sizeof(s_nr_unpack_b));
 }
+// ADR-205: the refill path after a word's 16 bits (3C98-3C9F, 3C90) and its call (3D64-3D68)
+static const uint32_t s_nr_refill_a[8] = { 0x83dfd5, 0x83fe4a, 0x22ea0f, 0x22ea1f, 0x1bc995, 0x1fd64f, 0x3c0105, 0x1bc90f }; // 3C98
+static const uint32_t s_nr_refill_b[5] = { 0x83dfd5, 0x6308ed, 0x1bd693, 0x93dfda, 0x0a000f }; // 3D64
+#if !defined(__vita__)
+static const int s_nr_unpack_refill = !getenv("RSTV_NOREFILL"); // (ADR-205 A/B)
+#else
+static const int s_nr_unpack_refill = 1;
+#endif
+static int rax_nr_refill_ok()
+{
+	return s_pram[0x3c90] == 0x17c97e && !memcmp(&s_pram[0x3c98], s_nr_refill_a, sizeof(s_nr_refill_a)) &&
+		!memcmp(&s_pram[0x3d64], s_nr_refill_b, sizeof(s_nr_refill_b));
+}
 static RaxNRes rax_nr_unpack(adsp21xx_device *c)
 {
 	enum : uint32_t { T = 0x3c91, DY = 0xff }; // every I register checked at each use
@@ -722,6 +777,7 @@ static RaxNRes rax_nr_unpack(adsp21xx_device *c)
 #define NRW(a, op) do { if (budget <= 0 || !nx_dyok<op, DY, T, 24>(r)) { xpc = a; goto out; } \
 	nx<0, DY, T, 24, (a) - T, op>(r); budget--; ins++; last = a; } while (0)
 #define NRJ(a) do { if (budget <= 0) { xpc = a; goto out; } budget--; ins++; last = a; } while (0)
+#define NRD(a) do { budget--; ins++; last = a; } while (0)
 top:
 	NRW(0x3c91, 0x638609);
 	NRJ(0x3c92);
@@ -732,7 +788,38 @@ w3c94:
 	NRJ(0x3c95);
 	if (!r.av) goto w3ca0; // IF NOT AV JUMP 3CA0
 	NRW(0x3c96, 0x0d047a);
-	if (cntr < 2) { xpc = 0x3c97; goto out; } // loop end: the CE step at its fetch
+	if (cntr < 2) { // loop end: the CE step at its fetch
+		// ADR-205: the last bit of a word, then the refill path (3C98-3C9F with the call to 3D64) and the DO again,
+		// here while the input is there; it stops at the DMA wait (3C99), before 3D65 or at 3D69 (no data left)
+		if (!s_nr_unpack_refill || budget < 16 || !nx_dyok<0x12160b, DY, T, 24>(r) || !rax_nr_refill_ok()) {
+			xpc = 0x3c97;
+			goto out;
+		}
+		c->m_cntr = 0; // (cntr was 1) the CE step runs out: the counter, then the loop pop
+		c->cntr_stack_pop();
+		c->loop_stack_pop();
+		c->pc_stack_pop_val();
+		cntr = c->m_cntr;
+		nx<0, DY, T, 24, 0x3c97 - T, 0x12160b>(r);
+		NRD(0x3c97);
+		r.ay1 = s_iram[0x3dfd - 0x2000]; NRD(0x3c98); // AY1 = DM(3DFD)
+		r.ar = (uint16_t)c->data_read(0x3fe4); NRD(0x3c99); // AR = DM(3FE4) (BDMA word count)
+		nx<0, DY, T, 24, 0, 0x22ea0f>(r); NRD(0x3c9a); // AR = AR - AY1
+		nx<0, DY, T, 24, 0, 0x22ea1f>(r); NRD(0x3c9b); // AR = AR - 0010
+		NRD(0x3c9c);
+		if (!(r.an ^ r.av)) { xpc = 0x3c99; goto out; } // IF GE JUMP 3C99: waits for the DMA (usual path)
+		NRD(0x3c9d); c->m_pc = 0x3c9e; c->pc_stack_push(); // CALL 3D64
+		r.ay1 = s_iram[0x3dfd - 0x2000]; NRD(0x3d64); // AY1 = DM(3DFD)
+		NRW(0x3d65, 0x6308ed); // AR = AY1 - 1, SR0 = DM(I3,M1)
+		NRD(0x3d66);
+		if ((r.an ^ r.av) | r.az) { xpc = 0x3d69; goto out; } // IF LE JUMP 3D69 (the next block: usual path)
+		s_iram[0x3dfd - 0x2000] = r.ar; NRD(0x3d67); // DM(3DFD) = AR
+		c->pc_stack_pop_val(); NRD(0x3d68); // RTS
+		c->m_cntr = cntr; c->cntr_stack_push(); cntr = 0x10; NRD(0x3c9e); // CNTR = 0010
+		NRD(0x3c9f); // JUMP 3C90
+		c->loop_stack_push(0x3c97e); c->m_pc = 0x3c91; c->pc_stack_push(); NRD(0x3c90); // DO 3C97 UNTIL CE
+		goto top;
+	}
 	NRW(0x3c97, 0x12160b);
 	cntr--;
 	goto top;
@@ -759,6 +846,7 @@ w3ca3:
 	goto top;
 #undef NRW
 #undef NRJ
+#undef NRD
 out:
 	nstore<~0ull>(r, c);
 	c->m_base[2] = r.base[2];
@@ -790,6 +878,39 @@ static RAX_AI void nr_modify(RaxN &r, int I, int M) // modify_address
 	else if (i >= r.base[I] + r.l[I]) i -= r.l[I];
 	r.i[I] = i;
 }
+#if !defined(__vita__)
+static const int s_nr_fft_fast = !getenv("RSTV_NOFFTFAST"); // (ADR-204 A/B)
+#else
+static const int s_nr_fft_fast = 1;
+#endif
+// ADR-204: n butterflies (316C-3174) with the I registers static (I0-I3 linear in the range checked by nr_fft_fast_ok,
+// I4 / I5 circular) and the loop end left to the caller
+template <int MD> static RAX_AI void nr_fft_bf(RaxN &r, int n)
+{
+	for (int b = 0; b < n; b++)
+		nseq<0x30, 0, 0x316c, 9, 0, MD, 0, 0x60803c, 0x606940, 0x632458, 0x6a64a1, 0x6881a5, 0xf84844, 0x526c60, 0x6b2cad,
+			0x6800a9>(r);
+}
+// the data addresses of a whole group of cc butterflies through I0-I3 (each steps by M0 + M1 a butterfly; reads at
+// +M0) stay linear inside one region: the bank or internal RAM below the control registers
+static int nr_fft_fast_ok(RaxN &r, int cc)
+{
+	const int32_t m0 = r.m[0], m1 = r.m[1], s = m0 + m1, ext = (m0 < 0 ? -m0 : m0) + (m1 < 0 ? -m1 : m1);
+	const int32_t span = s * cc;
+
+	for (int k = 0; k < 4; k++) {
+		if (r.l[k])
+			return 0;
+		const int32_t i = (int32_t)r.i[k];
+		const int32_t lo = i + (span < 0 ? span : 0) - ext, hi = i + (span > 0 ? span : 0) + ext;
+		uint16_t *b = lo >= 0 && hi < 0x2000 ? r.db : lo >= 0x2000 && hi < 0x3fe0 ? s_iram - 0x2000 : NULL;
+		if (!b)
+			return 0;
+		r.mp[k] = b;
+
+	}
+	return 1;
+}
 static RaxNRes rax_nr_fft(adsp21xx_device *c)
 {
 	enum : uint32_t { T = 0x3166, DY = 0xff };
@@ -802,6 +923,41 @@ static RaxNRes rax_nr_fft(adsp21xx_device *c)
 #define NRS(a) do { if (budget <= 0) { xpc = a; goto out; } } while (0)
 #define NRD(a) do { budget--; ins++; last = a; } while (0)
 group:
+	if (s_nr_fft_fast) {
+		// ADR-204: a whole group at once (3166-3177, then the outer loop end) when the slice has room for it: the
+		// registers stay in r from group to group; the stacks are pushed and popped as the words do
+		const int cc = s_iram[0x3d85 - 0x2000] & 0x3fff, cost = 6 + 9 * cc + 3;
+		if (cc >= 1 && budget >= cost && nr_fft_fast_ok(r, cc)) {
+			r.i[4] = 0x2100; r.base[4] = 0x2100 & c->m_lmask[4];
+			r.i[5] = 0x2180; r.base[5] = 0x2180 & c->m_lmask[5];
+			c->cntr_stack_push(); c->m_cntr = (uint32_t)cc;
+			nx<0x30, 0, T, 19, 3, 0xe80004>(r);
+			nx<0x30, 0, T, 19, 4, 0x500074>(r);
+			c->loop_stack_push(0x3174e); c->m_pc = 0x316c; c->pc_stack_push();
+			if (cc > 1 && !r.sticky) {
+				switch ((r.sat ? MD_SAT : 0) | (r.shift ? MD_FRAC : 0)) {
+				case 0: nr_fft_bf<MD_NF | MD_FIX>(r, cc - 1); break;
+				case MD_SAT: nr_fft_bf<MD_NF | MD_FIX | MD_SAT>(r, cc - 1); break;
+				case MD_FRAC: nr_fft_bf<MD_NF | MD_FIX | MD_FRAC>(r, cc - 1); break;
+				default: nr_fft_bf<MD_NF | MD_FIX | MD_SAT | MD_FRAC>(r, cc - 1); break;
+				}
+				nr_fft_bf<0>(r, 1); // (the flags of the last one)
+			} else
+				nr_fft_bf<0>(r, cc);
+			c->m_cntr = 0; // loop end 3174: the last count pops
+			c->cntr_stack_pop();
+			c->loop_stack_pop();
+			c->pc_stack_pop_val();
+			nr_modify(r, 0, 2); nr_modify(r, 1, 2); nr_modify(r, 2, 2);
+			budget -= cost; ins += cost; last = 0x3177;
+			NRS(0x3178);
+			if ((int32_t)c->m_cntr < 2) { xpc = 0x3178; goto out; } // outer loop end: the last count pops (usual path)
+			c->m_cntr--;
+			nr_modify(r, 3, 2);
+			NRD(0x3178);
+			goto group;
+		}
+	}
 	NRS(0x3166); r.i[4] = 0x2100; r.base[4] = 0x2100 & c->m_lmask[4]; NRD(0x3166); // I4 = 2100
 	NRS(0x3167); r.i[5] = 0x2180; r.base[5] = 0x2180 & c->m_lmask[5]; NRD(0x3167); // I5 = 2180
 	NRS(0x3168); c->cntr_stack_push(); c->m_cntr = s_iram[0x3d85 - 0x2000] & 0x3fff; NRD(0x3168); // CNTR = DM(3D85)
@@ -809,6 +965,38 @@ group:
 	NRW(0x316a, 0x500074);
 	NRS(0x316b); c->loop_stack_push(0x3174e); c->m_pc = 0x316c; c->pc_stack_push(); NRD(0x316b); // DO 3174 UNTIL CE
 inner:
+	if ((int32_t)c->m_cntr >= 1 && budget >= 9) {
+		// ADR-196: the butterflies through the 316C loop's static run (the address ranges checked once, no check or
+		// wrap test at each access); the dynamic words below were 90 ns an instruction. ADR-200: the last one too (its
+		// loop end pops here), so groups of 2 (half of them) no longer go word by word
+		const RaxNLoop &L = s_nloops[0]; // 316C
+		static constexpr uint64_t UB = nf_use(0x60803c, 0x606940, 0x632458, 0x6a64a1, 0x6881a5, 0xf84844, 0x526c60, 0x6b2cad, 0x6800a9);
+		int kk = (int)c->m_cntr;
+		if (kk > budget / 9)
+			kk = budget / 9;
+		uint16_t *mp2[8] = { 0 };
+		nstore<UB>(r, c);
+		c->m_base[4] = r.base[4];
+		c->m_base[5] = r.base[5];
+		const int um = rax_nl_ranges(c, L, 0x316c, kk, mp2);
+		const int form = um < 0 ? -1 : !(um & ~L.cm[0]) ? 0 : !(um & ~L.cm[1]) ? 1 : -1;
+		if (form >= 0) {
+			const RaxNRes rr = L.run[form](c, mp2, kk);
+			budget -= rr.ins;
+			ins += rr.ins;
+			if (rr.ins)
+				last = rr.last;
+			nload<UB>(r, c);
+			if ((uint32_t)rr.full == c->m_cntr) { // the loop end's last count (as at 3174 below)
+				c->m_cntr = 0;
+				c->cntr_stack_pop();
+				c->loop_stack_pop();
+				c->pc_stack_pop_val();
+				goto ends;
+			}
+			c->m_cntr -= (uint32_t)rr.full;
+		}
+	}
 	NRW(0x316c, 0x60803c);
 	NRW(0x316d, 0x606940);
 	NRW(0x316e, 0x632458);
@@ -830,6 +1018,7 @@ inner:
 		if (again)
 			goto inner;
 	}
+ends:
 	NRS(0x3175); nr_modify(r, 0, 2); NRD(0x3175); // MODIFY (I0..I3, M2)
 	NRS(0x3176); nr_modify(r, 1, 2); NRD(0x3176);
 	NRS(0x3177); nr_modify(r, 2, 2); NRD(0x3177);
@@ -876,9 +1065,13 @@ static RAX_AI int rax_nl_try(adsp21xx_device *c, uint32_t pc)
 		k = c->m_icount / L.len;
 	if (k <= 0)
 		return 0;
+	if (c->m_mstat & MSTAT_REVERSE)
+		form = 2; // ADR-199: every I register dynamic (checked at each use), DAG1 addresses reversed
+	else {
 	um = rax_nl_ranges(c, L, pc, k, mp); // the I registers that wrap in this run
 	// a form whose circular set covers the wrapping ones (a circular step on an I that does not wrap is the linear one)
 	form = um < 0 ? -1 : !(um & ~L.cm[0]) ? 0 : !(um & ~L.cm[1]) ? 1 : -1;
+	}
 	}
 	if (form < 0) {
 		rstv_rax_nl_miss++;
@@ -906,8 +1099,31 @@ static RAX_AI int rax_nl_try(adsp21xx_device *c, uint32_t pc)
 		memcpy(p0, s_pram, sizeof(s_pram));
 	}
 #endif
+#if defined(__vita__)
+	const unsigned nlp_t0 = rstv_raxnl_prof ? sceKernelGetProcessTimeLow() : 0;
+#endif
+	if (rstv_rax_act_on) rstv_rax_act = 1;
 	const RaxNRes res = rt == 1 ? rax_nr_unpack(c) : rt == 2 ? rax_nr_fft(c) : L.run[form](c, mp, k);
+	if (rstv_rax_act_on) rstv_rax_act = 5;
 	const int ins = res.ins;
+#if defined(__vita__)
+	if (rstv_raxnl_prof) { // diag (ux0:data/restv/raxnlprof): time of each loop's runs on the device
+		static unsigned long long lr[RAX_NLN], lins[RAX_NLN], lus[RAX_NLN];
+		lr[li - 1]++;
+		lins[li - 1] += (unsigned)ins;
+		lus[li - 1] += sceKernelGetProcessTimeLow() - nlp_t0;
+		if ((rstv_rax_nl_runs & 0x3ffff) == 0x3ffff) {
+			extern void rstv_log_printf(const char *fmt, ...);
+			for (unsigned x = 0; x < RAX_NLN; x++)
+				if (lr[x])
+					rstv_log_printf("raxnlprof %04x runs %llu ins %llu us %llu (%.1f ns an insn)", s_nloops[x].top, lr[x], lins[x],
+						lus[x], lins[x] ? lus[x] * 1000.0 / lins[x] : 0.0);
+			memset(lr, 0, sizeof(lr));
+			memset(lins, 0, sizeof(lins));
+			memset(lus, 0, sizeof(lus));
+		}
+	}
+#endif
 	if (!ins)
 		return 0;
 	c->m_cntr -= (uint32_t)res.full;

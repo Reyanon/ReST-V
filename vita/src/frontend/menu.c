@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "frontend/cheats.h"
+#include "frontend/update.h"
 #include "frontend/stv_list.h"
 #include "frontend/ui.h"
 #include "stv.h"
@@ -785,7 +786,7 @@ static void ps_lock(int on)
 void rstv_kctrl_init(int restarted)
 {
 	const SceUID m = taiLoadStartKernelModule("ux0:app/RSTV00001/module/restv_kctrl.skprx", 0, NULL, 0); // (the kernel cannot open app0:)
-	// (the module name has a version, restv_kctrl_v4: a module of an older build may still be loaded until reboot)
+	// (the module name has a version, restv_kctrl_v7: a module of an older build may still be loaded until reboot)
 	if (m >= 0 && !restarted) {
 		static char *const av[] = { "kctrl", NULL };
 		sceAppMgrLoadExec("app0:eboot.bin", av, NULL);
@@ -796,7 +797,10 @@ void rstv_kctrl_init(int restarted)
 		ps_lock(1);
 	}
 }
-// call every frame anywhere: 1 once per single PS press; a double press goes home
+int rstv_kctrl_ready(void) { return s_kctrl > 0; } // (ADR-209: the update installs through it)
+// call every frame anywhere: 1 once per single PS press, when PS is let go (owner: PS + START takes a screenshot, the
+// menu must not cover it: START while PS is held drops that press); a double press goes home
+static int s_ps_pending; // a single press counted, PS still held
 static int ps_poll(void)
 {
 	if (s_kctrl < 0)
@@ -810,14 +814,25 @@ static int ps_poll(void)
 	if (two != s_ps_two) {
 		s_ps_two = two;
 		s_ps_one = one;
+		s_ps_pending = 0;
 		ps_lock(0);
 		rstvKCtrlGoHome();
 		s_ps_home_t = rstv_time_us();
 		return 0;
 	}
-	if (one == s_ps_one)
+	if (one != s_ps_one) {
+		s_ps_one = one;
+		s_ps_pending = 1;
+	}
+	if (!s_ps_pending)
 		return 0;
-	s_ps_one = one;
+	if (st & (1u << 30)) { // still held: START with it is the system's screenshot
+		SceCtrlData pad;
+		if (sceCtrlPeekBufferPositive(0, &pad, 1) >= 0 && (pad.buttons & SCE_CTRL_START))
+			s_ps_pending = 0;
+		return 0;
+	}
+	s_ps_pending = 0;
 	return 1;
 }
 
@@ -1917,6 +1932,109 @@ static void gl_row(UiCanvas *c, int px, int w, int ty, int g, int selected, int 
 	ui_text_clip(c, px + 48 - off, ty, col, 1.0f, s_stv_list[g].title, px + 48, px + w - 24);
 }
 
+// ---- ADR-209: update window over the game list (Update / Close / Skip this version) ----
+#define UPD_LINES 400
+#define UPD_W 840
+#define UPD_H 470
+#define UPD_TEXT_W (UPD_W - 64)
+#define UPD_VIS 13
+static char s_upd_line[UPD_LINES][160];
+static int s_upd_n, s_upd_scroll, s_upd_btn;
+static void upd_wrap(const char *notes) // the notes as lines of the window's width (word wrap)
+{
+	s_upd_n = 0;
+	const char *p = notes;
+	while (*p && s_upd_n < UPD_LINES) {
+		const char *e = strchr(p, '\n');
+		const size_t len = e ? (size_t)(e - p) : strlen(p);
+		char para[1024];
+		snprintf(para, sizeof(para), "%.*s", (int)(len < sizeof(para) - 1 ? len : sizeof(para) - 1), p);
+		if (!para[0])
+			s_upd_line[s_upd_n++][0] = 0;
+		for (char *q = para; *q && s_upd_n < UPD_LINES;) {
+			char line[160];
+			int take = 0, last_sp = -1;
+			while (q[take] && take < (int)sizeof(line) - 1) {
+				line[take] = q[take];
+				line[take + 1] = 0;
+				if (q[take] == ' ')
+					last_sp = take;
+				if (ui_text_width(0.8f, line) > UPD_TEXT_W - (para[0] == '#' ? 0 : 16)) {
+					if (last_sp > 0)
+						take = last_sp;
+					break;
+				}
+				take++;
+			}
+			snprintf(s_upd_line[s_upd_n++], sizeof(s_upd_line[0]), "%s%.*s", q == para || para[0] == '#' ? "" : "  ", take, q);
+			q += take;
+			while (*q == ' ')
+				q++;
+		}
+		p = e ? e + 1 : p + len;
+	}
+}
+static void upd_draw(UiCanvas *c, int o_ok)
+{
+	const int mx = (SCREEN_W - UPD_W) / 2, my = (SCREEN_H - UPD_H) / 2;
+	window_box(c, mx, my, UPD_W, UPD_H, COL_SEL, COL_PANEL);
+	char t[96];
+	snprintf(t, sizeof(t), "Update available: %s  (this version %s)", rstv_update_version(), RSTV_VERSION);
+	ui_text(c, mx + 24, my + 40, COL_TEXT, 1.0f, t);
+	for (int i = 0; i < UPD_VIS && s_upd_scroll + i < s_upd_n; i++) {
+		const char *l = s_upd_line[s_upd_scroll + i];
+		const int head = l[0] == '#';
+		ui_text(c, mx + 32, my + 80 + i * 24, head ? COL_SEL : COL_TEXT, head ? 0.9f : 0.8f, l + head);
+	}
+	if (s_upd_n > UPD_VIS) { // scroll bar
+		const int th = UPD_VIS * 24, ty = my + 62;
+		int bh = th * UPD_VIS / s_upd_n, by = ty + th * s_upd_scroll / s_upd_n;
+		if (bh < 16) bh = 16;
+		rrect(c, mx + UPD_W - 18, ty, 5, th, 2, UI_RGBA(0xFF, 0xFF, 0xFF, 0x18));
+		rrect(c, mx + UPD_W - 18, by, 5, bh, 2, UI_RGBA(0x8C, 0xD4, 0xFF, 0xB0));
+	}
+	static const char *const names[3] = { "Update", "Close", "Skip this version" };
+	int bx = mx + 24;
+	for (int i = 0; i < 3; i++) {
+		const int bw = ui_text_width(0.9f, names[i]) + 40, by = my + UPD_H - 74;
+		rrect(c, bx, by, bw, 36, 6, i == s_upd_btn ? COL_SEL : UI_RGBA(0xFF, 0xFF, 0xFF, 0x20));
+		ui_text(c, bx + 20, by + 25, i == s_upd_btn ? COL_PANEL : COL_TEXT, 0.9f, names[i]);
+		bx += bw + 16;
+	}
+	text_keys(c, mx + 24, my + UPD_H - 16, COL_DIM,
+		o_ok ? "Up/Down: notes   Left/Right: choose   " G_CIR ": OK   " G_CRO ": close"
+		     : "Up/Down: notes   Left/Right: choose   " G_CRO ": OK   " G_CIR ": close");
+}
+static void upd_progress(const char *stage, int pct) // (called while the update downloads)
+{
+	UiCanvas *c = s_cv;
+	const int mw = 760, mh = 140, mx = (SCREEN_W - mw) / 2, my = (SCREEN_H - mh) / 2;
+	// owner: the window's shadow got darker with every redraw: the screen under it is kept and put back first
+	static uint32_t *under;
+	if (!under) {
+		under = (uint32_t *)malloc((size_t)SCREEN_W * SCREEN_H * 4);
+		if (under)
+			memcpy(under, ui_pixels(c), (size_t)SCREEN_W * SCREEN_H * 4);
+	} else
+		ui_blit(c, under);
+	window_box(c, mx, my, mw, mh, COL_SEL, COL_PANEL);
+	char t[96];
+	if (pct == -2)
+		snprintf(t, sizeof(t), "%s", stage);
+	else if (pct >= 0)
+		snprintf(t, sizeof(t), "%s %s  %d%%", stage, rstv_update_version(), pct);
+	else
+		snprintf(t, sizeof(t), "%s %s ...", stage, rstv_update_version());
+	ui_text(c, mx + 24, my + 46, COL_TEXT, pct == -2 ? 0.9f : 1.0f, t);
+	if (pct != -2)
+		rrect(c, mx + 24, my + 74, mw - 48, 14, 6, UI_RGBA(0xFF, 0xFF, 0xFF, 0x20));
+	if (pct > 0)
+		rrect(c, mx + 24, my + 74, (mw - 48) * (pct > 100 ? 100 : pct) / 100, 14, 6, COL_SEL);
+	ui_text(c, mx + 24, my + mh - 20, COL_DIM, 0.8f, "Do not turn the Vita off");
+	ui_commit(c);
+	rstv_video_present();
+}
+
 const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 {
 	ensure_canvases();
@@ -1932,7 +2050,8 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 		auto_all = 1;
 	}
 	static int idx[RSTV_LIST_N];
-	int sel = 0, about = 0, dirty = 1;
+	int sel = 0, about = 0, dirty = 1, upd = 0;
+	static int upd_offered; // (once per run, ADR-209)
 	uint64_t rep = 0;
 	float scr = -1, tgt = 0; // list scroll (rows): drawn position easing to the target
 	static uint32_t *under; // the dimmed list under the options window
@@ -2012,7 +2131,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 		if (pad.ly > 128 + 48) b |= SCE_CTRL_DOWN;
 		if (pad.lx < 128 - 48) b |= SCE_CTRL_LEFT;
 		if (pad.lx > 128 + 48) b |= SCE_CTRL_RIGHT;
-		if (!s_list_mode && ps_poll()) { // owner: the PS button opens the options here too (rstv_menu_update closes them)
+		if (!s_list_mode && ps_poll() && !upd) { // owner: the PS button opens the options here too (rstv_menu_update closes them)
 			about = 0;
 			msg[0] = 0;
 			rstv_settings_use_global();
@@ -2022,13 +2141,43 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			s_prev_buttons = b;
 			dirty = 1;
 		}
-		const uint32_t pressed = key_repeat(b, b & ~prev, &rep);
+		uint32_t pressed = key_repeat(b, b & ~prev, &rep);
 		prev = b;
 		if (pressed)
 			dirty = 1;
 		const int o_ok = g_set.confirm == RSTV_CONFIRM_CIRCLE;
 		const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
-		if (s_list_mode) { // options (Display / Controls, global settings. Saved by rstv_menu_update on close)
+		if (!upd && !upd_offered && !s_list_mode && !about && !msg[0] && rstv_update_ready()) {
+			upd = upd_offered = 1; // ADR-209: a newer release (owner: Update / Close / Skip this version)
+			upd_wrap(rstv_update_notes());
+			s_upd_scroll = s_upd_btn = 0;
+			dirty = 1;
+		}
+		if (upd) {
+			extern int rstv_update_auto;
+			static int auto_step;
+			if (rstv_update_auto && auto_step++ == 2) { // test: the window drawn, saved, then Update
+				ui_save_ppm(c, DATA_DIR "/upd.ppm", UI_RGBA(0, 0, 0, 0xFF));
+				s_upd_btn = 0;
+				pressed |= ok;
+			}
+			if ((pressed & SCE_CTRL_UP) && s_upd_scroll > 0) s_upd_scroll--;
+			if ((pressed & SCE_CTRL_DOWN) && s_upd_scroll + UPD_VIS < s_upd_n) s_upd_scroll++;
+			if (pressed & SCE_CTRL_LEFT) s_upd_btn = wrap(s_upd_btn - 1, 3);
+			if (pressed & SCE_CTRL_RIGHT) s_upd_btn = wrap(s_upd_btn + 1, 3);
+			if (pressed & back)
+				upd = 0;
+			else if (pressed & ok) {
+				upd = 0;
+				if (s_upd_btn == 2)
+					rstv_update_skip();
+				else if (s_upd_btn == 0) {
+					const char *err = rstv_update_install(upd_progress); // (returns only on failure)
+					RSTV_LOG("update: failed: %s", err);
+					snprintf(msg, sizeof(msg), "Update failed: %s\nThis version stays installed", err);
+				}
+			}
+		} else if (s_list_mode) { // options (Display / Controls, global settings. Saved by rstv_menu_update on close)
 			const rstv_menu_result mr = rstv_menu_update(b);
 			if (mr != RSTV_MENU_STAY) {
 				s_list_mode = 0;
@@ -2167,7 +2316,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			} else {
 				ui_fill_rows(c, bgr, 0, 0, SCREEN_W, SCREEN_H);
 				const int rw = w - 16; // (room for the scroll bar)
-				const int still = s_list_mode || msg[0];
+				const int still = s_list_mode || msg[0] || upd; // (no blinking focus under a window)
 				s_focus_cy0 = la;
 				s_focus_cy1 = lb;
 				const int i0 = (int)floorf(scr), i1 = (int)ceilf(scr + rows_f + 2.0f * lpad / GL_LINE);
@@ -2252,6 +2401,8 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 						ui_text(c, mx + 24, my + 84, COL_TEXT, 0.9f, nl + 1);
 					ui_text(c, mx + 24, my + mh - 20, COL_DIM, 0.8f, "Press any button");
 				}
+				if (upd)
+					upd_draw(c, o_ok);
 				s_under = NULL;
 				if (s_list_mode) { // options just opened: dim the list once and keep it (the window redraws over it)
 					ui_rect(c, 0, 0, SCREEN_W, SCREEN_H, COL_BG);
@@ -2267,7 +2418,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				menu_paint(c, 1);
 			focus_end();
 			ui_commit(c);
-		} else if (!about && !msg[0] && !s_list_mode && mq_sel >= 0 && mq_tw > mq_w - 72) {
+		} else if (!about && !msg[0] && !upd && !s_list_mode && mq_sel >= 0 && mq_tw > mq_w - 72) {
 			// the selected row's title scrolls when longer than the row (ADR-099): 1 s pause → 60 px/s to the end →
 			// 1 s pause → from the start. Only this row is drawn again
 			const int avail = mq_w - 72, over = mq_tw - avail, hold = 60;

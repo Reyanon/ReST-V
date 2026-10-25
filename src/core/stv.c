@@ -268,6 +268,29 @@ u32 stv_5838_read_long(u32 off, u32 mask) // off = offset in the cartridge (0x7F
 	return r;
 }
 
+// ADR-207: n long reads of the port at once (an on-chip DMA from it); 0 if addr is not the port
+u32 stv_5838_read_longs(u32 addr, u32 *dst, u32 n)
+{
+	const u32 a = addr & 0x0FFFFFFF, off = a & 0x1FFFFFF;
+	if (!stv_5838_enabled || a < 0x02000000 || a >= 0x04000000 || (off & 0x7FFFFC) != 0x7FFFF8 || off >= 0x1800000)
+		return 0;
+	if (!(s_5838_control & 2)) {
+		const u32 v = T1ReadLong(CartridgeArea->rom, (off >> 23) * 0x800000 + 0x7FFFF8);
+		for (u32 i = 0; i < n; i++)
+			dst[i] = v;
+		return n;
+	}
+	u16 w[512];
+	for (u32 i = 0; i < n;) {
+		const u32 k = n - i < 256 ? n - i : 256;
+		sega5838_read_words(w, 2 * k);
+		for (u32 j = 0; j < k; j++)
+			dst[i + j] = (u32)w[2 * j] << 16 | w[2 * j + 1];
+		i += k;
+	}
+	return n;
+}
+
 void stv_5838_write(u32 off, u32 data, u32 mask) // off = offset in the cartridge, below 0x1800000
 {
 	s_5838_bank = (off >> 23) & 3;
@@ -812,6 +835,8 @@ static void sanjeon_decrypt(void)
 }
 
 #include "yabause.h"
+#include "vdp1.h"
+#include "scu.h"
 #include <time.h>
 #include "smpc.h"
 #include "stvio.h"
@@ -865,10 +890,14 @@ static void stv_frames_from_rtc(void)
 // loading a quick save). The clock must follow emulated time only, never the time the emulator was paused or reloaded
 int STVSaveState(FILE *fp)
 {
-	const int offset = StateWriteHeader(fp, "STV ", 3);
+	const int offset = StateWriteHeader(fp, "STV ", 5);
 	stv_state(fp, 1);
 	u32 fc = yabsys.frame_count;
 	fwrite(&fc, sizeof(fc), 1, fp);
+	s32 wl = yabsys.wait_line_count; // version 4 (ADR-197): the line a VDP1 draw ends on (-1: none)
+	fwrite(&wl, sizeof(wl), 1, fp);
+	s32 req[2] = { Vdp1External.manualchange, Vdp1External.manualerase }; // version 5 (ADR-206): FBCR requests not done yet
+	fwrite(req, sizeof(req), 1, fp);
 	u32 rax = rstv_rax_active; // version 3 (ADR-173): the batmanfr sound board
 	fwrite(&rax, sizeof(rax), 1, fp);
 	if (rax)
@@ -888,6 +917,40 @@ int STVLoadState(FILE *fp, int version, int size)
 		yabsys.frame_count = fc;
 	} else
 		stv_frames_from_rtc();
+	// ADR-197: a VDP1 draw in progress ends at yabsys.wait_line_count (the draw-end interrupt). It was not saved: a state
+	// saved during a draw never sent that interrupt, and a game waiting for it stopped (batmanfr). Older states: a
+	// draw end on the next line (a game not waiting takes one extra draw end)
+	if (version >= 4) {
+		s32 wl;
+		if (fread(&wl, sizeof(wl), 1, fp) != 1)
+			return -1;
+		yabsys.wait_line_count = wl;
+	} else
+		yabsys.wait_line_count = (yabsys.LineCount + 1) % (yabsys.MaxLineCount > 0 ? yabsys.MaxLineCount : 263);
+	// ADR-206: a manual frame change (FBCR FCM + FCT) or erase asked for and not done yet lives only in Vdp1External: a
+	// state saved between the request and the next V-blank lost it, the draw that follows the change never started and
+	// a game waiting for its draw end stopped (batmanfr quick saves). Older states: a change when FBCR asks for one
+	// (a game that was not waiting gets one extra change)
+	if (version >= 5) {
+		s32 req[2];
+		if (fread(req, sizeof(req), 1, fp) != 1)
+			return -1;
+		Vdp1External.manualchange = req[0];
+		Vdp1External.manualerase = req[1];
+#ifdef RSTV
+		if (req[1]) {
+			extern void rstv_vdp1_manual_erase_req(void);
+			rstv_vdp1_manual_erase_req();
+		}
+#endif
+	} else
+		Vdp1External.manualchange = (Vdp1Regs->FBCR & 3) == 3; // (an erase is not guessed)
+#if !defined(__vita__)
+	if (getenv("RSTV_STATELOG"))
+		fprintf(stderr, "state: wait_line %d line %d vdp1 status %d EDSR %02x PTMR %x TVMR %x FBCR %x change %d erase %d\n",
+			(int)yabsys.wait_line_count, (int)yabsys.LineCount, (int)Vdp1External.status, Vdp1Regs->EDSR, Vdp1Regs->PTMR,
+			Vdp1Regs->TVMR, Vdp1Regs->FBCR, Vdp1External.manualchange, Vdp1External.manualerase);
+#endif
 	u32 rax = 0;
 	if (version >= 3 && fread(&rax, sizeof(rax), 1, fp) != 1)
 		return -1;

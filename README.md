@@ -84,7 +84,7 @@ Set names are the MAME set names. ROMs must match the MAME romset; clone sets re
 parent zip. ST-V games also need the BIOS set `stvbios.zip`.
 
 **Performance**: *Playable*, *Partial* or *Not working*, and the average frame rate on a PS Vita at 444 MHz.
-ST-V rates are measured on the device for the current release: the exact average (frames divided by time) of the
+ST-V rates are measured on the device (the last check of each set): the exact average (frames divided by time) of the
 attract mode from frame 1500 to frame 2700 or later, after the BIOS start-up. Full speed is 59.94 fps, the Vita's
 refresh rate. A rate with `~` is estimated from tested games on the same board, not measured for that set. No rate
 means the set has not been measured.
@@ -100,9 +100,9 @@ known problem remains. Click a board to expand its list.
 |---|---|---|---|---|
 | `znpwfvt` | `znpwfv` | 1997 | All Japan Pro-Wrestling Featuring Virtua (T 971123 V1.000) | Playable<br>59.94 fps |
 | `aclub` |  | 1997 | Aroma Club (J 970611 V1.000) | Playable |
-| `astrass` |  | 1998 | Astra SuperStars (J 980514 V1.002) | Playable<br>58.57 fps |
+| `astrass` |  | 1998 | Astra SuperStars (J 980514 V1.002) | Playable<br>59.74 fps |
 | `bakubaku` |  | 1995 | Baku Baku Animal (J 950407 V1.000) | Playable<br>59.94 fps |
-| `batmanfr` |  | 1996 | Batman Forever (JUE 960507 V1.000) | Playable<br>58.94 fps |
+| `batmanfr` |  | 1996 | Batman Forever (JUE 960507 V1.000) | Playable<br>59.94 fps |
 | `chalgolf` |  | 1999 | Challenge Golf (J 990326 V1.000) | Playable |
 | `choroqhr` |  | 1998 | Choro Q Hyper Racing 5 (J 981230 V1.000) | Playable<br>59.94 fps |
 | `colmns97` |  | 1996 | Columns '97 (JET 961209 V1.000) | Playable<br>59.94 fps |
@@ -138,7 +138,7 @@ known problem remains. Click a board to expand its list.
 | `nclubv4` |  | 1997 | Name Club Ver.4 (J 971202 V1.000) | Playable<br>59.94 fps |
 | `supgoal` |  | 1998 | Nerae! Super Goal (J 981218 V1.000) | Playable<br>59.94 fps |
 | `othellos` |  | 1998 | Othello Shiyouyo (J 980423 V1.002) | Playable<br>59.94 fps |
-| `pblbeach` |  | 1995 | Pebble Beach - The Great Shot (JUE 950913 V0.990) | Playable<br>57.73 fps |
+| `pblbeach` |  | 1995 | Pebble Beach - The Great Shot (JUE 950913 V0.990) | Playable<br>58.5 fps |
 | `prikura` |  | 1996 | Princess Clara Daisakusen (J 960910 V1.000) | Partial<br>58.57 fps |
 | `prc297wi` |  | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 1) | Partial<br>58.53 fps |
 | `prc297wia` | `prc297wi` | 1997 | Print Club 2 '97 Winter Ver (J 971017 V1.100, set 2) | Partial<br>58.79 fps |
@@ -180,11 +180,11 @@ known problem remains. Click a board to expand its list.
 | `pclubyo2` |  | 1997 | Print Club Yoshimoto V2 (J 970422 V1.100) | Partial<br>59.94 fps |
 | `kiwames` |  | 1995 | Pro Mahjong Kiwame S (J 951020 V1.208) | Playable<br>59.77 fps |
 | `puyosun` |  | 1996 | Puyo Puyo Sun (J 961115 V0.001) | Playable<br>59.94 fps |
-| `thuntk` | `sandor` | 1997 | Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K) | Playable<br>58.76 fps |
+| `thuntk` | `sandor` | 1997 | Puzzle & Action: BoMulEul Chajara (JUET 970125 V2.00K) | Playable<br>59.94 fps |
 | `sandor` |  | 1995 | Puzzle & Action: Sand-R (J 951114 V1.000) | Playable<br>59.94 fps |
 | `thunt` | `sandor` | 1997 | Puzzle & Action: Treasure Hunt (JUET 970901 V2.00E) | Playable<br>59.94 fps |
 | `rsgun` |  | 1998 | Radiant Silvergun (JUET 980523 V1.000) | Playable<br>59.61 fps |
-| `hanagumi` |  | 1997 | Sakura Taisen - Hanagumi Taisen Columns (J 971007 V1.010) | Playable<br>58.01 fps |
+| `hanagumi` |  | 1997 | Sakura Taisen - Hanagumi Taisen Columns (J 971007 V1.010) | Playable<br>59.94 fps |
 | `seabass` |  | 1997 | Sea Bass Fishing (JUET 971110 V0.001) | Playable<br>59.12 fps |
 | `shanhigw` |  | 1995 | Shanghai - The Great Wall / Shanghai Triple Threat (JUE 950623 V1.005) | Playable<br>59.55 fps |
 | `shienryu` |  | 1997 | Shienryu (JUET 961226 V1.000) | Playable<br>59.94 fps |
@@ -197,24 +197,24 @@ known problem remains. Click a board to expand its list.
 | `sfish2` |  | 1995 | Sport Fishing 2 (UET 951106 V1.10e) | Partial<br>59.94 fps |
 | `sss` |  | 1998 | Steep Slope Sliders (JUET 981110 V1.000) | Playable<br>59.94 fps |
 | `stress` |  | 1998 | Stress Busters (J 981020 V1.000) | Partial<br>59.94 fps |
-| `suikoenb` |  | 1995 | Suiko Enbu / Outlaws of the Lost Dynasty (JUETL 950314 V2.001) | Playable<br>58.71 fps |
-| `smleague` |  | 1995 | Super Major League (U 960108 V1.000) | Partial<br>58.13 fps |
+| `suikoenb` |  | 1995 | Suiko Enbu / Outlaws of the Lost Dynasty (JUETL 950314 V2.001) | Playable<br>59.87 fps |
+| `smleague` |  | 1995 | Super Major League (U 960108 V1.000) | Partial<br>58.6 fps |
 | `sasissu` |  | 1998 | Taisen Tanto-R Sashissu!! (J 980216 V1.000) | Playable<br>59.94 fps |
 | `techbowl` |  | 1997 | Technical Bowling (J 971212 V1.000) | Playable<br>59.94 fps |
-| `twcup98` |  | 1998 | Tecmo World Cup '98 (JUET 980410 V1.000) | Playable<br>56.47 fps |
-| `twsoc98` | `twcup98` | 1998 | Tecmo World Soccer '98 (JUET 980410 V1.000) | Playable<br>57.02 fps |
+| `twcup98` |  | 1998 | Tecmo World Cup '98 (JUET 980410 V1.000) | Playable<br>59.94 fps |
+| `twsoc98` | `twcup98` | 1998 | Tecmo World Soccer '98 (JUET 980410 V1.000) | Playable<br>58.6 fps |
 | `elandore` |  | 1998 | Touryuu Densetsu Elan-Doree / Elan Doree - Legend of Dragoon (JUET 980922 V1.006) | Playable<br>59.94 fps |
 | `tsuribor` |  | 1998 | Tsuribori Taikai (JAE 980605 V1.000) | Playable |
 | `vfkids` |  | 1996 | Virtua Fighter Kids (JUET 960319 V0.000) | Playable<br>59.26 fps |
-| `vfremix` |  | 1995 | Virtua Fighter Remix (JUETBKAL 950428 V1.000) | Playable<br>58.85 fps |
+| `vfremix` |  | 1995 | Virtua Fighter Remix (JUETBKAL 950428 V1.000) | Playable<br>59.81 fps |
 | `vmahjong` |  | 1997 | Virtual Mahjong (J 961214 V1.000) | Playable<br>59.94 fps |
-| `myfairld` |  | 1998 | Virtual Mahjong 2 - My Fair Lady (J 980608 V1.000) | Playable<br>57.61 fps |
+| `myfairld` |  | 1998 | Virtual Mahjong 2 - My Fair Lady (J 980608 V1.000) | Playable<br>59.6 fps |
 | `wwshin` |  | 1997 | Waku Waku Shinkansen (J 971031 V0.002) | Playable |
 | `wasafari` |  | 1998 | Wanpaku Safari (J 981109 V1.000) | Playable<br>59.94 fps |
 | `winterht` |  | 1997 | Winter Heat (JUET 971012 V1.000) | Playable<br>59.21 fps |
 | `yattrmnp` |  | 1998 | Yatterman Plus (J 981006 V1.000) | Partial<br>59.94 fps |
 | `znpwfv` |  | 1997 | Zen Nippon Pro-Wres Featuring Virtua (J 971123 V1.000) | Playable<br>59.94 fps |
-| `findlove` |  | 1997 | Zenkoku Seifuku Bishoujo Grand Prix Find Love (J 971212 V1.000) | Playable<br>58.06 fps |
+| `findlove` |  | 1997 | Zenkoku Seifuku Bishoujo Grand Prix Find Love (J 971212 V1.000) | Playable<br>59.94 fps |
 
 </details>
 

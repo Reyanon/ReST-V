@@ -44,6 +44,7 @@ add_executable(${PROJECT_NAME}
   src/frontend/ui.c
   src/frontend/menu.c
   src/frontend/cheats.c
+  src/frontend/update.c
   src/frontend/emu.c
   src/frontend/audio.c
   src/frontend/resample.c
@@ -88,7 +89,7 @@ endif()
 add_executable(restv_kctrl kmod/restv_kctrl.c)
 set_target_properties(restv_kctrl PROPERTIES LINK_FLAGS "-nostdlib")
 target_compile_options(restv_kctrl PRIVATE -fno-builtin)
-target_link_libraries(restv_kctrl SceCtrlForDriver_stub SceThreadmgrForDriver_stub)
+target_link_libraries(restv_kctrl SceCtrlForDriver_stub SceThreadmgrForDriver_stub SceIofilemgrForDriver_stub SceSysmemForDriver_stub)
 # (vita_create_self splits its flags on spaces, so the export config path cannot be passed through it)
 add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
   COMMAND vita-elf-create -e "${CMAKE_SOURCE_DIR}/kmod/exports.yml" $<TARGET_FILE:restv_kctrl> "${CMAKE_BINARY_DIR}/restv_kctrl.velf"
@@ -97,7 +98,7 @@ add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
   VERBATIM)
 add_custom_target(kctrl_skprx ALL DEPENDS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx")
 set(RSTV_KSTUB_DIR "${CMAKE_BINARY_DIR}/kctrl_stubs")
-set(RSTV_KSTUB "${RSTV_KSTUB_DIR}/librestv_kctrl_v4_stub_weak.a")
+set(RSTV_KSTUB "${RSTV_KSTUB_DIR}/librestv_kctrl_v7_stub_weak.a")
 add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/kctrl.yml"
   COMMAND vita-elf-export kernel $<TARGET_FILE:restv_kctrl> "${CMAKE_SOURCE_DIR}/kmod/exports.yml" "${CMAKE_BINARY_DIR}/kctrl.yml"
   DEPENDS restv_kctrl "${CMAKE_SOURCE_DIR}/kmod/exports.yml"
@@ -140,6 +141,9 @@ target_link_libraries(${PROJECT_NAME}
   pthread
   png
   jpeg
+  mbedtls
+  mbedx509
+  mbedcrypto
   z
   m
   c
@@ -162,8 +166,10 @@ set(RSTV_SCE_SYS_FILES
 )
 # assets/blankArtwork.png: the border artwork of games without their own (owner)
 set(RSTV_VPK_ADD_ARGS -a "${CMAKE_BINARY_DIR}/restv_kctrl.skprx=module/restv_kctrl.skprx"
-  -a "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png=assets/blankArtwork.png")
-set(RSTV_VPK_DEPS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx" "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png")
+  -a "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png=assets/blankArtwork.png"
+  -a "${CMAKE_SOURCE_DIR}/res/cacert.pem=cacert.pem")
+set(RSTV_VPK_DEPS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx" "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png"
+  "${CMAKE_SOURCE_DIR}/res/cacert.pem")
 foreach(f ${RSTV_SCE_SYS_FILES})
   list(APPEND RSTV_VPK_ADD_ARGS -a "${CMAKE_SOURCE_DIR}/${f}=${f}")
   list(APPEND RSTV_VPK_DEPS "${CMAKE_SOURCE_DIR}/${f}")

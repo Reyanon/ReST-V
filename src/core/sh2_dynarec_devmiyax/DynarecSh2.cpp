@@ -2491,7 +2491,7 @@ int DynarecSh2::RstvTierRun()
 #include "../stv.h"
 extern "C" { u32 rstv_hle_big[4]; }
 extern "C" { unsigned rstv_hle_runs, rstv_hle_bytes, rstv_hle_kind[8], rstv_hle_fail[8], rstv_hle_why, rstv_hle_us[8], rstv_hle_auto_n;
-  int rstv_hle_on = 1, rstv_hle_auto = 1; }
+  int rstv_hle_on = 1, rstv_hle_auto = 1, rstv_hle_redetect = 1, rstv_lzb_off; } // redetect: diag switch (ux0:data/restv/noredetect)
 // ReST-V: library routine code signatures (length in words, FNV-1a over the words). The code itself is game data
 // and is not kept here (no ROM data in the repository)
 typedef struct { int n; u32 hash; int skip0, skip1; } RstvCodeSig; // words skip0..skip1 are not hashed (-1: none)
@@ -2886,10 +2886,108 @@ static int rstv_purge_check(u32 pc)
   return 0;
 }
 
+// ADR-198: a byte LZSS decoder found by its code (gaxeduel 06012DBC, 72 words): r4 = source, r5 = destination; flag
+// bytes read low bit first (9 at the start: the first shift is spent), 1 = a literal byte, 01 = two more flag bits and
+// a byte: offset 0xFFFFFF00 | byte back, length bits + 2; 00 = two bytes b0 b1: 13-bit offset (b1 b0) >> 3 back
+// (| 0xFFFFE000), length (b0 & 7) + 2, or the next byte + 1 when that is 0; offset 0 ends. Returns r0 = bytes written.
+// The routine is run here instruction by instruction (the same registers, flags and memory order) and stops at its
+// loop head (entry + 14) when the slice is used up; the hook at that head goes on from there. Writes go through
+// memSetByte (it drops compiled code it hits, as the SH-2's own stores do)
+static const RstvCodeSig rstv_lzb_sig = { 72, 0x339388e7u, -1, -1 };
+static inline int rstv_lzb_at(u32 pc) // pc: the routine's entry (0) or its loop head (1); -1: no
+{
+  if (rstv_hle_match(pc, &rstv_lzb_sig))
+    return 0;
+  if (rstv_hle_match(pc - 14, &rstv_lzb_sig))
+    return 1;
+  return -1;
+}
+struct RstvLzb { u32 r[8]; u32 t, pc, cyc, lo, hi; };
+static void rstv_lzb_run(RstvLzb *s, int head, s32 budget, u32 loop_pc)
+{
+  u32 r0 = s->r[0], r1 = s->r[1], r2 = s->r[2], r3 = s->r[3], r4 = s->r[4], r5 = s->r[5], r6 = s->r[6], r7 = s->r[7];
+  u32 t = s->t, c = 0;
+  u32 lo = 0xFFFFFFFFu, hi = 0;
+  // cycles as the recompiler counts them: 1 an instruction, a taken branch 2 (+ its delay slot), bt / bf 3,
+  // + 24 for a byte from the cartridge (A-bus)
+  auto rb = [&](u32 a) -> u32 { // high work RAM directly (memGetByte locks and dispatches for every byte)
+    if ((a & 0x0FF00000) == 0x06000000 && (a >> 29) <= 1)
+      return (u32)(s32)(s8)T2ReadByte(HighWram, a & 0xFFFFF);
+    c += (a & 0x0FF00000) == 0x00200000 ? 0 : 24;
+    return (u32)(s32)(s8)memGetByte(a); };
+  auto wb = [&](u32 a, u32 v) { memSetByte(a, (u8)v); if (a < lo) lo = a; if (a > hi) hi = a; };
+#define LZB_SHLR6() do { t = r6 & 1; r6 >>= 1; } while (0)
+#define LZB_REFILL() do { r6 = rb(r4); r4++; r7 = 8; LZB_SHLR6(); c += 3; } while (0) // mov.b @r4+, mov #8, shlr
+  // dt r7 / bf/s next (delay shlr r6) / refill when r7 reached 0
+#define LZB_FLAG() do { r7--; t = r7 == 0; c += 1; if (!t) { c += 2; LZB_SHLR6(); c += 1; } \
+                        else { c += 1; LZB_SHLR6(); c += 1; LZB_REFILL(); } } while (0)
+  if (!head) {
+    r6 = rb(r4); r4++; r7 = 9; r3 = r5; c += 1 + 1 + 2 + 1; // mov.b @r4+, mov #9, bra + mov r5, r3
+  }
+  for (;;) { // 06012DCA
+    if (c >= (u32)budget && budget > 0) {
+      s->pc = loop_pc; // (this copy's loop head: the routine is found anywhere)
+      break;
+    }
+    LZB_FLAG();
+    c += 3; // bt 06012DC4
+    if (t) { // literal
+      r1 = rb(r4); r4++; wb(r5, r1); r5++; c += 3;
+      continue;
+    }
+    LZB_FLAG();
+    c += 3; // bt 06012E1E
+    if (!t) { // short match: two length bits, an offset byte
+      r0 = 0; c += 1;
+      LZB_FLAG();
+      r1 = 0xFFFFFF00u; c += 1;
+      { const u32 nt = r0 >> 31; r0 = (r0 << 1) | t; t = nt; c += 1; } // rotcl r0
+      LZB_FLAG();
+      r2 = rb(r4); r4++;
+      { const u32 nt = r0 >> 31; r0 = (r0 << 1) | t; t = nt; }
+      r2 |= r1; r0 += 2; c += 4;
+      r2 += r5; c += 1;
+    } else { // long match: two bytes, maybe a length byte; offset 0 ends
+      r0 = rb(r4); r4++; r1 = rb(r4); r4++; r2 = r0 & 0xFF; r1 <<= 8; r2 |= r1; t = r2 == 0; c += 6;
+      c += 3; // bt 06012E46
+      if (t) { // end: mov r5, r0, rts + sub r3, r0
+        r0 = r5 - r3; c += 1 + 2 + 1;
+        s->pc = 0; // (returned)
+        break;
+      }
+      r1 = 0xFFFFE000u; r2 >>= 2; t = r2 & 1; r2 >>= 1; r0 &= 7; t = r0 == 0; c += 6; // mov.w, shlr2, shlr, and, tst
+      r2 |= r1; // (delay slot of bf/s)
+      if (!t) {
+        c += 2 + 1;
+        r0 += 2; c += 1; // 06012E0A
+        r2 += r5; c += 1;
+      } else {
+        c += 1 + 1;
+        r0 = rb(r4); r4++; r2 += r5; r0 &= 0xFF; c += 3; // mov.b @r4+, add r5, r2, extu.b
+        c += 2; r0 += 1; c += 1;                          // bra 06012E0E + add #1, r0
+      }
+    }
+    // 06012E0E: copy r0 bytes from r2
+    for (;;) {
+      r1 = rb(r2); r2++; r0--; t = r0 == 0; wb(r5, r1); c += 3;
+      r5++; c += 1;
+      if (!t) { c += 2; continue; }
+      c += 1;
+      break;
+    }
+    c += 2 + 1; // bra 06012DCA + nop
+  }
+#undef LZB_FLAG
+#undef LZB_REFILL
+#undef LZB_SHLR6
+  s->r[0] = r0; s->r[1] = r1; s->r[2] = r2; s->r[3] = r3; s->r[4] = r4; s->r[5] = r5; s->r[6] = r6; s->r[7] = r7;
+  s->t = t; s->cyc = c; s->lo = lo; s->hi = hi;
+}
+
 // ADR-045: library routines found by their code (position independent bodies), any game: checked the first time a
 // high work RAM PC is not compiled. Found PCs join rstv_hle[] and a bit map (the dispatcher looks them up there).
 static int rstv_hle_bits_n = -1;
-static int rstv_hle_detect(u32 pc)
+static int rstv_hle_detect(u32 pc, int lzb_only = 0)
 {
 #if defined(RSTV)
   RstvIoGuard rstv_io_g; // ADR-136: shared tables / devices (only while the slave runs on its own thread)
@@ -2898,6 +2996,10 @@ static int rstv_hle_detect(u32 pc)
     return 0;
   const u16 w0 = T2ReadWord(HighWram, pc & 0xFFFFF);
   int kind = 0;
+  if (lzb_only) { // a PC compiled again (its code may have changed): only the LZSS decoder (ADR-198)
+    if (w0 == 0x6644) kind = rstv_lzb_at(pc) == 0 ? RSTV_HLE_LZB : 0;
+    else if (w0 == 0x4710 && rstv_lzb_at(pc) == 1) kind = RSTV_HLE_LZB;
+  } else
   if (w0 == 0x2fd6) kind = RSTV_HLE_MEMMOVE;
   else if (w0 == 0xe700) kind = RSTV_HLE_MEMSET8;
   else if (w0 == 0x6743) kind = RSTV_HLE_MEMCPY;
@@ -2909,15 +3011,20 @@ static int rstv_hle_detect(u32 pc)
   else if ((w0 & 0xF00F) == 0x2008) kind = rstv_delayr_check(pc) >= 0 ? RSTV_HLE_DELAYR : 0;
   else if ((w0 & 0xF0FF) == 0x70FF) kind = rstv_delayr2_check(pc) >= 0 ? RSTV_HLE_DELAYR2 : 0;
   else if (w0 == 0x3450) kind = rstv_hle_match(pc, &rstv_mm2_sig) ? RSTV_HLE_MEMMOVE2 : 0;
+  else if (w0 == 0x6644) kind = rstv_lzb_at(pc) == 0 ? RSTV_HLE_LZB : 0; // ADR-198: entry
+  else if (w0 == 0x4710 && rstv_lzb_at(pc) == 1) kind = RSTV_HLE_LZB;     // ADR-198: its loop head (a slice went on)
   else if ((w0 & 0xF0FF) == 0x4010) kind = rstv_delaydt_check(pc) >= 0 ? RSTV_HLE_DELAYDT : 0;
   else if ((w0 & 0xF00F) == 0x6005) kind = rstv_cpy16_check(pc) >= 0 ? RSTV_HLE_CPY16 : 0;
   else if ((w0 & 0xFF00) == 0xD300) kind = rstv_purge_check(pc) ? RSTV_HLE_PURGE : 0;
   if (!kind)
     return 0;
   if (kind != RSTV_HLE_LZ && kind != RSTV_HLE_BSSCLR && kind != RSTV_HLE_BSSCLR2 && kind != RSTV_HLE_DELAY && kind != RSTV_HLE_DELAYR && kind != RSTV_HLE_DELAYR2 &&
-      kind != RSTV_HLE_MEMMOVE2 && kind != RSTV_HLE_DELAYDT && kind != RSTV_HLE_CPY16 && kind != RSTV_HLE_PURGE &&
+      kind != RSTV_HLE_MEMMOVE2 && kind != RSTV_HLE_DELAYDT && kind != RSTV_HLE_CPY16 && kind != RSTV_HLE_PURGE && kind != RSTV_HLE_LZB &&
       !rstv_hle_match(pc, &rstv_hle_sig[kind]))
     return 0;
+  for (int k = 0; k < rstv_hle_n; k++) // (found before: detected again after a recompile)
+    if (rstv_hle[k].pc == pc && rstv_hle[k].kind == kind)
+      return 0;
   if (rstv_hle_n >= RSTV_MAX_HLE)
     return 0;
   rstv_hle[rstv_hle_n].pc = pc;
@@ -5608,6 +5715,35 @@ int DynarecSh2::RstvHle(int kind)
     rstv_hle_runs++;
     return 1;
   }
+  if (kind == RSTV_HLE_LZB) {
+    // ADR-198: see rstv_lzb_run (code compared at every call: the hook also sits on the loop head)
+    if (rstv_lzb_off) // diag A/B (harness RSTV_NOLZB, device ux0:data/restv/nolzb)
+      return 0;
+    const int head = rstv_lzb_at(pc);
+    if (head < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    RstvLzb s;
+    for (int k = 0; k < 8; k++)
+      s.r[k] = R[k];
+    s.t = GET_SR() & 1;
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+#if !defined(__vita__)
+    // (harness RSTV_HLECHK compares up to the routine's exit: the whole decode in one call there)
+    const s32 bud = getenv("RSTV_HLECHK") ? 0 : (left > 64 ? left : 64);
+#else
+    const s32 bud = left > 64 ? left : 64;
+#endif
+    rstv_lzb_run(&s, head, bud, head ? pc : pc + 14);
+    for (int k = 0; k < 8; k++)
+      R[k] = s.r[k];
+    SET_SR((GET_SR() & ~1u) | (s.t & 1));
+    SET_PC(s.pc ? s.pc : GET_PR());
+    m_pDynaSh2->SysReg[4] += s.cyc;
+    rstv_hle_runs++;
+    rstv_hle_bytes += s.hi >= s.lo ? s.hi - s.lo + 1 : 0;
+    return 1;
+  }
   if (kind == RSTV_HLE_LZ) {
     extern unsigned rstv_hle_why;
     if (!rstv_lz_check(pc)) { rstv_hle_why = 1; return 0; }
@@ -6161,8 +6297,11 @@ inline int DynarecSh2::Execute(){
         pBlock = RstvHleOrigBlock(GET_PC());
 #endif
 #if defined(RSTV)
-      if (pBlock == NULL && rstv_hle_on && rstv_hle_auto && rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1] == 0 &&
-          rstv_hle_detect(GET_PC())) {
+      // (also when the PC is compiled again: only the LZSS decoder then, ADR-198; every kind there split blocks at
+      // hooks that never run: decathlt 48 -> 35, cotton2 59 -> 45, ffrevng10 60 -> 50 fps)
+      if (pBlock == NULL && rstv_hle_on && rstv_hle_auto && (rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1] == 0 ?
+          rstv_hle_detect(GET_PC()) : rstv_hle_redetect && rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1] >= rstv_tier_n &&
+          rstv_hle_detect(GET_PC(), 1))) {
         rstv_hle_auto_n++;
         rstv_hle_bits_sync();
         const int kind = rstv_hle[rstv_hle_n - 1].kind;

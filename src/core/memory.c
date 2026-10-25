@@ -2081,6 +2081,13 @@ int YabLoadStateStream(FILE *fp)
 #endif
    yread(&check, (void *)HighWram, 0x100000, 1, fp);
    yread(&check, (void *)LowWram, 0x100000, 1, fp);
+#if defined(RSTV)
+   /* ReST-V (ADR-197): the work RAM was replaced behind the write handlers: the recompiler's blocks for code there are
+      stale. batmanfr keeps loading code into RAM as it plays: a state loaded into another boot ran the old blocks and
+      stopped (waiting forever on an SCU DMA end) */
+   SH2WriteNotify(0x06000000, 0x100000);
+   SH2WriteNotify(0x00200000, 0x100000);
+#endif
 
    yread(&check, (void *)&yabsys.DecilineCount, sizeof(int), 1, fp);
    yread(&check, (void *)&yabsys.LineCount, sizeof(int), 1, fp);

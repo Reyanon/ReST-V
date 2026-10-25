@@ -232,6 +232,7 @@ u64 rstv_rax_us;                 // time in rstv_rax_mix (performance line)
 u64 rstv_rax_cpu_us;             // CPU time of the sound thread in rstv_rax_mix (Vita: wall time minus preemption)
 #if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 static u64 rax_thread_cpu_us()
 {
 	SceKernelThreadInfo ti;
@@ -414,10 +415,11 @@ inline uint32_t adsp21xx_device::program_read(uint32_t addr) { return s_pram[add
 static inline void rax_fn_set(uint32_t a);
 static inline void raxj_dirty();
 static inline void raxj_dirty_at(uint32_t a);
+static inline void rax_fn_later(uint32_t a, uint32_t op);
 inline void adsp21xx_device::program_write(uint32_t addr, uint32_t data)
 {
 	s_pram[addr & 0x3fff] = data & 0xffffff;
-	rax_fn_set(addr);
+	rax_fn_later(addr, data & 0xffffff); // ADR-196: decoded when it runs (the driver writes data tables into program memory)
 	raxj_dirty_at(addr & 0x3fff);
 }
 inline uint32_t adsp21xx_device::opcode_read() { return s_pram[m_pc & 0x3fff]; }
@@ -447,6 +449,9 @@ void adsp21xx_device::m_sport_tx_cb(int which, uint32_t data, uint32_t mask)
 	s_reg_period = 0;
 }
 
+// ADR-203: while the DSP is busy its slices run on past the autobuffer event (up to RAX_SLICE) and the event is done
+// late, after the slice; an idle wait still goes to the event's time. (ux0:data/restv/raxexactev: every event on time)
+extern "C" { int rstv_rax_late_ev = 1; }
 static void adsp_irq0() // autobuffer half: the DAC takes the next words
 {
 	uint32_t reg = s_cpu.m_i[s_ireg] & 0x3fff;
@@ -1197,6 +1202,25 @@ static inline void rax_fn_set(uint32_t a)
 		}
 	}
 }
+// ADR-196: a word written into program memory is decoded only when it runs: most writes are data (the 3622 loop wrote
+// one a step and paid the decode and the DO check each time)
+static void rax_fn_lazy(adsp21xx_device *c, uint32_t op);
+static inline void rax_fn_later(uint32_t a, uint32_t op)
+{
+	s_ins[a & 0x3fff].fn = rax_fn_lazy;
+	s_ins[a & 0x3fff].op = op;
+}
+static void rax_fn_lazy(adsp21xx_device *c, uint32_t op)
+{
+	const uint32_t a = c->m_ppc & 0x3fff; // (the interpreter sets m_ppc before the handler; blocks decode at compile time)
+	if (s_ins[a].fn == rax_fn_lazy && s_pram[a] == op)
+		rax_fn_set(a);
+	else if ((op >> 18) == 0x05 && !s_loopend[(op >> 4) & 0x3fff]) { // (a DO met another way: its loop end as rax_fn_set)
+		s_loopend[(op >> 4) & 0x3fff] = 1;
+		raxj_loopend_new((op >> 4) & 0x3fff);
+	}
+	s_exec_tab[(op >> 13) & 0x7ff](c, op);
+}
 static inline void raxj_dirty();
 static void rax_fn_all() { for (uint32_t a = 0; a < 0x4000; a++) rax_fn_set(a); raxj_dirty(); }
 
@@ -1243,7 +1267,7 @@ static uint8_t s_blk_n[0x4000];      // instructions of the block at each addres
 static uint32_t s_wstamp[0x4000], s_wcount; // program writes into compiled code: when
 static int s_jlast_n;
 unsigned rstv_rax_jit_fb;          // instructions run through a handler inside blocks (diag)
-unsigned rstv_rax_jit_compiles, rstv_rax_jit_drops, rstv_rax_jit_wdrops;
+unsigned rstv_rax_jit_compiles, rstv_rax_jit_drops, rstv_rax_jit_wdrops, rstv_rax_jit_calls;
 #if !defined(__vita__)
 static unsigned s_jfb_kind[256];   // harness: those per top byte
 extern "C" void rax_jfb_count(uint32_t op) { s_jfb_kind[op >> 16]++; }
@@ -1255,6 +1279,14 @@ static uint32_t s_jgen_seen;
 static int s_jalloc_failed;
 unsigned rstv_rax_jit_blocks;
 int rstv_rax_jit_on = 2; // ADR-177: on (ux0:data/restv/raxjit "0" turns it off; harness: RSTV_RAXJIT=1 to use it)
+extern "C" { int rstv_rax_jit_chain = 1; } // ADR-201: block exits go on to the next block (ux0:data/restv/raxnochain: off)
+static void *raxj_next(adsp21xx_device *c);
+// ADR-202: blocks are compiled only where the flow enters (a jump, a call, a return, a loop end, an interrupt, a block
+// left before its slice ran out); a slice that ran out mid-block resumes in the interpreter. Compiling at every resume
+// PC made thousands of overlapping blocks (2.7 MB of code), each one run cold
+static uint8_t s_jent[0x4000];
+extern "C" { int rstv_rax_jit_entry = 1; } // (ux0:data/restv/raxanyentry: off)
+static inline void raxj_entry(uint32_t pc) { s_jent[pc & 0x3fff] = 1; }
 #if defined(__vita__)
 extern "C" void rstv_log_printf(const char *fmt, ...);
 #define RAXJ_LOG(...) rstv_log_printf(__VA_ARGS__)
@@ -1935,6 +1967,13 @@ static int raxj_compile(uint32_t pc0)
 			if (k > 0 && s_loopend[(pc0 + k) & 0x3fff]) live_nzvc = live_mv = 1; // may leave before k (loop end)
 		}
 	}
+	// ADR-201: word 1 is the chained entry (from another block's exit through raxj_next: the frame, r4, r5, r8, r9,
+	// r11 and the count in r10 go on; mode and cycles were checked there)
+	uint32_t *b_main = j_b(CAL);
+	j_ldr(JR6, JR4, JO(m_loop));
+	j_mov32(JR7, (uint32_t)(uintptr_t)&s_dbank); j_ldr(JR7, JR7, 0);
+	uint32_t *b_chain = j_b(CAL);
+	j_patch(b_main, s_jp);
 	jw(0xE92D4FF0u);                 // push {r4-r11, lr}
 	jw(0xE24DD004u);                 // sub sp, sp, #4 (8-byte alignment; also a slot for 28-2F)
 	j_mov(JR4, JR0);
@@ -1953,6 +1992,7 @@ static int raxj_compile(uint32_t pc0)
 	j_mov32(JR11, (uint32_t)(uintptr_t)s_pram);
 	j_movw(JR10, 0);
 	uint32_t *top = s_jp;            // back edge target (a DO loop over this block)
+	j_patch(b_chain, top);
 	uint32_t *to_next = NULL;        // loop end path going on with the next instruction
 	for (int k = 0; k < n; k++) {
 		const uint32_t pc = pc0 + (uint32_t)k, op = ops[k];
@@ -1984,6 +2024,8 @@ static int raxj_compile(uint32_t pc0)
 			j_str(JR5, JR4, JO(m_icount));
 			j_mov(JR0, JR4);
 			j_mov32(JR1, op);
+			if (s_ins[pc].fn == rax_fn_lazy)
+				rax_fn_set(pc); // (ADR-196: a written word, decoded now)
 			j_call((uint32_t)(uintptr_t)s_ins[pc].fn);
 			j_ldr(JR5, JR4, JO(m_icount));
 			j_mov32(JR7, (uint32_t)(uintptr_t)&s_dbank); j_ldr(JR7, JR7, 0);
@@ -2051,6 +2093,12 @@ static int raxj_compile(uint32_t pc0)
 	j_str(JR0, JR4, JO(m_pc));
 	uint32_t *leave = s_jp;
 	j_str(JR5, JR4, JO(m_icount));
+	if (rstv_rax_jit_chain) { // ADR-201: the next block straight away when run() would only call it
+		j_mov(JR0, JR4);
+		j_call((uint32_t)(uintptr_t)raxj_next);
+		j_dpi(CAL, JCMP, 1, 0, JR0, 0);
+		jw(JC(CNE) | 0x012FFF10u | JR0); // bxne r0
+	}
 	j_str(JR10, JR4, JO(m_jn));
 	jw(0xE28DD004u);                 // add sp, sp, #4
 	jw(0xE8BD8FF0u);                 // pop {r4-r11, pc}
@@ -2134,6 +2182,8 @@ static RaxBlock raxj_get(uint32_t pc)
 		s_jon = rstv_rax_jit_on;
 #if !defined(__vita__)
 		s_jon = getenv("RSTV_RAXJIT") && !getenv("RSTV_RAXHIST") ? 2 : 0; // harness: the interpreter unless asked
+		if (getenv("RSTV_RAXNOCHAIN")) rstv_rax_jit_chain = 0; // (ADR-201 A/B)
+		if (getenv("RSTV_RAXANYENTRY")) rstv_rax_jit_entry = 0; // (ADR-202 A/B)
 #endif
 		RAXJ_LOG("raxjit: %s", s_jon ? "on" : "off");
 		if (!s_jon)
@@ -2143,7 +2193,7 @@ static RaxBlock raxj_get(uint32_t pc)
 		raxj_newgen();
 	const uint32_t mode = s_cpu.m_mstat & JMS;
 	RaxBlock b = s_blk[pc][0] && s_blkt[pc][0] == mode ? s_blk[pc][0] : s_blk[pc][1] && s_blkt[pc][1] == mode ? s_blk[pc][1] : NULL;
-	if (b || s_jpend[pc] || s_jregion_full)
+	if (b || s_jpend[pc] || s_jregion_full || (rstv_rax_jit_entry && !s_jent[pc]))
 		return b;
 	for (int i = 0; i < RAXJ_SLOTS; i++) {
 		RaxSlot *sl = &s_slot[i];
@@ -2277,6 +2327,9 @@ extern "C" void rstv_rax_jit_install(void)
 unsigned rstv_rax_jit_fb, rstv_rax_jit_compiles, rstv_rax_jit_drops, rstv_rax_jit_wdrops, rstv_rax_jit_blocks;
 typedef void (*RaxBlock)(adsp21xx_device *c);
 static inline RaxBlock raxj_get(uint32_t) { return NULL; }
+unsigned rstv_rax_jit_calls; // (diag counter, no blocks here)
+static inline void raxj_entry(uint32_t) {}
+static inline int raxj_ender(uint32_t) { return 0; }
 static inline void raxj_dirty() {}
 static inline void raxj_dirty_at(uint32_t) {}
 static inline void raxj_drop(uint32_t) {}
@@ -2291,13 +2344,37 @@ static int rax_jit_check_on();
 static void rax_jit_check(adsp21xx_device *c, RaxBlock b);
 #endif
 #include "rstv_rax_loops.hxx" // ADR-180
+#if defined(__arm__)
+// ADR-201: called at a block's exit (m_pc, m_icount stored): the chained entry of the block run() would call next, or
+// NULL when run() has to look first (cycles used up, the loop end, the idle loop heads, a listed native loop, a
+// generation change, no block for this mode, too few cycles for the whole block)
+static void *raxj_next(adsp21xx_device *c)
+{
+	const uint32_t pc = c->m_pc & 0x3fff;
+	if (c->m_icount <= 0 || c->m_pc == c->m_loop || pc == 0x009a || pc == 0x00a1 || s_jdirty || (s_nl_at[pc] && s_nl_on > 0))
+		return NULL;
+	const uint32_t mode = c->m_mstat & JMS;
+	const RaxBlock b = s_blk[pc][0] && s_blkt[pc][0] == mode ? s_blk[pc][0] : s_blk[pc][1] && s_blkt[pc][1] == mode ? s_blk[pc][1] : NULL;
+	if (!b || c->m_icount < (int)s_blk_n[pc])
+		return NULL;
+	rstv_rax_jit_calls++;
+	return (void *)((uint32_t *)(void *)b + 1);
+}
+#endif
+extern "C" { volatile int rstv_rax_act; int rstv_rax_act_on; } // diag (sampler): what the sound thread does in the board
 int adsp21xx_device::run(int cycles)
 {
 	m_icount = cycles;
 	m_abort = 0;
 	m_skip_pc = ~0u;
 	int n = 0;
-	check_irqs();
+	const int act = rstv_rax_act_on; // (the sampler's state stores only while it samples)
+	{
+		const uint32_t pc_in = m_pc;
+		check_irqs();
+		if (m_pc != pc_in)
+			raxj_entry(m_pc); // an interrupt vector (ADR-202)
+	}
 	do
 	{
 		// ADR-173: the sound driver's wait loops (batmanfr RAX) poll I7, which only the autobuffer timer moves, and
@@ -2312,6 +2389,7 @@ int adsp21xx_device::run(int cycles)
 			m_skip_pc = m_pc;
 			m_skip_n = n;
 		}
+		if (act) rstv_rax_act = 5; // dispatch
 		if (const int nl = rax_nl_try(this, m_pc)) { // ADR-180: a listed inner loop, natively (one-word loops: top = end)
 			n += nl;
 			m_icount -= nl;
@@ -2326,10 +2404,14 @@ int adsp21xx_device::run(int cycles)
 					if (m_jn >= 0) { n += m_jn; continue; }
 				} else
 #endif
+				if (act) rstv_rax_act = 2;
 				b(this);
+				rstv_rax_jit_calls++;
 				if (m_jn >= 0) {
 					n += m_jn;
 					rstv_rax_jit_insns += (unsigned)m_jn;
+					if (m_icount > 0)
+						raxj_entry(m_pc); // left at a jump / ender / loop end, not because the slice ran out (ADR-202)
 					continue;
 				}
 				if (m_jn == -1) {
@@ -2344,6 +2426,7 @@ int adsp21xx_device::run(int cycles)
 		if (s_hist) s_hist[m_pc & 0x3fff]++;
 #endif
 		const RaxIns in = s_ins[m_pc & 0x3fff];
+		const int at_end = m_pc == m_loop;
 		if (m_pc != m_loop)
 			m_pc++;
 		else
@@ -2359,11 +2442,15 @@ int adsp21xx_device::run(int cycles)
 		}
 		n++;
 
+		if (act) rstv_rax_act = 3;
 		in.fn(this, in.op);
+		if (at_end || m_pc != m_ppc + 1 || raxj_ender(in.op))
+			raxj_entry(m_pc); // (ADR-202)
 
 		m_icount--;
 	} while (m_icount > 0);
 	m_insns += n;
+	if (act) rstv_rax_act = 4;
 	return m_abort ? n : cycles;
 }
 
@@ -2498,7 +2585,61 @@ extern "C" void rstv_rax_bench(void)
 		for (int i = 0; i < N; i++) f(c, ops[k]);
 		RAXJ_LOG("raxbench: %06x %.1f ns", ops[k], (sceKernelGetProcessTimeWide() - t0) * 1000.0 / N);
 	}
+	// native loops (ADR-180) on their own: linear I registers from 2100 by 1, k iterations a run
+	for (unsigned li = 0; li < RAX_NLN; li++) {
+		const RaxNLoop &L = s_nloops[li];
+		if (L.dy || L.top == 0x3166)
+			continue;
+		enum { K = 200, R = 400 };
+		u64 us = 0;
+		int ins = 0, ok = 1;
+		for (int rep = 0; rep < R && ok; rep++) {
+			for (int k = 0; k < 8; k++) { c->m_i[k] = 0x2100; c->m_l[k] = 0; c->m_m[k] = 1; c->m_base[k] = 0x2100; }
+			c->m_mstat = 0;
+			uint16_t *mp[8] = { 0 };
+			const int um = rax_nl_ranges(c, L, L.top, K, mp);
+			if (um != 0) { ok = 0; break; }
+			const u64 t0 = sceKernelGetProcessTimeWide();
+			const RaxNRes rr = L.run[0](c, mp, K);
+			us += sceKernelGetProcessTimeWide() - t0;
+			ins += rr.ins;
+		}
+		if (ok)
+			RAXJ_LOG("raxbench: loop %04x %.1f ns an insn (%d insns)", L.top, us * 1000.0 / (ins ? ins : 1), ins);
+	}
 	c->init();
+}
+// diag (raxnlprof): the same timing on the board thread during play, on a copy of the device and with data memory
+// put back: is a native loop slower there because of where it runs, or because of its runs? (best of 20 runs)
+static void rax_bench_live()
+{
+	static adsp21xx_device t;
+	static uint16_t si[0x2000], sb[0x2000];
+	memcpy(&t, &s_cpu, sizeof(t));
+	memcpy(si, s_iram, sizeof(si));
+	memcpy(sb, s_dbank, sizeof(sb));
+	static const uint16_t tops[] = { 0x3e3a, 0x316c, 0x3124 };
+	for (unsigned q = 0; q < sizeof(tops) / sizeof(tops[0]); q++) {
+		const RaxNLoop &L = s_nloops[s_nl_at[tops[q]] - 1];
+		u64 best = ~0ull;
+		int ins = 0;
+		for (int rep = 0; rep < 20; rep++) {
+			for (int k = 0; k < 8; k++) { t.m_i[k] = 0x2100; t.m_l[k] = 0; t.m_m[k] = 1; t.m_base[k] = 0x2100; }
+			t.m_mstat = 0;
+			uint16_t *mp[8] = { 0 };
+			if (rax_nl_ranges(&t, L, L.top, 200, mp) != 0)
+				break;
+			const u64 t0 = sceKernelGetProcessTimeWide();
+			const RaxNRes rr = L.run[0](&t, mp, 200);
+			const u64 d = sceKernelGetProcessTimeWide() - t0;
+			if (d < best) best = d;
+			ins = rr.ins;
+		}
+		if (ins)
+			RAXJ_LOG("raxbench live: loop %04x %.1f ns an insn (best of 20)", L.top, best * 1000.0 / ins);
+	}
+	memcpy(s_iram, si, sizeof(si));
+	memcpy(s_dbank, sb, sizeof(sb));
 }
 #endif
 
@@ -2568,24 +2709,30 @@ static void rax_frame(s32 *l, s32 *r, int n)
 		}
 	}
 	const u64 t_prof = RSTV_PROF_T();
+	rstv_rax_act = 4; // (the frame loop: events, slices)
 #if defined(__vita__)
 	const u64 c_prof = t_prof ? rax_thread_cpu_us() : 0;
 #endif
 #if !defined(__vita__)
 	struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
 #endif
+#if !defined(__vita__)
+	{ static int init; if (!init) { init = 1; if (getenv("RSTV_RAXEXACTEV")) rstv_rax_late_ev = 0; } } // (ADR-203 A/B)
+#endif
 	// one frame of DSP time (n samples at 44.1 kHz)
 	const uint64_t end = s_now + (uint64_t)RAX_CLOCK * n / 44100;
 	while (s_now < end) {
-		uint64_t stop = end;
-		if (s_reg_period && s_reg_next < stop)
-			stop = s_reg_next;
+		uint64_t stop = end, ev = end;
+		if (s_reg_period && s_reg_next < ev)
+			ev = s_reg_next;
 		if (s_dma_next && s_dma_next < stop)
 			stop = s_dma_next;
+		if (!rstv_rax_late_ev && ev < stop)
+			stop = ev;
 		if (s_cmd_r != s_cmd_w && !s_cpu.m_irq_state[ADSP2181_IRQL0])
 			s_cpu.set_input(ADSP2181_IRQL0, ASSERT_LINE); // data_w
 		if (s_idle && !s_cpu.irq_pending()) {
-			s_now = stop; // ADR-173: nothing the wait loop polls changes before the next event
+			s_now = ev < stop ? ev : stop; // ADR-173: nothing the wait loop polls changes before the next event
 		} else if (stop > s_now) {
 			s_idle = 0;
 			if (stop > s_now + RAX_SLICE)
@@ -2594,7 +2741,7 @@ static void rax_frame(s32 *l, s32 *r, int n)
 			s_len = (int)(stop - s_now);
 			s_now += s_cpu.run(s_len);
 		}
-		if (s_reg_period && s_now >= s_reg_next) {
+		while (s_reg_period && s_now >= s_reg_next) { // (ADR-203: a busy slice may have gone past several)
 			s_idle = 0;
 			adsp_irq0();
 			s_reg_next += s_reg_period;
@@ -2605,7 +2752,11 @@ static void rax_frame(s32 *l, s32 *r, int n)
 			dma_timer();
 		}
 	}
+#if defined(__vita__)
+	{ static unsigned fr; if (rstv_raxnl_prof && ++fr % 600 == 0) rax_bench_live(); }
+#endif
 	rstv_rax_insns = s_cpu.m_insns;
+	rstv_rax_act = 0;
 	if (t_prof) {
 		rstv_rax_us += RSTV_PROF_T() - t_prof;
 #if defined(__vita__)
@@ -2686,43 +2837,67 @@ static void rax_frame(s32 *l, s32 *r, int n)
 		s_out_r = s_out_w - keep;
 }
 
-/* ADR-176: the board runs one frame behind the sound thread. Each call mixes the output of the previous frame and
-   starts the next one: on its own thread on CPU3 (Vita), or right away (harness), so the samples are the same. */
+/* ADR-176 / 196: the board runs behind the sound thread. Each call mixes the output of the frame asked for RAX_LAG
+   calls before and asks for the next one: on the board thread (Vita), or right away (harness), so the samples are the
+   same either way. Two frames of lag give the board thread room for a heavy frame next to a light one. */
 #include "threads.h"
 #define RAX_MAXN 1024
-static s32 s_pend_l[RAX_MAXN], s_pend_r[RAX_MAXN];
-static int s_pend_n;              // samples of the frame run last (0: none)
-static int s_job_n;
-static volatile int s_busy;       // the board thread is running a frame
-static int s_thr = -1;            // -1: not decided, 0: inline, 1: thread
-extern "C" { int rstv_rax_thread_cpu; } // 0: on the sound thread (default); 2 / 3: a board thread on that CPU
+#define RAX_LAGMAX 8 // (rstv_rax_lag: frames behind, 2 by default; ux0:data/restv/raxlag diag)
+#define RAX_SLOTS (RAX_LAGMAX + 1)
+extern "C" { int rstv_rax_lag = 2; }
+static s32 s_pend_l[RAX_SLOTS][RAX_MAXN], s_pend_r[RAX_SLOTS][RAX_MAXN];
+static int s_pend_n[RAX_SLOTS];  // samples of each slot's frame
+static int s_job_n[RAX_SLOTS];   // samples asked for each slot
+static unsigned s_req, s_mixed;  // frames asked for, frames mixed (slot = frame % RAX_SLOTS)
+static unsigned s_waited;        // frames whose end event was taken (thread)
+static volatile unsigned s_done; // frames the board has run
+static int s_thr = -1;           // -1: not decided, 0: inline, 1: thread
+extern "C" { int rstv_rax_thread_cpu = 6; int rstv_rax_thread_prio = 20; } // 0: on the sound thread; 2-5: a board thread (ADR-176 / 196)
 static YabEventQueue *s_q_go, *s_q_done;
 
-static void rax_job()
+static void rax_job(unsigned f)
 {
-	memset(s_pend_l, 0, sizeof(s32) * (size_t)s_job_n);
-	memset(s_pend_r, 0, sizeof(s32) * (size_t)s_job_n);
-	rax_frame(s_pend_l, s_pend_r, s_job_n);
-	s_pend_n = s_job_n;
+	const int k = (int)(f % RAX_SLOTS), n = s_job_n[k];
+	memset(s_pend_l[k], 0, sizeof(s32) * (size_t)n);
+	memset(s_pend_r[k], 0, sizeof(s32) * (size_t)n);
+	rax_frame(s_pend_l[k], s_pend_r[k], n);
+	s_pend_n[k] = n;
 }
 
 static void *rax_thread_main(void *)
 {
 	for (;;) {
 		YabWaitEventQueue(s_q_go);
-		rax_job();
+		rax_job(s_done);
+		__sync_synchronize();
+		s_done = s_done + 1;
 		YabAddEventQueue(s_q_done, 0);
 	}
 	return NULL;
 }
 
-// the board thread is idle after this (sound thread, between frames)
+// frame f has been run (thread: its end event taken, one event a frame)
+static void rax_wait_frame(unsigned f)
+{
+	if (s_thr != 1)
+		return;
+	while (s_waited <= f) {
+		YabWaitEventQueue(s_q_done);
+		s_waited++;
+	}
+	__sync_synchronize();
+}
+// every frame asked for has been run (the board thread is idle after this)
 static void rax_wait()
 {
-	if (s_busy) {
-		YabWaitEventQueue(s_q_done);
-		s_busy = 0;
-	}
+	if (s_req)
+		rax_wait_frame(s_req - 1);
+}
+// ADR-196: before the emulator is freed (exit, reset): the board thread finishes what it was asked. It went on running
+// a compiled block while the exiting app freed the code region: a prefetch abort (and a crash dump) at every exit
+extern "C" void rstv_rax_quiesce(void)
+{
+	rax_wait();
 }
 
 extern "C" void rstv_rax_mix(s32 *l, s32 *r, int n)
@@ -2731,41 +2906,81 @@ extern "C" void rstv_rax_mix(s32 *l, s32 *r, int n)
 		return;
 	if (s_thr < 0) {
 		s_thr = 0;
-#if defined(__vita__) // ADR-176: a board thread only when asked (ux0:data/restv/raxthr = 2 or 3: its CPU)
-		if (rstv_rax_thread_cpu == 2) { // CPU3 hit prefetch aborts running JIT code (twice): not offered
-			s_q_go = YabThreadCreateQueue(2);
-			s_q_done = YabThreadCreateQueue(2);
-			if (s_q_go && s_q_done && YabThreadStart(YAB_THREAD_RAX, rax_thread_main, NULL) == 0)
+#if defined(__vita__) // a board thread only when asked (ux0:data/restv/raxthr = 2-5) or by the game's default (ADR-196)
+		if (rstv_rax_thread_cpu >= 2 && rstv_rax_thread_cpu <= 8) {
+			s_q_go = YabThreadCreateQueue(RAX_SLOTS + 2);
+			s_q_done = YabThreadCreateQueue(RAX_SLOTS + 2);
+			if (s_q_go && s_q_done && YabThreadStart(YAB_THREAD_RAX, rax_thread_main, NULL) == 0) {
 				s_thr = 1;
+				// ADR-196: compiled blocks on CPU0 (where the emu thread writes and syncs the code region) gave
+				// prefetch aborts now and then: there the board thread runs without them (diag: raxthr 5 = CPU0-2)
+				if (rstv_rax_thread_cpu == 5 || rstv_rax_thread_cpu == 4 || rstv_rax_thread_cpu == 8)
+					rstv_rax_jit_on = 0;
+			}
 		}
 #endif
 	}
-	rax_wait();
-	for (int i = 0; i < s_pend_n && i < n; i++) {
-		l[i] += s_pend_l[i];
-		r[i] += s_pend_r[i];
+	if (s_req - s_mixed >= (unsigned)rstv_rax_lag) { // the oldest frame not mixed yet
+		rax_wait_frame(s_mixed);
+		const int k = (int)(s_mixed % RAX_SLOTS);
+		for (int i = 0; i < s_pend_n[k] && i < n; i++) {
+			l[i] += s_pend_l[k][i];
+			r[i] += s_pend_r[k][i];
+		}
+		s_mixed++;
 	}
-	s_job_n = n;
-	if (s_thr == 1) {
-		s_busy = 1;
+	const unsigned f = s_req++;
+	s_job_n[f % RAX_SLOTS] = n;
+	if (s_thr == 1)
 		YabAddEventQueue(s_q_go, 0);
-	} else
-		rax_job();
+	else {
+		rax_job(f);
+		s_done = f + 1;
+	}
 }
 
-static void rax_pend_state_reset() { s_pend_n = 0; }
-// the output of the frame run last (mixed by the next call)
+static void rax_pend_state_reset() { s_req = s_mixed = s_waited = 0; s_done = 0; }
+// the frames run and not mixed yet. Format: -1 - count, then (samples, left, right) a frame; a save from before
+// ADR-196 has one frame without the count (its first word is the frame's samples, 0 or more)
 static int rax_pend_state(FILE *fp, int save)
 {
-	int nn = s_pend_n;
-	if (save ? fwrite(&nn, sizeof(nn), 1, fp) != 1 : fread(&nn, sizeof(nn), 1, fp) != 1)
-		return -1;
-	if (nn < 0 || nn > RAX_MAXN)
-		return -1;
-	if (save ? (fwrite(s_pend_l, sizeof(s32), (size_t)nn, fp) != (size_t)nn || fwrite(s_pend_r, sizeof(s32), (size_t)nn, fp) != (size_t)nn)
-	         : (fread(s_pend_l, sizeof(s32), (size_t)nn, fp) != (size_t)nn || fread(s_pend_r, sizeof(s32), (size_t)nn, fp) != (size_t)nn))
-		return -1;
-	s_pend_n = nn;
+	int c = (int)(s_req - s_mixed);
+	if (save) {
+		const int h = -1 - c;
+		if (fwrite(&h, sizeof(h), 1, fp) != 1)
+			return -1;
+	} else {
+		int h;
+		if (fread(&h, sizeof(h), 1, fp) != 1)
+			return -1;
+		if (h >= 0) { // (older save: one frame, h its samples)
+			if (fseek(fp, -(long)sizeof(h), SEEK_CUR) != 0)
+				return -1;
+			c = 1;
+		} else
+			c = -1 - h;
+		if (c < 0 || c > RAX_LAGMAX)
+			return -1;
+		rax_pend_state_reset();
+	}
+	for (int j = 0; j < c; j++) {
+		const int k = (int)((save ? s_mixed + (unsigned)j : (unsigned)j) % RAX_SLOTS);
+		int nn = s_pend_n[k];
+		if (save ? fwrite(&nn, sizeof(nn), 1, fp) != 1 : fread(&nn, sizeof(nn), 1, fp) != 1)
+			return -1;
+		if (nn < 0 || nn > RAX_MAXN)
+			return -1;
+		if (save ? (fwrite(s_pend_l[k], sizeof(s32), (size_t)nn, fp) != (size_t)nn || fwrite(s_pend_r[k], sizeof(s32), (size_t)nn, fp) != (size_t)nn)
+		         : (fread(s_pend_l[k], sizeof(s32), (size_t)nn, fp) != (size_t)nn || fread(s_pend_r[k], sizeof(s32), (size_t)nn, fp) != (size_t)nn))
+			return -1;
+		s_pend_n[k] = nn;
+	}
+	if (!save) { // frames 0 .. c-1 are run, none mixed
+		s_req = (unsigned)c;
+		s_done = (unsigned)c;
+		s_waited = (unsigned)c; // (no end events for them)
+		s_mixed = 0;
+	}
 	return 0;
 }
 
@@ -2807,6 +3022,7 @@ static void rax_jit_check(adsp21xx_device *c, RaxBlock b)
 	memcpy(c0, c, sizeof(*c)); memcpy(m0b, s_banked, sizeof(s_banked)); memcpy(m0i, s_iram, sizeof(s_iram));
 	memcpy(p0, s_pram, sizeof(s_pram));
 	const uint64_t now0 = s_now; const uint64_t dma0 = s_dma_next; const uint32_t dp0 = s_dma_param;
+	uint16_t *const db0 = s_dbank; const uint32_t dbk0 = s_data_bank, ovl0 = s_dmovlay_val; // (a bank switch in a chain, ADR-201)
 	uint16_t ctl0[32]; memcpy(ctl0, s_control, sizeof(ctl0));
 	const uint32_t pc0 = c->m_pc;
 	b(c);
@@ -2819,6 +3035,8 @@ static void rax_jit_check(adsp21xx_device *c, RaxBlock b)
 	memcpy(c, c0, sizeof(*c)); memcpy(s_banked, m0b, sizeof(s_banked)); memcpy(s_iram, m0i, sizeof(s_iram));
 	memcpy(s_pram, p0, sizeof(s_pram)); // (s_ins / blocks are not touched by data-area program writes)
 	s_now = now0; s_dma_next = dma0; s_dma_param = dp0;
+	uint16_t *const dbj = s_dbank; const uint32_t dbkj = s_data_bank, ovlj = s_dmovlay_val;
+	s_dbank = db0; s_data_bank = dbk0; s_dmovlay_val = ovl0;
 	uint16_t ctlj[32]; memcpy(ctlj, s_control, sizeof(ctlj)); memcpy(s_control, ctl0, sizeof(ctl0));
 	for (int i = 0; i < jn; i++)
 		c->step1();
@@ -2827,7 +3045,7 @@ static void rax_jit_check(adsp21xx_device *c, RaxBlock b)
 		c->m_jn = J->m_jn; c->m_insns = J->m_insns; c->m_skip_pc = J->m_skip_pc; c->m_skip_n = J->m_skip_n; c->m_ppc = J->m_ppc;
 	}
 	s_chk_n++;
-	int bad = memcmp(cj, c, core) != 0 || memcmp(mjb, s_banked, sizeof(s_banked)) || memcmp(mji, s_iram, sizeof(s_iram)) ||
+	int bad = dbj != s_dbank || dbkj != s_data_bank || ovlj != s_dmovlay_val || memcmp(cj, c, core) != 0 || memcmp(mjb, s_banked, sizeof(s_banked)) || memcmp(mji, s_iram, sizeof(s_iram)) ||
 		dmaj != s_dma_next || memcmp(ctlj, s_control, sizeof(ctlj)) || memcmp(pj, s_pram, sizeof(s_pram));
 	if (bad && s_chk_bad++ < 20) {
 		fprintf(stderr, "raxjitchk BAD block %04x n %d:", pc0, jn);

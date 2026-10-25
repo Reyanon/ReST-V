@@ -13,6 +13,7 @@ void sega5838_init(int variant, uint16_t (*read)(uint32_t word_addr));
 void sega5838_source_w(uint32_t data, uint32_t mem_mask);
 void sega5838_table_w(int offset, uint16_t data);
 uint16_t sega5838_data_r(void);
+void sega5838_read_words(uint16_t *dst, uint32_t n); // n sega5838_data_r calls at once (ADR-207)
 int sega5838_state(FILE *fp, int save); /* 0 = ok */
 
 #endif

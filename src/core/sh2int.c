@@ -206,6 +206,12 @@ void SH2HandleInterrupts(SH2_struct *context)
       }
       context->regs.PC = MappedMemoryReadLong(context->regs.VBR + (context->interrupts[context->NumberOfInterrupts - 1].vector << 2), NULL);
       LOG("[%s] Exception %u, vecnum=%02x, saved PC=0x%08x --- New PC=0x%08x\n", context->isslave?"SH2-S":"SH2-M", 9, context->interrupts[context->NumberOfInterrupts - 1].vector, oldpc, context->regs.PC);
+#if !defined(__vita__)
+      { static int on = -1, n; if (on < 0) on = getenv("RSTV_INTLOG") ? atoi(getenv("RSTV_INTLOG")) : 0; // diag (harness): interrupts taken from frame RSTV_INTLOG
+        if (on && (int)yabsys.frame_count >= on && n < 60 && !context->isslave) { n++; fprintf(stderr, "int f%u vec %02x lvl %u from %08x to %08x vbr %08x\n",
+          (unsigned)yabsys.frame_count, context->interrupts[context->NumberOfInterrupts - 1].vector,
+          (unsigned)level, oldpc, context->regs.PC, context->regs.VBR); } }
+#endif
       context->NumberOfInterrupts--;
       context->isIdle = 0;
       context->isSleeping = 0;

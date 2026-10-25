@@ -2261,7 +2261,7 @@ int DMAProc(int cycles) {
   return 0;
 }
 #else
-int DMAProc( int cycles ){
+static int DMAProc0( int cycles ){
 
 
    if (CurrentSH2->onchip.DMAOR & 0x6)
@@ -2399,6 +2399,32 @@ int getEatClock(u32 src, u32 dst) {
 
 }
 
+#include "rstv_prof.h"
+/* diag (Vita, ux0:data/restv/dmaclog): a DMAProc call over 5 ms is logged with the channel registers (ADR-207) */
+int rstv_dmac_slowlog;
+int DMAProc(int cycles) {
+   if (!rstv_dmac_slowlog)
+      return DMAProc0(cycles);
+#if defined(__vita__)
+   const u64 t0 = RSTV_PROF_T();
+   const u32 s0 = CurrentSH2->onchip.SAR0, d0 = CurrentSH2->onchip.DAR0, n0 = CurrentSH2->onchip.TCR0, c0 = CurrentSH2->onchip.CHCR0;
+   const u32 s1 = CurrentSH2->onchip.SAR1, d1 = CurrentSH2->onchip.DAR1, n1 = CurrentSH2->onchip.TCR1, c1 = CurrentSH2->onchip.CHCR1;
+#endif
+   const int r = DMAProc0(cycles);
+#if defined(__vita__)
+   if (t0) {
+      const u64 dt = RSTV_PROF_T() - t0;
+      if (dt > 5000) {
+         extern void rstv_log_printf(const char *fmt, ...);
+         rstv_log_printf("dmac slow %u us f%u cyc %d %s ch0 %08x>%08x n %x>%x chcr %x ch1 %08x>%08x n %x>%x chcr %x", (unsigned)dt,
+            (unsigned)yabsys.frame_count, cycles, CurrentSH2 == SSH2 ? "S" : "M", s0, d0, n0, CurrentSH2->onchip.TCR0, c0,
+            s1, d1, n1, CurrentSH2->onchip.TCR1, c1);
+      }
+   }
+#endif
+   return r;
+}
+
 extern int rstv_dma_busy;
 static void DMATransferCycles0(Dmac * dmac, int cycles);
 #ifndef __vita__
@@ -2446,6 +2472,39 @@ static u32 rstv_dmac_fast(Dmac *dmac, int step)
    *dmac->DAR += 4 * n;
    *dmac->TCR -= n;
    return n;
+}
+
+/* ReST-V (ADR-207): long units from the 315-5838 port (fixed source) to an incrementing destination: the units this slice
+   allows decompressed at once (decathlt: 128 KB to VDP2 VRAM through one long read per unit). Returns the units done */
+static u32 rstv_dmac_5838(Dmac *dmac, int step)
+{
+   extern int stv_5838_enabled;
+   extern u32 stv_5838_read_longs(u32 addr, u32 *dst, u32 n);
+   if (!stv_5838_enabled || dmac->copy_clock < 0 || *dmac->TCR == 0 || (*dmac->DAR & 3))
+      return 0;
+   const u32 dreg = *dmac->DAR & 0x0FF00000;
+   if (dreg != 0x05C00000 && dreg != 0x05E00000 && (*dmac->DAR & 0x0E000000) != 0x06000000)
+      return 0;
+   u32 n = *dmac->TCR;
+   if (step > 0) {
+      const u32 c = (u32)dmac->copy_clock / (u32)step + 1;
+      if (c < n)
+         n = c;
+   }
+   u32 buf[256], done = 0;
+   while (done < n) {
+      const u32 k = n - done < 256 ? n - done : 256;
+      if (!stv_5838_read_longs(*dmac->SAR, buf, k))
+         break;
+      for (u32 j = 0; j < k; j++) {
+         MappedMemoryWriteLongNocache(*dmac->DAR, buf[j]);
+         *dmac->DAR += 4;
+      }
+      done += k;
+   }
+   dmac->copy_clock -= (int)(done * (u32)step);
+   *dmac->TCR -= done;
+   return done;
 }
 
 static void DMATransferCycles0(Dmac * dmac, int cycles ){
@@ -2527,6 +2586,18 @@ static void DMATransferCycles0(Dmac * dmac, int cycles ){
          case 2:
             destInc *= 4;
             srcInc *= 4;
+            if (srcInc == 0 && destInc == 4) { // ADR-207
+               const u32 f = rstv_dmac_5838(dmac, eat);
+               i += f;
+               if (f && *dmac->TCR <= 0) {
+                  if (*dmac->CHCR & 0x4)
+                     SH2SendInterrupt(CurrentSH2, *dmac->VCRDMA, (CurrentSH2->onchip.IPRA & 0xF00) >> 8);
+                  *dmac->CHCR |= 0x2;
+                  *dmac->CHCRM |= 0x2;
+                  SH2WriteNotify(*dmac->DAR - i * destInc, i * abs(destInc));
+                  return;
+               }
+            }
             if (srcInc == 4 && destInc == 4) { // ADR-145
                const u32 f = rstv_dmac_fast(dmac, eat);
                i += f;

@@ -5,6 +5,7 @@
     recovered); the device class became static state. */
 #include "sega5838.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define BIT(x, n) (((x) >> (n)) & 1)
@@ -61,15 +62,39 @@ static struct {
 	uint32_t abort_;
 } s;
 
+/* ReST-V (ADR-207): the substitution of every word as a table, and the prefix code as a 12-bit lookahead table built by
+   running the same search for every 12-bit value (rebuilt when the tables change); bits are still taken one word at a
+   time as before, so the state stays the same. decathlt decompressed 128 KB in 270 ms on the Vita through the search */
+static uint16_t *s_dec_word;   // decipher(x) for the variant s_dec_variant
+static int s_dec_variant = -1;
+static uint16_t s_dec_code[4096]; // the code at the next 12 bits: length (bits 8-11, 0: none) and dictionary index
+static int s_dec_code_ok;
+static uint16_t decipher_calc(uint16_t x);
+
 void sega5838_init(int variant, uint16_t (*read)(uint32_t word_addr))
 {
 	s_variant = variant & 3;
 	s_read = read;
 	memset(&s, 0, sizeof(s));
 	s.output = 0xffff;
+	s_dec_code_ok = 0;
 }
 
 static uint16_t decipher(uint16_t x)
+{
+	if (s_dec_variant != s_variant) {
+		if (!s_dec_word)
+			s_dec_word = (uint16_t *)malloc(65536 * sizeof(uint16_t));
+		if (!s_dec_word)
+			return decipher_calc(x);
+		s_dec_variant = s_variant;
+		for (uint32_t v = 0; v < 65536; v++)
+			s_dec_word[v] = decipher_calc((uint16_t)v);
+	}
+	return s_dec_word[x];
+}
+
+static uint16_t decipher_calc(uint16_t x)
 {
 	const uint8_t lanes[4] = {
 		(uint8_t)((BIT(x, 5) ^ BIT(x, 12)) | ((BIT(x, 7) ^ BIT(x, 9)) << 1) | (BIT(x, 14) << 2)),
@@ -118,12 +143,66 @@ void sega5838_table_w(int offset, uint16_t data)
 	} else if (s.tree_words < 24) {
 		s.tree[s.tree_words++] = data;
 	}
+	s_dec_code_ok = 0;
+}
+
+// the search below for the code at the top of a 12-bit value: (length << 8) | index, 0 if none matches in 12 bits
+static uint16_t code_at(uint32_t v)
+{
+	for (unsigned length = 1; length <= 12; length++) {
+		const uint16_t code = (uint16_t)(v >> (12 - length));
+		for (unsigned entry = 0; entry < 24; entry += 2) {
+			if (((s.tree[entry] >> 8) & 0xff) != length)
+				continue;
+			const uint16_t first = (uint16_t)(s.tree[entry + 1] >> (12 - length));
+			uint16_t limit = (uint16_t)(1u << length);
+			for (unsigned next = entry + 2; next < 24; next += 2)
+				if (s.tree[next + 1] != s.tree[entry + 1]) {
+					limit = (uint16_t)(s.tree[next + 1] >> (12 - length));
+					break;
+				}
+			if (code >= first && code < limit) {
+				const unsigned index = (s.tree[entry] & 0xff) + code - first;
+				if (index < sizeof(s.dictionary))
+					return (uint16_t)(length << 8 | index);
+			}
+		}
+	}
+	return 0;
 }
 
 static uint8_t decompress_byte(void)
 {
 	if (s.abort_ || s.tree_words != 24 || s.dictionary_bytes != sizeof(s.dictionary))
 		return 0xff;
+	if (s_dec_word) { // (ADR-207) the next 12 bits without taking them, then the code's length taken
+		if (!s_dec_code_ok) {
+			for (uint32_t v = 0; v < 4096; v++)
+				s_dec_code[v] = code_at(v);
+			s_dec_code_ok = 1;
+		}
+		uint32_t buf = s.bits ? (s.word & ((1u << s.bits) - 1)) : 0, nb = s.bits, src = s.source;
+		while (nb < 12) {
+			buf = (buf << 16) | decipher(s_read ? s_read(src) : 0xffff);
+			src = (src + 1) & 0x007fffff;
+			nb += 16;
+		}
+		const uint16_t e = s_dec_code[(buf >> (nb - 12)) & 0xfff];
+		for (unsigned need = e ? (e >> 8) : 12; need;) {
+			if (!s.bits) {
+				s.word = decipher(s_read ? s_read(s.source) : 0xffff);
+				s.source = (s.source + 1) & 0x007fffff;
+				s.bits = 16;
+			}
+			const unsigned take = need < s.bits ? need : s.bits;
+			s.bits -= take;
+			need -= take;
+		}
+		if (e)
+			return s.dictionary[e & 0xff];
+		s.abort_ = 1;
+		return 0xff;
+	}
 	uint16_t code = 0;
 	for (unsigned length = 1; length <= 12; length++) {
 		if (!s.bits) {
@@ -161,7 +240,66 @@ uint16_t sega5838_data_r(void)
 	return (uint16_t)s.output;
 }
 
+// ADR-207: n words as n sega5838_data_r calls, the bits in a local buffer; the chip state afterwards (source, word,
+// bits, output) is the one the calls leave
+void sega5838_read_words(uint16_t *dst, uint32_t n)
+{
+	if (!n)
+		return;
+	if (!s_dec_word)
+		dst[0] = sega5838_data_r(), dst++, n--; // (the first word sets up the substitution table)
+	if (!n || s.abort_ || s.tree_words != 24 || s.dictionary_bytes != sizeof(s.dictionary) || !s_dec_word) {
+		for (uint32_t i = 0; i < n; i++)
+			dst[i] = sega5838_data_r();
+		return;
+	}
+	if (!s_dec_code_ok) {
+		for (uint32_t v = 0; v < 4096; v++)
+			s_dec_code[v] = code_at(v);
+		s_dec_code_ok = 1;
+	}
+	uint64_t acc = s.bits ? (s.word & ((1u << s.bits) - 1)) : 0;
+	uint32_t nb = s.bits, src = s.source, w_prev = s.word, w_last = s.word, i = 0;
+	for (; i < n; i++) {
+		uint32_t v = 0;
+		for (int b = 0; b < 2; b++) {
+			while (nb < 12) {
+				w_prev = w_last;
+				w_last = s_dec_word[s_read ? s_read(src) : 0xffff];
+				src = (src + 1) & 0x007fffff;
+				acc = (acc << 16) | w_last;
+				nb += 16;
+			}
+			const uint16_t e = s_dec_code[(acc >> (nb - 12)) & 0xfff];
+			if (!e) { // invalid: put the state back to this byte's start and let the plain path end it
+				if (nb >= 16)
+					s.word = w_prev, s.bits = nb - 16, s.source = (src - 1) & 0x007fffff;
+				else
+					s.word = w_last, s.bits = nb, s.source = src;
+				if (b) { // (the first byte of this word was good)
+					s.output = v << 8;
+					s.output |= decompress_byte();
+					dst[i++] = (uint16_t)s.output;
+				}
+				for (; i < n; i++)
+					dst[i] = sega5838_data_r();
+				return;
+			}
+			nb -= e >> 8;
+			v = (v << 8) | s.dictionary[e & 0xff];
+		}
+		dst[i] = (uint16_t)v;
+	}
+	// a word fetched ahead and not started is fetched again next time (the plain path fetches when it needs a bit)
+	if (nb >= 16)
+		s.word = w_prev, s.bits = nb - 16, s.source = (src - 1) & 0x007fffff;
+	else
+		s.word = w_last, s.bits = nb, s.source = src;
+	s.output = dst[n - 1];
+}
+
 int sega5838_state(FILE *fp, int save)
 {
+	s_dec_code_ok = 0;
 	return save ? (fwrite(&s, sizeof(s), 1, fp) == 1 ? 0 : -1) : (fread(&s, sizeof(s), 1, fp) == 1 ? 0 : -1);
 }

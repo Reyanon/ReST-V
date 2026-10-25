@@ -29,6 +29,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include "frontend/audio.h"
 #include "frontend/emu.h"
 #include "frontend/sampler.h"
+#include "frontend/update.h"
 #include "frontend/menu.h"
 #include "frontend/stv_list.h"
 #include <psp2/appmgr.h>
@@ -720,8 +721,26 @@ static void c2_loop(const char *game, const char *jit_msg)
 
 unsigned rstv_v1log_from, rstv_v1log_to;
 int rstv_v1log_n; // diag: VDP1 GPU list lines left to log (ux0:data/restv/v1log)
+// no screen off or auto suspend while the app runs, whatever it does (loading, menus, a long stall): the screen of a
+// device left on its own went off during unattended runs
+static int power_tick_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	for (;;) {
+		sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+		sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+		sceKernelDelayThread(1000 * 1000);
+	}
+	return 0;
+}
 int main(int argc, char *argv[])
 {
+	{
+		SceUID pt = sceKernelCreateThread("rstv_power", power_tick_thread, 191, 0x1000, 0, 0x80000, NULL); // CPU3, low priority
+		if (pt >= 0)
+			sceKernelStartThread(pt, 0, NULL);
+	}
 	// main (SH-2, SCU, VDP) = CPU0, SCSP/68K thread = CPU1 (thr-restv.c), helper drawing = CPU2
 	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
 	rstv_prof_clock = rstv_time_us;
@@ -739,6 +758,14 @@ int main(int argc, char *argv[])
 		rstv_core_test(); // before any other thread exists
 	sceIoMkdir(DATA_DIR, 0777);
 	sceIoMkdir(ROM_DIR, 0777);
+	{ // ADR-209: GitHub releases, on its own thread (the game list offers a newer one). Owner: only when the app is
+	  // started, not when it comes back to the list from a game (that relaunch passes "list")
+		int back = 0;
+		for (int i = 0; i < argc; i++)
+			back |= argv[i] && !strcmp(argv[i], "list");
+		if (!back)
+			rstv_update_check_start();
+	}
 
 	char jit_msg[160];
 	rstv_jit_selftest(jit_msg, sizeof(jit_msg));
@@ -945,6 +972,34 @@ int main(int argc, char *argv[])
 			sceIoClose(jf);
 			extern int rstv_rax_jit_on;
 			rstv_rax_jit_on = c == '0' ? 0 : c == '1' ? 1 : 2; // 0 off, 1 copy only (check), 2 on
+		}
+	}
+	{ extern int rstv_raxnl_prof; rstv_raxnl_prof = file_exists(DATA_DIR "/raxnlprof"); } // diag: RAX native loop times
+	{ extern int rstv_rax_jit_chain; rstv_rax_jit_chain = !file_exists(DATA_DIR "/raxnochain"); } // diag A/B (ADR-201)
+	{ extern int rstv_rax_jit_entry; rstv_rax_jit_entry = !file_exists(DATA_DIR "/raxanyentry"); } // diag A/B (ADR-202)
+	{ extern int rstv_rax_late_ev; rstv_rax_late_ev = !file_exists(DATA_DIR "/raxexactev"); } // diag A/B (ADR-203)
+	{ extern int rstv_dmac_slowlog; rstv_dmac_slowlog = file_exists(DATA_DIR "/dmaclog"); } // diag: slow on-chip DMA runs (ADR-207)
+#ifdef RSTV_DYNAREC
+	{ extern int rstv_hle_redetect; rstv_hle_redetect = !file_exists(DATA_DIR "/noredetect"); } // diag (ADR-198)
+	{ extern int rstv_lzb_off; rstv_lzb_off = file_exists(DATA_DIR "/nolzb"); } // diag (ADR-198)
+#endif
+	{ // diag: ux0:data/restv/raxprio = the board thread's priority relative to the default (raxthr 4)
+		FILE *pf = fopen(DATA_DIR "/raxprio", "r");
+		if (pf) {
+			extern int rstv_rax_thread_prio;
+			if (fscanf(pf, "%d", &rstv_rax_thread_prio) != 1)
+				rstv_rax_thread_prio = 20;
+			fclose(pf);
+		}
+	}
+	{ // diag: ux0:data/restv/raxlag = frames the RAX board runs behind (1-8, default 2)
+		FILE *pf = fopen(DATA_DIR "/raxlag", "r");
+		if (pf) {
+			extern int rstv_rax_lag;
+			int v = 2;
+			if (fscanf(pf, "%d", &v) == 1 && v >= 1 && v <= 8)
+				rstv_rax_lag = v;
+			fclose(pf);
 		}
 	}
 	{ // ADR-176 (check): ux0:data/restv/raxthr = 2 or 3 runs the RAX board on its own thread on that CPU
@@ -1427,13 +1482,16 @@ int main(int argc, char *argv[])
 				extern unsigned rstv_rax_insns;
 				extern u64 rstv_rax_us, rstv_rax_cpu_us;
 				extern unsigned rstv_rax_jit_gens, rstv_rax_jit_insns, rstv_rax_jit_blocks, rstv_rax_nl_insns;
-				static unsigned s_rax_prev, s_raxj_prev, s_raxn_prev;
+				extern unsigned rstv_rax_jit_calls, rstv_rax_nl_runs;
+				static unsigned s_rax_prev, s_raxj_prev, s_raxn_prev, s_raxc_prev, s_raxr_prev;
 				size_t n = strlen(line);
 				if (rstv_rax_active && n > 0 && line[n - 1] == '\n')
-					snprintf(line + n - 1, sizeof(line) - n + 1, " | rax %.1fms cpu %.1fms %uk jit %uk nl %uk gen %u blk %u\n",
+					snprintf(line + n - 1, sizeof(line) - n + 1, " | rax %.1fms cpu %.1fms %uk jit %uk nl %uk gen %u blk %u calls %u runs %u\n",
 						rstv_rax_us / 60000.0, rstv_rax_cpu_us / 60000.0, (rstv_rax_insns - s_rax_prev) / 60000,
 						(rstv_rax_jit_insns - s_raxj_prev) / 60000, (rstv_rax_nl_insns - s_raxn_prev) / 60000,
-						rstv_rax_jit_gens, rstv_rax_jit_blocks);
+						rstv_rax_jit_gens, rstv_rax_jit_blocks, (rstv_rax_jit_calls - s_raxc_prev) / 60, (rstv_rax_nl_runs - s_raxr_prev) / 60);
+				s_raxc_prev = rstv_rax_jit_calls;
+				s_raxr_prev = rstv_rax_nl_runs;
 				s_rax_prev = rstv_rax_insns;
 				s_raxj_prev = rstv_rax_jit_insns;
 				s_raxn_prev = rstv_rax_nl_insns;
@@ -1613,8 +1671,10 @@ out:
 	rstv_audio_fini();
 	rstv_video_shutdown();
 	rstv_log_shutdown();
-	if (s_quit_mode == 2 || s_exit_next) // menu "Select game" / measuring tools: relaunch the app
-		sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
+	if (s_quit_mode == 2 || s_exit_next) { // menu "Select game" / measuring tools: relaunch the app
+		static char *const av[] = { "list", NULL }; // (back to the list: no update check, ADR-209)
+		sceAppMgrLoadExec("app0:eboot.bin", s_quit_mode == 2 ? av : NULL, NULL);
+	}
 	sceKernelExitProcess(0);
 	return 0;
 }

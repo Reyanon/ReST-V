@@ -296,6 +296,8 @@ int main(int argc, char **argv)
 			extern int rstv_hle_on;
 			if (getenv("RSTV_NOHLE"))
 				rstv_hle_on = 0;
+			{ extern int rstv_hle_redetect; if (getenv("RSTV_NOREDETECT")) rstv_hle_redetect = 0; } // ADR-198 A/B
+			{ extern int rstv_lzb_off; if (getenv("RSTV_NOLZB")) rstv_lzb_off = 1; }
 			extern int rstv_hle_stub_on; // ADR-081: native-call blocks (off with the HLE checker, which runs in Execute)
 			if (getenv("RSTV_NOHLESTUB") || getenv("RSTV_HLECHK"))
 				rstv_hle_stub_on = 0;
@@ -812,7 +814,7 @@ int main(int argc, char **argv)
 			double t = now_s();
 			printf("frame %5d drawn %5u %dx%d video %016llx audio %016llx samples %llu  %.1f fps  mpc %08x spc %08x\n", f,
 				s_frames_drawn, s_w, s_h, (unsigned long long)s_video_hash, (unsigned long long)s_audio_hash,
-				(unsigned long long)s_audio_samples, checkpoint / (t - tc), MSH2->regs.PC, SSH2->regs.PC);
+				(unsigned long long)s_audio_samples, checkpoint / (t - tc), SH2Core->GetPC(MSH2), SH2Core->GetPC(SSH2)); // (the core's own PC: the recompiler keeps it outside regs)
 #if defined(RSTV_DYNAREC)
 			{ // dynarec: cycles really run per frame since the last checkpoint (idle skips excluded), master / slave
 				extern unsigned rstv_dyn_cyc[2];

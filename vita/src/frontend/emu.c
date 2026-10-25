@@ -150,7 +150,9 @@ void rstv_emu_shutdown(void)
 	// ADR-103: the sound and VDP1 threads finish their work before the core is freed
 	extern void rstv_sound_quiesce(void);
 	extern void rstv_vdp1_quiesce(void);
+	extern void rstv_rax_quiesce(void);
 	rstv_sound_quiesce();
+	rstv_rax_quiesce(); // (batmanfr's board thread, ADR-196)
 	rstv_vdp1_quiesce();
 	YabauseDeInit();
 }
@@ -184,7 +186,9 @@ void rstv_emu_reset(void)
 {
 	extern void rstv_sound_quiesce(void);
 	extern void rstv_vdp1_quiesce(void);
+	extern void rstv_rax_quiesce(void);
 	rstv_sound_quiesce();
+	rstv_rax_quiesce();
 	rstv_vdp1_quiesce();
 	YabauseResetNoLoad();
 }
