@@ -45,6 +45,7 @@ add_executable(${PROJECT_NAME}
   src/frontend/menu.c
   src/frontend/cheats.c
   src/frontend/update.c
+  src/frontend/touch.c
   src/frontend/emu.c
   src/frontend/audio.c
   src/frontend/resample.c

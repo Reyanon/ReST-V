@@ -30,6 +30,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include "frontend/emu.h"
 #include "frontend/sampler.h"
 #include "frontend/update.h"
+#include "frontend/touch.h"
 #include "frontend/menu.h"
 #include "frontend/stv_list.h"
 #include <psp2/appmgr.h>
@@ -67,16 +68,49 @@ static unsigned char s_ee_buf[256];
 static int s_ee_n;
 static char s_ee_path[128];
 static volatile int s_ee_pending;
+// ADR-212: save states are made in memory on the emu thread and written by the writer thread (writing the 5 MB file on
+// the emu thread held the game 1-2 s). Written as <path>.tmp, then renamed: a write cut short keeps the old state
+static char *s_st_buf;
+static size_t s_st_n;
+static char s_st_path[160];
+static volatile int s_st_pending;
+static SceUID s_writer_wake = -1;
 // ADR-090: the exit request file (ux0:data/restv/exit) is also checked by this thread. The main loop called sceIoGetstat every 120 frames
 // and stalled 0.5-1.8 s when that overlapped a card write (g2 f5820·f6060, underruns 85·320)
 static volatile int s_exit_req;
-static volatile int s_exit_next; // the exit file says "next": relaunch the app (autostart picks the next game, no home screen)
+static volatile int s_exit_next; // the exit file says "next": the game in the autostart file (in this process, ADR-211)
 static int async_writer_thread(SceSize args, void *argp)
 {
 	(void)args;
 	(void)argp;
 	for (unsigned tick = 0;; tick++) {
-		sceKernelDelayThread(200 * 1000);
+		if (s_writer_wake >= 0) { // (woken at once for a save state, else every 200 ms)
+			SceUInt to = 200 * 1000;
+			sceKernelWaitSema(s_writer_wake, 1, &to);
+		} else
+			sceKernelDelayThread(200 * 1000);
+		if (s_st_pending) {
+			__sync_synchronize();
+			char tmp[168];
+			snprintf(tmp, sizeof(tmp), "%s.tmp", s_st_path);
+			SceUID sfd = sceIoOpen(tmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+			int ok = 0;
+			if (sfd >= 0) {
+				ok = sceIoWrite(sfd, s_st_buf, s_st_n) == (int)s_st_n;
+				sceIoClose(sfd);
+			}
+			if (ok) {
+				sceIoRemove(s_st_path);
+				ok = sceIoRename(tmp, s_st_path) >= 0;
+			}
+			if (!ok)
+				sceIoRemove(tmp);
+			RSTV_LOG("state write %s: %s (%u KB)", s_st_path, ok ? "ok" : "failed", (unsigned)(s_st_n >> 10));
+			free(s_st_buf);
+			s_st_buf = NULL;
+			__sync_synchronize();
+			s_st_pending = 0;
+		}
 		if (tick % 10 == 9) {
 			SceIoStat st;
 			if (sceIoGetstat(DATA_DIR "/exit", &st) >= 0) {
@@ -120,9 +154,32 @@ static void writer_start(void)
 	if (started)
 		return;
 	started = 1;
+	s_writer_wake = sceKernelCreateSema("rstv_writer", 0, 0, 1, NULL);
 	SceUID t = sceKernelCreateThread("rstv_writer", async_writer_thread, 120, 0x4000, 0, 0x80000, NULL); // CPU3 (ADR-147)
 	if (t >= 0)
 		sceKernelStartThread(t, 0, NULL);
+}
+// ADR-212: a save state the writer thread has not finished yet (before a load, another save, a game switch, exit)
+static void state_write_wait(void)
+{
+	while (s_st_pending)
+		sceKernelDelayThread(2000);
+}
+static int state_save_async(const char *path)
+{
+	state_write_wait();
+	char *b = NULL;
+	size_t n = 0;
+	if (rstv_state_save_mem(&b, &n) != 0)
+		return rstv_state_save(path); // (no memory for it: straight to the card as before)
+	s_st_buf = b;
+	s_st_n = n;
+	snprintf(s_st_path, sizeof(s_st_path), "%s", path);
+	__sync_synchronize();
+	s_st_pending = 1;
+	if (s_writer_wake >= 0)
+		sceKernelSignalSema(s_writer_wake, 1);
+	return 0;
 }
 // In-game EEPROM save: snapshot it and hand it to the writer thread (card writes on the main thread sometimes stall for hundreds of ms)
 static void eeprom_save_async(const char *path)
@@ -316,6 +373,19 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 		*sys = 0;
 		return;
 	}
+	if (g_set.touch_keys) // ADR-214: the touch buttons press their Vita keys (in the game only)
+		b |= rstv_touch_buttons();
+	{ // ADR-214 combo keys (as ReiREM): a key with a combo acts as its two keys pressed together, not its own mapping
+		uint32_t add = 0;
+		for (int k = 0; k < 6; k++)
+			if (g_set.combo[k] && (b & rstv_key_code(k))) {
+				b &= ~rstv_key_code(k);
+				for (int j = 0; j < RSTV_KEY_COUNT; j++)
+					if (g_set.combo[k] & (1 << j))
+						add |= rstv_key_code(j);
+			}
+		b |= add;
+	}
 	if (b & SCE_CTRL_UP) p |= STV_IN_UP;
 	if (b & SCE_CTRL_DOWN) p |= STV_IN_DOWN;
 	if (b & SCE_CTRL_LEFT) p |= STV_IN_LEFT;
@@ -417,11 +487,12 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 static void load_rom_progress(int p) { rstv_loading_progress(p * 7 / 10); }
 static void load_gpu_progress(int p) { rstv_loading_progress(700 + p * 3 / 10); }
 
+static int s_picked; // game.txt to write (after the loading screen is up)
 static const char *game_menu(char *buf, int len)
 {
 	const char *set = rstv_game_select(buf[0] ? buf : NULL, ROM_DIR);
 	snprintf(buf, len, "%s", set);
-	write_text_file(DATA_DIR "/game.txt", buf, 0);
+	s_picked = 1;
 	return buf;
 }
 
@@ -449,7 +520,7 @@ __attribute__((used)) static const unsigned char s_text_pad[28 * 1024] = { 1 };
 static unsigned s_spike_us = 25000; // late frame log threshold (us)
 static int s_spike_sampler;         // if the sampling profiler is on, log top blocks on every late frame
 extern unsigned long long rstv_snd_wall_us, rstv_snd_lat_us, rstv_snd_gap_us; extern unsigned rstv_snd_posts; // sound thread wall time of its frames, wake latency (scsp.c)
-static int s_quit_mode;             // ADR-094 menu: 1 = quit, 2 = back to game select (relaunch app)
+static int s_quit_mode;             // ADR-094 menu: 1 = quit, 2 = back to game select (same process, ADR-211)
 
 // ---- Sega System C / C2 (ADR-107): 68000 board. Video via CPU texture, sound at 44.1kHz into the same audio ring buffer ----
 // YM sound generation on a CPU1 worker thread (c2snd_worker: replays the frame's write log, result independent of thread timing)
@@ -774,6 +845,8 @@ int main(int argc, char *argv[])
 
 	const int mhz_pre_video = rstv_clock_measure_arm_mhz();
 	rstv_video_init();
+	rstv_video_preload();
+	rstv_loading_prepare();
 	const int mhz_post_video = rstv_clock_measure_arm_mhz();
 	rstv_audio_init();
 	const int mhz_post_audio = rstv_clock_measure_arm_mhz();
@@ -781,11 +854,27 @@ int main(int argc, char *argv[])
 
 
 	char game_buf[64], err[256];
+	rstv_touch_init(); // ADR-214
 	rstv_settings_load();
 	rstv_settings_apply_video();
 	const char *game = pick_game(game_buf, sizeof(game_buf));
 	if (!game)
 		game_buf[0] = 0; // owner: the game list also without ROMs (R in the list reads the folder again)
+	// ADR-211 (owner: fast game list entry, as ReSys12 / ReiREM): "Select game" comes back here in the same process
+	// instead of starting the app again. Video, audio output, log, the code region and the core's helper threads stay.
+	// The measuring tools' "next" (exit file) goes the same way to the game in the autostart file
+	int n_games = 0, switch_next = 0;
+next_game:
+	s_quit_mode = 0;
+	rstv_test_session = 0;
+	s_test_frames = 0;
+	if (n_games) {
+		rstv_settings_load(); // (the global settings again, as a new process: the last game's own ones are left)
+		rstv_settings_apply_video();
+		s_autostart = 0;
+		if (switch_next)
+			game = pick_game(game_buf, sizeof(game_buf));
+	}
 	if (!s_autostart)
 		game = game_menu(game_buf, sizeof(game_buf));
 	if (!game) {
@@ -794,6 +883,15 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 	RSTV_LOG("game: %s", game);
+	if (!c2_is_game(game)) { // owner: the loading screen at once when a game is picked (the rest below waited before it)
+		const StvGameInfo *gi = STVFindGame(game);
+		rstv_loading_title(gi && gi->name ? gi->name : game);
+		rstv_loading_progress(0);
+	}
+	if (s_picked) {
+		s_picked = 0;
+		write_text_file(DATA_DIR "/game.txt", game, 0);
+	}
 	// ADR-126: per-game settings (over global, if present) and border artwork
 	rstv_settings_load_game(game);
 	rstv_settings_apply_video();
@@ -1062,10 +1160,20 @@ int main(int argc, char *argv[])
 	extern void (*gvdp2_progress)(int permille);
 	gvdp2_progress = load_gpu_progress;
 	gx_set_busy(rstv_loading_tick); // ADR-193: shader compiles keep the loading bar moving
-	const int use_gpu = !file_exists(DATA_DIR "/cpucompose") && gvdp2_init() == 0;
+	const int use_gpu = !file_exists(DATA_DIR "/cpucompose") && (n_games ? gvdp2_game_start() : gvdp2_init()) == 0;
+	n_games++;
 	gx_set_busy(NULL);
 	gvdp2_progress = NULL;
 	rstv_loading_progress(1000);
+#ifdef RSTV_DEBUG_TOOLS
+	if (rstv_fastboot_until > 0) { // (debug fastboot: the BIOS boot runs unseen; its progress on the loading bar below)
+		const StvGameInfo *gi = STVFindGame(game);
+		char lt[128];
+		snprintf(lt, sizeof(lt), "%s - BIOS boot (fastboot, debug build)", gi && gi->name ? gi->name : game);
+		rstv_loading_title(lt);
+		rstv_loading_progress(0);
+	} else
+#endif
 	rstv_loading_done();
 
 	// perf log: average and max every 60 frames, appended to file every 600 frames
@@ -1196,6 +1304,8 @@ int main(int argc, char *argv[])
 		if (rstv_menu_should_open(pad.buttons)) {
 			// ADR-094: in-game menu (SELECT+START). Emulation stops while the menu is open; the menu is drawn over the last frame
 			RSTV_LOG("menu: open f%u", frame);
+			rstv_fps_hide(); // (it covered the menu, e.g. Done of the touch layout editor)
+			rstv_touch_overlay_update(1);
 			for (int done = 0; !done;) {
 				sceCtrlPeekBufferPositive(0, &pad, 1);
 				const rstv_menu_result r = rstv_menu_update(pad.buttons);
@@ -1213,12 +1323,13 @@ int main(int argc, char *argv[])
 					break;
 				case RSTV_MENU_SAVE: {
 					rstv_state_slot_path(sp, sizeof(sp), slot);
-					const int rc = rstv_state_save(sp);
+					const int rc = state_save_async(sp);
 					rstv_osd_show(rc == 0 ? "Saved: slot %d" : "Save failed: slot %d", slot);
 					break;
 				}
 				case RSTV_MENU_LOAD: {
 					rstv_state_slot_path(sp, sizeof(sp), slot);
+					state_write_wait();
 					const int rc = rstv_state_load(sp);
 					rstv_osd_show(rc == 0 ? "Loaded: slot %d" : "Load failed: slot %d", slot);
 					done = 1;
@@ -1308,6 +1419,12 @@ int main(int argc, char *argv[])
 		uint64_t t0 = rstv_time_us();
 #ifdef RSTV_DEBUG_TOOLS
 		rstv_fastboot_now = frame < rstv_fastboot_until;
+		if (rstv_fastboot_until > 0) { // owner: the screen looked stuck at 100% for the 3-5 s of the fastboot frames
+			if (rstv_fastboot_now && frame % 30 == 0)
+				rstv_loading_progress((int)(frame * 1000u / (unsigned)rstv_fastboot_until));
+			else if (frame == (uint32_t)rstv_fastboot_until)
+				rstv_loading_done();
+		}
 #endif
 		rstv_emu_run_frame(p1, 0, sys);
 		for (int k = 0; k < n_poke; k++)
@@ -1377,7 +1494,10 @@ int main(int argc, char *argv[])
 			if (act) {
 				const uint64_t ts = rstv_time_us();
 				const char *sp = act == 1 ? save_path : (quick ? state_path : load_path);
-				const int r = act == 1 ? rstv_state_save(sp) : rstv_state_load(sp);
+				if (act == 2)
+					state_write_wait();
+				// saves through the writer thread (ADR-212; the game end waits for the write)
+				const int r = act == 1 ? state_save_async(sp) : rstv_state_load(sp);
 				RSTV_LOG("state %s f%u %s: %d (%.1fms)", act == 1 ? "save" : "load", frame + 1, sp, r, (rstv_time_us() - ts) / 1000.0);
 				if (quick)
 					rstv_osd_show(act == 1 ? (r == 0 ? "Saved: quick" : "Save failed: quick") : (r == 0 ? "Loaded: quick" : "Load failed: quick"));
@@ -1434,6 +1554,7 @@ int main(int argc, char *argv[])
 		}
 		// FPS (updated every second) + frame number; top-right box as in Reirem (ADR-094); expire notices
 		rstv_fps_update((float)osd_fps, frame);
+		rstv_touch_overlay_update(0); // ADR-214 (drawn again only when the layout changes)
 		rstv_osd_tick();
 		if (s_exit_req) {
 			// ADR-086: exit request from measurement tools; clean up and exit instead of a forced quit (checked by the writer thread, ADR-090)
@@ -1664,6 +1785,20 @@ int main(int argc, char *argv[])
 	}
 	if (eeprom_dirty())
 		eeprom_save(nv_path);
+	state_write_wait(); // (ADR-212)
+	if ((s_quit_mode == 2 && !s_exit_req) || (s_exit_req && s_exit_next)) { // ADR-211: "Select game" / tools' "next"
+		switch_next = s_exit_req && s_exit_next;
+		s_exit_req = s_exit_next = 0;
+		RSTV_LOG("switch: %s at f%u (game %d)", switch_next ? "next game" : "back to the game list", frame, n_games);
+		if (use_gpu)
+			gvdp2_game_end();
+		rstv_emu_shutdown();
+		rstv_video_game_end();
+		rstv_fps_hide();
+		rstv_touch_overlay_update(1);
+		rstv_video_present();
+		goto next_game;
+	}
 	RSTV_LOG("exit: clean shutdown at f%u", frame);
 	rstv_emu_shutdown();
 	rstv_jit_shutdown(); // ADR-086: close VM area, free code blocks
@@ -1671,7 +1806,7 @@ out:
 	rstv_audio_fini();
 	rstv_video_shutdown();
 	rstv_log_shutdown();
-	if (s_quit_mode == 2 || s_exit_next) { // menu "Select game" / measuring tools: relaunch the app
+	if (s_quit_mode == 2 || s_exit_next) { // System C / C2 menu "Select game" / measuring tools: relaunch the app
 		static char *const av[] = { "list", NULL }; // (back to the list: no update check, ADR-209)
 		sceAppMgrLoadExec("app0:eboot.bin", s_quit_mode == 2 ? av : NULL, NULL);
 	}

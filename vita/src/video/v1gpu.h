@@ -34,6 +34,7 @@ typedef struct {
 
 // items -> vertices (out, max_verts) + batches. atlas is GPU atlas memory (RGBA8, width V1GPU_ATLAS), vram is VDP1 RAM,
 // page_stamp/serial are VDP1 RAM write stamps (re-decode when a pattern changes). -1 on failure
+void v1gpu_reset(void); // ADR-211: drop the sprite cache (another game in the same process)
 int v1gpu_build(const RstvV1Item *items, int n, float *out, int max_verts, uint8_t *atlas, const uint8_t *vram,
 	const uint32_t *page_stamp, uint32_t serial, V1Frame *f);
 

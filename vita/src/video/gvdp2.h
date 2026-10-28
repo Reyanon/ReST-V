@@ -8,6 +8,10 @@
 // Call after gx_init and after YabauseInit. 0 = success (on failure only the CPU path is used)
 void gvdp2_set_game(const char *game); // per-game shader variant list (before gvdp2_init)
 int gvdp2_init(void);
+// ADR-211: back to the game list without a new process. gvdp2_game_end before the core is freed (the frame in flight
+// finishes); gvdp2_game_start in place of gvdp2_init for the games after the first (GPU resources stay, caches go)
+void gvdp2_game_end(void);
+int gvdp2_game_start(void);
 // for the spike line: accumulated times (not reset): prep thread work, prep wait in draw_end, draw_end CPU
 void gvdp2_peek_times(unsigned long long *prep_worker, unsigned long long *prep_wait, unsigned long long *draw);
 

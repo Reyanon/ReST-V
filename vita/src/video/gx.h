@@ -50,6 +50,7 @@ void gx_shutdown(void);
 // texture (w rounded to a multiple of 8). linear: bilinear filter, rt: nonzero = also a render target (value = render target slot,
 // textures in the same slot share a render target -> only 1 scene per slot per frame)
 GxTex *gx_tex(int w, int h, int fmt, int linear, int rt);
+void gx_tex_free(GxTex *t); // not a render target; the GPU must be done with it (gx_finish)
 void gx_tex_filter(GxTex *t, int linear);
 unsigned gx_gpu_wait_us(void); // diag: accumulated GPU wait (us) // point (0) or bilinear (1) sampling
 // horizontal repeat addressing (palette etc.)

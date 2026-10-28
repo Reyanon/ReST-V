@@ -978,6 +978,14 @@ int rstv_state_save(const char *path)
 	return YabSaveState(path);
 }
 
+int YabSaveStateMem(char **out, size_t *len);
+int rstv_state_save_mem(char **out, size_t *len)
+{
+	rstv_sound_quiesce();
+	rstv_vdp1_quiesce();
+	return YabSaveStateMem(out, len);
+}
+
 int rstv_state_load(const char *path)
 {
 	rstv_sound_quiesce();

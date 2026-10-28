@@ -3044,6 +3044,21 @@ static void rstv_hle_bits_sync(void)
   }
   rstv_hle_bits_n = rstv_hle_n;
 }
+// ADR-211: a game started after another one in the same process (SH2DynInit, from YabauseInit): what the last game left
+// in these tables goes, as in a new process. rstv_hle_codegen moves on instead of going back to 1, so the routines'
+// cached generations (0 in a new process) compare their code again
+extern "C" void rstv_dyn_game_reset(void)
+{
+  memset(rstv_code_chunk, 0, sizeof(rstv_code_chunk));
+  memset(rstv_hle_chunk, 0, sizeof(rstv_hle_chunk));
+  memset(rstv_tier_hot, 0, sizeof(rstv_tier_hot));
+  rstv_hle_nrng = 0;
+  memset(rstv_hle_bits, 0, sizeof(rstv_hle_bits)); // (the count only told when to rebuild: the same count in the next
+  rstv_hle_bits_n = -1;                             // game kept the last game's native PCs)
+  rstv_hle_codegen = (rstv_hle_codegen + 1) & 0x7FFFFFFFu;
+  if (!rstv_hle_codegen)
+    rstv_hle_codegen = 1;
+}
 
 // work RAM long read / write without checks (the caller checked the ranges)
 static inline u32 rstv_hw_rd(u32 a) { return T2ReadLong(HighWram, a & 0xFFFFF); }

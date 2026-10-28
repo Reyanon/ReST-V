@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <jpeglib.h>
+#include <psp2/kernel/threadmgr.h>
 #include <png.h>
 
 #include "platform/log.h"
@@ -291,22 +292,23 @@ static void quad(const GxProg *p, GxParam scale, float x0, float y0, float x1, f
 	gx_draw(SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, v, gx_seq_indices(4), 4);
 }
 
-static struct { GxTex *t; int x, y, w, h, rot; float a; } s_layer[4] = { { .a = 1 }, { .a = 1 }, { .a = 1 }, { .a = 1 } };
+// slot 4 (ADR-214): the touch buttons over the game, drawn first (under the menu and the other layers)
+static struct { GxTex *t; int x, y, w, h, rot; float a; } s_layer[5] = { { .a = 1 }, { .a = 1 }, { .a = 1 }, { .a = 1 }, { .a = 1 } };
 // ADR-194: a layer's opacity (the blinking menu focus is a small layer of its own: the blink costs no CPU drawing)
 void rstv_video_layer_alpha(int slot, float a)
 {
-	if (slot >= 0 && slot < 4)
+	if (slot >= 0 && slot < 5)
 		s_layer[slot].a = a;
 }
 // ADR-190: a layer turned clockwise by rot * 90 degrees (the FPS box follows a Vita held upright)
 void rstv_video_layer_rot(int slot, int rot)
 {
-	if (slot >= 0 && slot < 4)
+	if (slot >= 0 && slot < 5)
 		s_layer[slot].rot = rot & 3;
 }
 void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h)
 {
-	if (slot < 0 || slot >= 4)
+	if (slot < 0 || slot >= 5)
 		return;
 	s_layer[slot].t = t;
 	s_layer[slot].x = x;
@@ -556,21 +558,108 @@ static uint8_t *load_art_file(const char *name, int *w, int *h)
 	return b;
 }
 // the app's LiveArea background (RGBA, malloc'd; NULL if missing): loading screen (ADR-191)
-uint8_t *rstv_video_load_bg(int *w, int *h)
+// owner: the loading screen right after a game is picked. Its background (the LiveArea art) and the blank artwork are
+// decoded once on a thread at start (decoding them when the first game was picked kept the list on screen ~0.5 s)
+static uint8_t *s_bg_px;
+static int s_bg_w, s_bg_h;
+static SceUID s_pre_thr = -1;
+static uint8_t *s_blank_src;
+static int s_blank_w, s_blank_h;
+static int preload_thread(SceSize args, void *argp)
 {
-	return load_png("app0:sce_sys/livearea/contents/bg.png", w, h);
+	(void)args;
+	(void)argp;
+	s_bg_px = load_png("app0:sce_sys/livearea/contents/bg.png", &s_bg_w, &s_bg_h);
+	s_blank_src = load_png("app0:assets/blankArtwork.png", &s_blank_w, &s_blank_h);
+	return sceKernelExitThread(0);
 }
+void rstv_video_preload(void)
+{
+	s_pre_thr = sceKernelCreateThread("rstv_preload", preload_thread, 0x10000100 + 20, 0x40000, 0, 0x80000, NULL); // CPU3
+	if (s_pre_thr >= 0 && sceKernelStartThread(s_pre_thr, 0, NULL) < 0) {
+		sceKernelDeleteThread(s_pre_thr);
+		s_pre_thr = -1;
+	}
+}
+static void preload_wait(void)
+{
+	if (s_pre_thr < 0)
+		return;
+	sceKernelWaitThreadEnd(s_pre_thr, NULL, NULL);
+	sceKernelDeleteThread(s_pre_thr);
+	s_pre_thr = -1;
+}
+uint8_t *rstv_video_load_bg(int *w, int *h) // (kept: the caller keeps it too)
+{
+	preload_wait();
+	if (!s_bg_px)
+		s_bg_px = load_png("app0:sce_sys/livearea/contents/bg.png", &s_bg_w, &s_bg_h);
+	*w = s_bg_w;
+	*h = s_bg_h;
+	return s_bg_px;
+}
+// ADR-210 (owner): the app's blank artwork (games without their own) is tinted with the theme's accent: its brightness
+// times the colour (x2, so mid grey is the colour), as ReiREM. Kept untinted to be tinted again when the theme changes
+extern uint32_t rstv_menu_accent(void);
+static int s_art_blank;
+static uint32_t s_blank_acc;
+static void blank_tint(uint8_t *dst, size_t dst_stride)
+{
+	const uint32_t acc = rstv_menu_accent();
+	const unsigned tr = acc & 0xFF, tg = (acc >> 8) & 0xFF, tb = (acc >> 16) & 0xFF;
+	static uint8_t row[2048 * 4];
+	for (int y = 0; y < s_blank_h; y++) {
+		const uint8_t *p = s_blank_src + (size_t)y * s_blank_w * 4;
+		for (int x = 0; x < s_blank_w && x < 2048; x++, p += 4) {
+			const unsigned l = (p[0] * 77u + p[1] * 150u + p[2] * 29u) >> 8;
+			const unsigned r = l * tr / 128, g = l * tg / 128, b = l * tb / 128;
+			row[x * 4] = (uint8_t)(r > 255 ? 255 : r);
+			row[x * 4 + 1] = (uint8_t)(g > 255 ? 255 : g);
+			row[x * 4 + 2] = (uint8_t)(b > 255 ? 255 : b);
+			row[x * 4 + 3] = 0xFF;
+		}
+		memcpy(dst + (size_t)y * dst_stride, row, (size_t)s_blank_w * 4); // (one copy a row: texture memory)
+	}
+	s_blank_acc = acc;
+}
+// the theme may have changed (Display > Theme in a game): the blank artwork shown is tinted again
+void rstv_video_art_retint(void)
+{
+	if (s_art_blank && s_art && s_blank_src && rstv_menu_accent() != s_blank_acc)
+		blank_tint(s_art->data, s_art->stride);
+}
+// ADR-211: back to the game list in the same process: the last game's picture and artwork are not shown any more
+void rstv_video_game_end(void)
+{
+	s_ready = -1;
+	s_gpu_last = 0;
+	s_art_w = s_art_h = 0;
+}
+
 void rstv_video_set_art(const char *set, const char *parent)
 {
-	s_art_w = s_art_h = 0; // (one texture: one game per run)
+	s_art_w = s_art_h = 0; // (one texture, made again when a later game's artwork is larger)
+	s_art_blank = 0;
+	preload_wait();
 	if (!set)
 		return;
 	int w = 0, h = 0;
 	uint8_t *b = load_art_file(set, &w, &h);
 	if (!b && parent)
 		b = load_art_file(parent, &w, &h);
-	if (!b) // no artwork for this game: the app's blank artwork (owner), as it is
-		b = load_png("app0:assets/blankArtwork.png", &w, &h);
+	if (!b) { // no artwork for this game: the app's blank artwork (owner), tinted with the theme (ADR-210)
+		if (!s_blank_src)
+			s_blank_src = load_png("app0:assets/blankArtwork.png", &s_blank_w, &s_blank_h);
+		if (s_blank_src && s_blank_w <= 2048 && s_blank_h <= 2048) {
+			w = s_blank_w;
+			h = s_blank_h;
+			b = (uint8_t *)malloc((size_t)w * h * 4);
+			if (b) {
+				blank_tint(b, (size_t)w * 4);
+				s_art_blank = 1;
+			}
+		}
+	}
 	if (!b) {
 		// (no blank artwork either: the app's LiveArea background, full screen at 60% over black, not too loud)
 		b = load_png("app0:sce_sys/livearea/contents/bg.png", &w, &h);
@@ -586,10 +675,15 @@ void rstv_video_set_art(const char *set, const char *parent)
 		}
 		RSTV_LOG("video: %s artwork missing, bg.png at 60%%", set);
 	}
-	if (w > 2048 || h > 2048 || (s_art && (w > s_art->w || h > s_art->h))) {
+	if (w > 2048 || h > 2048) {
 		RSTV_LOG("video: artwork %dx%d too large", w, h);
 		free(b);
 		return;
+	}
+	if (s_art && (w > s_art->w || h > s_art->h)) { // a larger artwork than an earlier game's (ADR-211): a new texture
+		gx_finish();
+		gx_tex_free(s_art);
+		s_art = NULL;
 	}
 	if (!s_art)
 		s_art = gx_tex(w, h, GX_RGBA8, 1, 0);
@@ -603,10 +697,21 @@ void rstv_video_set_art(const char *set, const char *parent)
 	free(b);
 }
 
+// owner: the FPS box sits on the game picture's top-right corner; the picture's place on the screen (last present)
+static int s_pic_x, s_pic_y, s_pic_w = 960, s_pic_h = 544;
+void rstv_video_picture_rect(int *x, int *y, int *w, int *h)
+{
+	*x = s_pic_x;
+	*y = s_pic_y;
+	*w = s_pic_w;
+	*h = s_pic_h;
+}
+
 void rstv_video_present(void)
 {
 	if (!s_prog_img || !s_prog_fill)
 		return;
+	rstv_video_art_retint(); // owner: the blank artwork follows the theme at once, also while the menu is open
 	gx_lock(); // keep clear of the worker thread's GPU submits (ADR-029)
 	gx_begin(NULL);
 	// black background
@@ -653,6 +758,10 @@ void rstv_video_present(void)
 			dw = side ? dh * 3.0f / 4.0f : dh * 4.0f / 3.0f;
 		}
 		const float x0 = (960.0f - dw) * 0.5f, y0 = (544.0f - dh) * 0.5f;
+		s_pic_x = (int)(x0 + 0.5f);
+		s_pic_y = (int)(y0 + 0.5f);
+		s_pic_w = (int)(dw + 0.5f);
+		s_pic_h = (int)(dh + 0.5f);
 		if (s_border && s_scale_mode != 2) {
 			// ADR-126 border: fill the whole screen with artwork (if any) or solid color, then the game screen
 			if (s_border == 1 && s_art && s_art_w > 0) {
@@ -700,11 +809,12 @@ void rstv_video_present(void)
 		gx_set_tex(s_u_osd_tex, s_osd_tex[s_osd_cur]);
 		quad(s_prog_osd, s_u_osd_scale, 8, 8, 8 + w * OSD_SCALE, 8 + h * OSD_SCALE, 0, 0, w / OSD_W, 1);
 	}
-	for (int k = 0; k < 4 && s_prog_layer; k++) {
+	for (int kk = 0; kk < 5 && s_prog_layer; kk++) {
+		const int k = kk == 0 ? 4 : kk - 1; // (slot 4 first: under the others)
 		GxTex *t = s_layer[k].t;
 		if (!t)
 			continue;
-		static int logged[4];
+		static int logged[5];
 		if (!logged[k]) {
 			logged[k] = 1;
 			RSTV_LOG("video: layer %d drawn %dx%d at %d,%d", k, s_layer[k].w, s_layer[k].h, s_layer[k].x, s_layer[k].y);

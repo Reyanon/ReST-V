@@ -45,6 +45,10 @@ void rstv_m68k_trace_hook(void)
 #endif
 
 static int M68KMusashiInit(void) {
+   // ReST-V (ADR-211): the cycle counts and CPU state as in a new process (a game started after another one)
+   extern int m68ki_remaining_cycles, m68ki_initial_cycles;
+   m68ki_remaining_cycles = m68ki_initial_cycles = 0;
+   memset(&m68ki_cpu, 0, sizeof(m68ki_cpu));
 
    m68k_init();
    m68k_set_reset_instr_callback(m68k_pulse_reset);

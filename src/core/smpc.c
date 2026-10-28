@@ -80,6 +80,8 @@ int syslngid = 0;
 //////////////////////////////////////////////////////////////////////////////
 
 int SmpcInit(u8 regionid, int syslanguageid, int clocksync, u32 basetime) {
+   intback_wait_for_line = 0; // ReST-V (ADR-211): as in a new process (a game started after another one)
+   ckchg_frame = 0;
    if ((SmpcRegsT = (u8 *) calloc(1, sizeof(Smpc))) == NULL)
       return -1;
  

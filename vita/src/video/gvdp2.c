@@ -4457,6 +4457,14 @@ static void shader_lab_ext(const char *ext, int uniq)
 static void shader_lab(void) { shader_lab_ext(".cg", 0); }
 
 // ADR-035: register composite/RBG0 variants seen last run at startup (load cached GXP and register right away)
+static int s_preload_again; // ADR-211: a later game in the same process
+static int var_known(const char *key)
+{
+	for (int i = 0; i < s_nvar; i++)
+		if (!strcmp(s_var[i].key, key))
+			return 1;
+	return 0;
+}
 static void preload_variants(void)
 {
 	SceUID d = sceIoDopen(VARLIST_DIR);
@@ -4508,6 +4516,10 @@ static void preload_variants(void)
 				continue;
 			}
 			*nl = 0;
+			if (s_preload_again && var_known(buf)) { // (already loaded for an earlier game)
+				free(buf);
+				continue;
+			}
 			CmpVariant *v = &s_var[s_nvar];
 			snprintf(v->key, sizeof(v->key), "%s", buf);
 			v->fbin = gx_compile(nl + 1, 1);
@@ -4525,7 +4537,7 @@ static void preload_variants(void)
 					gvdp2_progress(300 + (nc < 160 ? nc * 650 / 160 : 650));
 			}
 			free(buf);
-		} else if (pass == 0 && s_nbg_spec && !strncmp(e.d_name, pre_n, 12) && s_nnvar < 24) {
+		} else if (pass == 0 && !s_preload_again && s_nbg_spec && !strncmp(e.d_name, pre_n, 12) && s_nnvar < 24) {
 			const int key = (int)strtol(e.d_name + 12, NULL, 16);
 			NbgVariant *v = &s_nvar_tab[s_nnvar];
 			const size_t n = strlen(s_fs_nbg) + 512;
@@ -4545,7 +4557,7 @@ static void preload_variants(void)
 				s_nnvar++;
 				nn++;
 			}
-		} else if (pass == 0 && s_rbg_spec && s_prog_rbg && !strncmp(e.d_name, pre_r, 12) && s_nrvar < 32) {
+		} else if (pass == 0 && !s_preload_again && s_rbg_spec && s_prog_rbg && !strncmp(e.d_name, pre_r, 12) && s_nrvar < 32) {
 			const int key = (int)strtol(e.d_name + 12, NULL, 16);
 			RbgVariant *v = &s_rvar[s_nrvar];
 			const size_t n = strlen(s_fs_rbg2);
@@ -4572,9 +4584,11 @@ static void preload_variants(void)
 	if (d >= 0)
 		sceIoDclose(d);
 	// ADR-066: migration of cached variants from the previous source: worker thread reads files (mig_scan), main registers a few per frame (mig_take)
-	s_mig_pending = 1;
-	if (s_cmp_sema >= 0)
-		sceKernelSignalSema(s_cmp_sema, 1);
+	if (!s_preload_again) {
+		s_mig_pending = 1;
+		if (s_cmp_sema >= 0)
+			sceKernelSignalSema(s_cmp_sema, 1);
+	}
 	RSTV_LOG("gvdp2: preloaded %d compose (%d not in list) + %d rbg variants (%.0f ms, %s %s spec %d %d)", nc, nskip, nr,
 		(RSTV_PROF_T() - t0) / 1000.0, pre_c, pre_r, s_cmp_spec, s_rbg_spec);
 	{
@@ -4930,6 +4944,58 @@ int gvdp2_init(void)
 		gvdp2_progress(1000);
 	s_ok = 1;
 	RSTV_LOG("gvdp2: ready");
+	return 0;
+}
+
+// ADR-211 (owner: fast game list entry, as ReSys12 / ReiREM): the app goes back to the game list in the same process
+void gvdp2_game_end(void)
+{
+	if (!s_ok)
+		return;
+	prep_wait();
+	if (s_end_pend >= 0) { // (the deferred end of the last frame, ADR-186)
+		draw_end_work(s_end_pend);
+		s_end_pend = -1;
+	}
+	gx_finish();
+}
+int gvdp2_game_start(void)
+{
+	if (!s_ok)
+		return gvdp2_init();
+	if (gvdp2_progress)
+		gvdp2_progress(0);
+	// (YabauseInit made every VRAM page and the palette new for the caches, as after a state load.) What was kept
+	// from the previous game is dropped
+	memset(s_lvalid, 0, sizeof(s_lvalid));
+	memset(s_plane_valid, 0, sizeof(s_plane_valid));
+	memset(s_plane_tag, 0xFF, sizeof(s_plane_tag));
+	memset(s_slut_pool_valid, 0, sizeof(s_slut_pool_valid));
+	memset(s_argb_dirty, 0, sizeof(s_argb_dirty));
+	s_argb_pend = 0;
+	s_atlas_copied = 0;
+	s_snap_valid = 0;
+	s_snap_vram_serial = 0;
+	s_snap_cram_serial = 0xFFFFFFFFu;
+	s_v1snap_valid = 0;
+	s_cgen++;
+	RbgqState *const qs[2] = { &s_rbgq, &s_rbgq_b };
+	for (int k = 0; k < 2; k++) {
+		memset(qs[k]->valid, 0, sizeof(qs[k]->valid));
+		memset(qs[k]->flat_slot, 0xFF, sizeof(qs[k]->flat_slot));
+	}
+	v1gpu_reset();
+	s_frame = 0;
+	// this game's variant list (gvdp2_set_game): its compose variants not loaded yet, and the list noted afresh
+	s_cl_n = 0;
+	s_cl_loaded = 0;
+	for (int i = 0; i < s_nvar; i++)
+		s_var[i].listed = 0;
+	s_preload_again = 1;
+	preload_variants();
+	if (gvdp2_progress)
+		gvdp2_progress(1000);
+	RSTV_LOG("gvdp2: ready (game %s)", s_game);
 	return 0;
 }
 

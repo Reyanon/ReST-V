@@ -404,6 +404,16 @@ int TitanInit()
 
       tt_context.inited = 1;
    }
+   else
+   {
+      /* ReST-V (ADR-211): another game in the same process. The buffers are kept (TitanDeInit is never called, and
+         the renderers hold them) but cleared as new ones: the last game's pixels showed below a taller screen */
+      for(i = 0;i < 6;i++)
+         memset(tt_context.vdp2framebuffer[i], 0, sizeof(struct PixelData) * 704 * 256);
+      for(i = 1;i < 4;i++)
+         memset(tt_context.linescreen[i], 0, sizeof(u32) * 512);
+      memset(tt_context.backscreen, 0, sizeof(struct PixelData) * 704 * 512);
+   }
 
    for(i = 0;i < 6;i++)
       memset(tt_context.vdp2framebuffer[i], 0, sizeof(u32) * 704 * 256);

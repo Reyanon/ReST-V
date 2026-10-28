@@ -193,6 +193,9 @@ YabEventQueue * q_scsp_finish;
 
 int YabauseInit(yabauseinit_struct *init)
 {
+  // ReST-V (ADR-211): the cycle remainders start at 0 as in a new process (a game started after another one)
+  saved_scsp_cycles = 0;
+  saved_m68k_cycles = 0;
   q_scsp_frame_start = YabThreadCreateQueue(1);
   q_scsp_finish = YabThreadCreateQueue(1);
   setM68kCounter(0);
@@ -471,6 +474,21 @@ int YabauseInit(yabauseinit_struct *init)
    scsp_set_use_new(init->use_new_scsp);
 #ifdef WEBINTERFACE
    YabStartHttpServer();
+#endif
+#if defined(RSTV)
+   {  // ReST-V (ADR-211): VRAM is new for the renderers' caches, as after a state load (memory.c). The serials go on
+      // across games in one process, so pages the next game has not written yet would look unchanged to a cache
+      // filled by the last game (the VDP1 thread's VRAM copy kept the last game's pages)
+      extern u32 rstv_vdp1_serial, rstv_vdp1_page_stamp[128], rstv_vdp2_serial, rstv_vdp2_page_stamp[128], rstv_cram_serial;
+      int p;
+      rstv_vdp1_serial++;
+      rstv_vdp2_serial++;
+      rstv_cram_serial++;
+      for (p = 0; p < 128; p++) {
+         rstv_vdp1_page_stamp[p] = rstv_vdp1_serial;
+         rstv_vdp2_page_stamp[p] = rstv_vdp2_serial;
+      }
+   }
 #endif
    return 0;
 }

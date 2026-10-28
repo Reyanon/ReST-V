@@ -360,6 +360,29 @@ int main(int argc, char **argv)
 	yinit.stv_romset = game;
 
 	rstv_prof_clock = prof_clock;
+	if (getenv("RSTV_PRERUN")) {
+		// ADR-211: RSTV_PRERUN=SET:FRAMES runs another set first and shuts the core down the way the Vita app does when it
+		// goes back to the game list. The main run that follows must hash the same as a fresh process: state left over
+		// from the first game shows up as a different hash
+		char g[64];
+		int n = 0;
+		if (sscanf(getenv("RSTV_PRERUN"), "%63[^:]:%d", g, &n) == 2) {
+			yinit.stv_romset = g;
+			if (YabauseInit(&yinit) == 0) {
+				for (int f = 1; f <= n; f++) {
+					StvIoSetInputs(0, 0, f % 600 < 6 ? STV_SYS_COIN1 : 0);
+					YabauseExec();
+				}
+			} else
+				fprintf(stderr, "prerun %s: init failed\n", g);
+			YabauseDeInit();
+			yinit.stv_romset = game;
+			s_video_hash = s_audio_hash = 0xcbf29ce484222325ull;
+			s_audio_samples = 0;
+			s_frames_drawn = 0;
+			fprintf(stderr, "prerun %s %d frames\n", g, n);
+		}
+	}
 	double t0 = now_s();
 	if (YabauseInit(&yinit) != 0) {
 		fprintf(stderr, "YabauseInit failed\n");

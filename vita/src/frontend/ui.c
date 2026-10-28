@@ -108,21 +108,24 @@ struct UiCanvas {
 };
 
 static void dirty_add(UiCanvas *c, int x0, int y0, int x1, int y1);
-void ui_image(UiCanvas *c, const uint8_t *rgba, int w, int h, unsigned level)
+// bilinear (owner: smooth, not blocky), worked out once for this image, size and level, then copied. ui_image_prepare
+// does that part ahead (a thread at start: ~230 ms on the first loading screen, owner)
+static uint32_t *s_img_cache;
+static const uint8_t *s_img_src;
+static int s_img_w, s_img_h;
+static unsigned s_img_level;
+void ui_image_prepare(const uint8_t *rgba, int w, int h, int cw, int ch, unsigned level)
 {
-	if (!c || !rgba || w <= 0 || h <= 0)
+	if (!rgba || w <= 0 || h <= 0)
 		return;
-	// bilinear (owner: smooth, not blocky), worked out once for this image, size and level, then copied
-	static uint32_t *cache;
-	static const uint8_t *c_src;
-	static int c_w, c_h;
-	static unsigned c_level;
-	if (!cache || c_src != rgba || c_w != c->w || c_h != c->h || c_level != level) {
+	uint32_t *cache = s_img_cache;
+	if (!cache || s_img_src != rgba || s_img_w != cw || s_img_h != ch || s_img_level != level) {
 		free(cache);
-		cache = (uint32_t *)malloc((size_t)c->w * c->h * 4);
+		cache = s_img_cache = (uint32_t *)malloc((size_t)cw * ch * 4);
 		if (!cache)
 			return;
-		c_src = rgba; c_w = c->w; c_h = c->h; c_level = level;
+		s_img_src = rgba; s_img_w = cw; s_img_h = ch; s_img_level = level;
+		const struct { int w, h; } cv = { cw, ch }, *c = &cv;
 		for (int y = 0; y < c->h; y++) {
 			// source position of the pixel centre, 8 fractional bits
 			int sy = (int)(((2 * y + 1) * h * 128) / c->h) - 128;
@@ -147,7 +150,15 @@ void ui_image(UiCanvas *c, const uint8_t *rgba, int w, int h, unsigned level)
 			}
 		}
 	}
-	memcpy(c->px, cache, (size_t)c->w * c->h * 4);
+}
+void ui_image(UiCanvas *c, const uint8_t *rgba, int w, int h, unsigned level)
+{
+	if (!c || !rgba || w <= 0 || h <= 0)
+		return;
+	ui_image_prepare(rgba, w, h, c->w, c->h, level);
+	if (!s_img_cache)
+		return;
+	memcpy(c->px, s_img_cache, (size_t)c->w * c->h * 4);
 	dirty_add(c, 0, 0, c->w, c->h);
 }
 

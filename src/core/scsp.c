@@ -5164,6 +5164,13 @@ ScspInit (int coreid, int scsp_sync_count_per_frame, int scsp_main_mode )
 
   IsM68KRunning = 0;
 
+  // ReST-V (ADR-211): the LFO noise tables come from rand(); start it where a new process does, so a game started
+  // after another one in the same process (back to the game list) sounds the same. use_new_scsp as in a new process
+  // too: scsp_set_use_new resets the new SCSP (more rand() calls) only when it was off
+  srand (1);
+  use_new_scsp = 0;
+  sh2_read_req = 0;
+  mem_access_counter = 0;
   scsp_init (SoundRam, &c68k_interrupt_handler, &scu_interrupt_handler);
   ScspInternalVars->scsptiming1 = 0;
   ScspInternalVars->scsptiming2 = 0;

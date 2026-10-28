@@ -42,6 +42,8 @@ extern int rstv_kctrl_ready(void);
 #define CA_PATH "app0:cacert.pem"
 
 static volatile int s_ready;       // 1: a newer release is known
+static volatile int s_state;       // ADR-213: RSTV_UPD_*
+static int s_manual;               // asked from the options: a skipped version is offered too
 static char s_tag[32], s_url[512]; // its tag and package URL
 static char *s_notes;              // notes of the newer releases
 static char s_cur[32];             // this build's version (or ux0:data/restv/updtest, a test)
@@ -420,11 +422,13 @@ static int check_thread(SceSize args, void *argp)
 	(void)argp;
 	if (!net_up()) {
 		RSTV_LOG("update: no network");
+		s_state = RSTV_UPD_FAILED;
 		return sceKernelExitDeleteThread(0);
 	}
 	Buf b = { 0 };
 	if (!http_get(s_api, &b, 20)) {
 		free(b.p);
+		s_state = RSTV_UPD_FAILED;
 		return sceKernelExitDeleteThread(0);
 	}
 	char skip[32] = { 0 };
@@ -485,14 +489,17 @@ static int check_thread(SceSize args, void *argp)
 	free(b.p);
 	if (best > cur && s_dl_test[0])
 		snprintf(s_url, sizeof(s_url), "%s", s_dl_test);
-	if (best > cur && strcmp(skip, s_tag) != 0) {
+	if (best > cur && (s_manual || strcmp(skip, s_tag) != 0)) {
+		free(s_notes);
 		s_notes = notes;
 		RSTV_LOG("update: %s available (this build %s), %s", s_tag, s_cur, s_url);
 		__sync_synchronize();
 		s_ready = 1;
+		s_state = RSTV_UPD_FOUND;
 	} else {
 		free(notes);
 		RSTV_LOG("update: none (this build %s%s%s)", s_cur, best > cur ? ", skipped " : "", best > cur ? s_tag : "");
+		s_state = RSTV_UPD_LATEST;
 	}
 	return sceKernelExitDeleteThread(0);
 }
@@ -531,9 +538,27 @@ void rstv_update_check_start(void)
 		fclose(tf);
 	}
 	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, 0x80000, NULL);
-	if (t >= 0)
+	if (t >= 0) {
+		s_state = RSTV_UPD_CHECKING;
 		sceKernelStartThread(t, 0, NULL);
+	}
 }
+
+void rstv_update_check_now(void)
+{
+	if (s_state == RSTV_UPD_CHECKING)
+		return; // (one running already)
+	if (!s_cur[0])
+		snprintf(s_cur, sizeof(s_cur), "%s", RSTV_VERSION); // (the start check did not run: autostart, noupdate)
+	s_manual = 1;
+	s_ready = 0;
+	s_state = RSTV_UPD_CHECKING;
+	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, 0x80000, NULL);
+	if (t < 0 || sceKernelStartThread(t, 0, NULL) < 0)
+		s_state = RSTV_UPD_FAILED;
+}
+
+int rstv_update_state(void) { return s_state; }
 
 int rstv_update_ready(void) { return s_ready; }
 const char *rstv_update_version(void) { return s_tag; }

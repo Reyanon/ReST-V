@@ -65,6 +65,7 @@ int STVSaveState(FILE *fp);                          // ReST-V: "STV " chunk (I/
 int STVLoadState(FILE *fp, int version, int size);
 int rstv_state_save(const char *path); // 0 = ok; between frames only
 int rstv_state_load(const char *path);
+int rstv_state_save_mem(char **out, size_t *len); // ADR-212: into memory (malloc'd), 0 = ok; between frames only
 extern int rstv_coin_mailbox_latch; // ADR-151: sound RAM 0x4F1 keeps the SH-2 value until the SH-2 reads it
 
 #ifdef __cplusplus

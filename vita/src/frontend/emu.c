@@ -155,6 +155,10 @@ void rstv_emu_shutdown(void)
 	rstv_rax_quiesce(); // (batmanfr's board thread, ADR-196)
 	rstv_vdp1_quiesce();
 	YabauseDeInit();
+	// the sound thread could still ask the board for a frame between the waits above and its stop in YabauseDeInit: the
+	// board thread then ran a compiled block while the code region was freed (exit) or used again (the next game):
+	// a prefetch abort at exit. The sound thread is stopped now: what it asked is finished here
+	rstv_rax_quiesce();
 }
 
 void rstv_emu_run_frame(uint8_t p1, uint8_t p2, uint8_t system)

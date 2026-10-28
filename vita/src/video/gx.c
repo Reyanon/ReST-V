@@ -280,6 +280,17 @@ GxTex *gx_tex(int w, int h, int fmt, int linear, int rt)
 	return t;
 }
 
+void gx_tex_free(GxTex *t)
+{
+	if (!t)
+		return;
+	const SceUID uid = sceKernelFindMemBlockByAddr(t->data, 0);
+	sceGxmUnmapMemory(t->data);
+	if (uid >= 0)
+		sceKernelFreeMemBlock(uid);
+	free(t);
+}
+
 void gx_tex_filter(GxTex *t, int linear)
 {
 	const SceGxmTextureFilter f = linear ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT;

@@ -1687,6 +1687,30 @@ int YabSaveStateBuffer(void ** buffer, size_t * size)
 
 //////////////////////////////////////////////////////////////////////////////
 
+#if defined(RSTV)
+// ReST-V (ADR-212): the state into memory (malloc'd, *out); the caller writes it to the card on another thread
+int YabSaveStateMem(char **out, size_t *len)
+{
+   FILE *fp;
+   int status;
+   *out = NULL;
+   *len = 0;
+   if ((fp = open_memstream(out, len)) == NULL)
+      return -1;
+   ScspLockThread();
+   status = YabSaveStateStream(fp);
+   ScspUnLockThread();
+   fseek(fp, 0, SEEK_END); // (the stream ends at its furthest write: StateFinishHeader seeks back into it)
+   fclose(fp);
+   if (status != 0 || !*out || !*len) {
+      free(*out);
+      *out = NULL;
+      return -1;
+   }
+   return 0;
+}
+#endif
+
 int YabSaveState(const char *filename)
 {
    FILE *fp;

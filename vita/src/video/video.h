@@ -11,6 +11,9 @@
 
 void rstv_video_init(void);
 void rstv_video_shutdown(void);
+void rstv_video_game_end(void);
+void rstv_video_preload(void); // the loading screen's background and the blank artwork, decoded on a thread at start
+void rstv_video_picture_rect(int *x, int *y, int *w, int *h); // the game picture on the screen (last present) // (back to the game list in the same process, ADR-211)
 
 // pixel pointer of the next texture to draw. w x h is this frame's game screen size
 uint32_t *rstv_video_frame_begin(int w, int h);
@@ -49,5 +52,6 @@ uint8_t *rstv_video_load_bg(int *w, int *h);
 void rstv_video_set_style(int scan_type, int scan_strength, int border, int border_color);
 // border artwork: ux0:data/restv/artwork/<set>.png (.jpg, .bmp), else parent. set NULL removes it
 void rstv_video_set_art(const char *set, const char *parent);
+void rstv_video_art_retint(void); // (the blank artwork follows a theme change, ADR-210)
 
 #endif

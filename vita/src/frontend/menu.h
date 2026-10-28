@@ -33,6 +33,8 @@ enum { RSTV_CONFIRM_CROSS, RSTV_CONFIRM_CIRCLE, RSTV_CONFIRM_COUNT };
 // game list filter (SELECT cycles in this order)
 enum { RSTV_LIST_PLAYABLE, RSTV_LIST_ALL, RSTV_LIST_FAVORITES, RSTV_LIST_FILTER_COUNT };
 enum { RSTV_TURBO_FAST, RSTV_TURBO_MEDIUM, RSTV_TURBO_SLOW, RSTV_TURBO_SPEED_COUNT };
+// colour themes (ADR-210, as ReSys12 / ReiREM; Blue is the ReST-V default)
+enum { RSTV_THEME_RED, RSTV_THEME_BLUE, RSTV_THEME_GREEN, RSTV_THEME_PURPLE, RSTV_THEME_ORANGE, RSTV_THEME_GRAPHITE, RSTV_THEME_COUNT };
 
 typedef struct {
 	int fps;           // FPS display
@@ -50,6 +52,10 @@ typedef struct {
 	int turbo_speed;   // RSTV_TURBO_*
 	int confirm;       // RSTV_CONFIRM_*
 	int list_filter;   // RSTV_LIST_*
+	int theme;         // RSTV_THEME_* (global)
+	int combo[6];      // ADR-214: combo keys: combo[RSTV_KEY_*] = bit mask (1 << RSTV_KEY_*) of two keys it presses, 0 = normal
+	int touch_keys;    // ADR-214: the touch screen buttons press their keys
+	int touch_show;    // the touch buttons are drawn over the game
 } rstv_settings;
 extern rstv_settings g_set;
 // ADR-190: game direction = screen direction turned back by this (0, 90, 270 degrees clockwise); set by apply_video
@@ -75,6 +81,8 @@ int rstv_fav_is(const char *set);
 void rstv_fav_toggle(const char *set);
 // apply current settings to video output (screen, filter, scanlines, border)
 void rstv_settings_apply_video(void);
+// the theme's accent (0xAABBGGRR): the blank border artwork is tinted with it (ADR-210)
+uint32_t rstv_menu_accent(void);
 
 typedef enum {
 	RSTV_MENU_STAY,
@@ -84,6 +92,7 @@ typedef enum {
 	RSTV_MENU_LOAD,        // load current slot, then close
 	RSTV_MENU_SELECT_GAME, // relaunch the app to game select
 	RSTV_MENU_REFRESH,     // game list options: read the ROM folder again
+	RSTV_MENU_UPDATE,      // game list options: check for updates (ADR-213)
 	RSTV_MENU_EXIT,
 	RSTV_MENU_TEST,        // close and press the board's TEST switch (ST-V BIOS test menu)
 } rstv_menu_result;
@@ -106,6 +115,10 @@ void rstv_loading_done(void);
 
 void rstv_osd_show(const char *fmt, ...);
 void rstv_osd_tick(void);                   // every frame (hides after 2 s)
+void rstv_fps_hide(void);
+void rstv_loading_prepare(void); // the loading screen's background, decoded and scaled on a thread (at start)
+// ADR-214: the touch buttons over the game (hidden: in a menu, the game list); drawn again only when the layout changes
+void rstv_touch_overlay_update(int hidden);
 void rstv_fps_update(float fps, unsigned frame); // every frame (display refreshed every 0.1 s)
 
 // test (ux0:data/restv/menutest): draw each menu page, notice and FPS box to ux0:data/restv/menu_<name>.ppm

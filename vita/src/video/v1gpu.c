@@ -37,6 +37,8 @@ static void cache_reset(void)
 	s_resets++;
 }
 
+void v1gpu_reset(void) { cache_reset(); }
+
 static int atlas_alloc(int w, int h, int *ax, int *ay)
 {
 	for (int i = 0; i < s_shelf_n; i++)

@@ -28,6 +28,7 @@ void ui_hide(UiCanvas *c);                     // remove from screen
 // drawing (coords inside the canvas, alpha blended)
 void ui_rect(UiCanvas *c, int x, int y, int w, int h, uint32_t col);
 // whole canvas from an RGBA image (stretched, nearest), colours times level / 256, opaque
+void ui_image_prepare(const uint8_t *rgba, int w, int h, int cw, int ch, unsigned level); // ui_image's scaling, ahead
 void ui_image(UiCanvas *c, const uint8_t *rgba, int w, int h, unsigned level);
 // canvas-sized premultiplied pixels (c->w x c->h) copied in: whole canvas, or one rectangle of it
 void ui_blit(UiCanvas *c, const uint32_t *px);

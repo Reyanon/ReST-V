@@ -2476,6 +2476,14 @@ static void rax_board_reset()
 	s_reg_period = 0;
 	s_dma_next = 0;
 	s_now = 0;
+	// ADR-211: the DSP's idle wait and timers too (s_now goes back to 0): after a reset (menu, or a batmanfr started
+	// again in the same process) the DSP stayed in the old idle wait, waiting for a time of the old clock, and the
+	// board never ran again (the game stopped)
+	s_idle = 0;
+	s_reg_next = 0;
+	s_t0 = 0;
+	s_len = 0;
+	s_dma_param = 0;
 }
 
 extern "C" void rstv_rax_init(const u8 *rom, u32 size)
@@ -2496,6 +2504,20 @@ extern "C" void rstv_rax_init(const u8 *rom, u32 size)
 			(unsigned)offsetof(adsp21xx_device, m_jn), (unsigned)offsetof(adsp21xx_device, m_read0_ptr),
 			(unsigned)offsetof(adsp21xx_device, m_alu_xregs), (unsigned)offsetof(adsp21xx_device, m_condition_table),
 			(unsigned)sizeof(adsp21xx_device));
+#endif
+	// ADR-211: a batmanfr started after another game in the same process: the compiler's marks go, and its code region
+	// is used from the start again (it filled up in the second run: the board then ran interpreted). The board thread
+	// is at rest here (rstv_emu_shutdown) and every block is dropped first
+	memset(s_loopend, 0, sizeof(s_loopend));
+#if defined(__arm__)
+	memset(s_jent, 0, sizeof(s_jent));
+	raxj_newgen();
+	for (int i = 0; i < RAXJ_SLOTS; i++) {
+		s_slot[i].state = RJ_FREE;
+		s_slot[i].code = NULL;
+	}
+	s_jused = 0;
+	s_jregion_full = 0;
 #endif
 	s_cpu.init();
 	rax_nl_init();

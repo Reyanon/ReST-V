@@ -142,7 +142,13 @@ SH2Interface_struct SH2DynDebug = {
   SH2DynAddCycle
 };
 
+#if defined(RSTV)
+extern "C" void rstv_dyn_game_reset(void);
+#endif
 int SH2DynInit(void) {
+#if defined(RSTV)
+  rstv_dyn_game_reset(); // ADR-211 (another game may have run in this process)
+#endif
   return 0;
 }
 
