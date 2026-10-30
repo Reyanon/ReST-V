@@ -317,6 +317,19 @@ void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h)
 	s_layer[slot].h = h;
 }
 
+static RstvStrip s_strip[RSTV_NSTRIP];
+static int s_nstrip, s_strip_y0, s_strip_y1;
+void rstv_video_strips(const RstvStrip *s, int n, int y0, int y1)
+{
+	if (n > RSTV_NSTRIP)
+		n = RSTV_NSTRIP;
+	for (int i = 0; i < n; i++)
+		s_strip[i] = s[i];
+	s_nstrip = n;
+	s_strip_y0 = y0;
+	s_strip_y1 = y1;
+}
+
 static int s_scale_mode, s_filter = 1, s_rot;
 void rstv_video_set_mode(int scale, int filter)
 {
@@ -811,6 +824,19 @@ void rstv_video_present(void)
 	}
 	for (int kk = 0; kk < 5 && s_prog_layer; kk++) {
 		const int k = kk == 0 ? 4 : kk - 1; // (slot 4 first: under the others)
+		if (kk == 2) // the list rows' strips: over slot 0, under the focus outline
+			for (int i = 0; i < s_nstrip; i++) {
+				const RstvStrip *s = &s_strip[i];
+				const int sy0 = s->y > s_strip_y0 ? s->y : s_strip_y0, sy1 = s->y + s->h < s_strip_y1 ? s->y + s->h : s_strip_y1;
+				if (sy1 <= sy0)
+					continue;
+				GxTex *st = (GxTex *)s->t;
+				gx_tex_filter(st, 0);
+				gx_use(s_prog_layer);
+				gx_set_tex(s_u_layer_tex, st);
+				quad(s_prog_layer, s_u_layer_scale, (float)s->x, (float)sy0, (float)(s->x + s->w), (float)sy1,
+					0, (float)(sy0 - s->y) / st->h, (float)s->w / st->w, (float)(sy1 - s->y) / st->h);
+			}
 		GxTex *t = s_layer[k].t;
 		if (!t)
 			continue;

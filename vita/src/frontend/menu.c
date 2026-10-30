@@ -7,6 +7,7 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/appmgr.h>
 #include <psp2/shellutil.h>
@@ -21,6 +22,7 @@
 
 #include "frontend/cheats.h"
 #include "frontend/update.h"
+#include "common/re_pad.h"
 #include "frontend/touch.h"
 #include "frontend/stv_list.h"
 #include "frontend/ui.h"
@@ -30,6 +32,8 @@
 #include "platform/timer.h"
 #include "rstv_version.h" // generated at build time (tools/git_version.cmake)
 #include "video/video.h"
+// Device choice list: each source with its device ("Controller 1: Switch Pro")
+static char s_devtext[RE_PAD_SRC_COUNT][40];
 
 #define DATA_DIR "ux0:data/restv"
 #define SETTINGS_PATH DATA_DIR "/settings.cfg"
@@ -360,20 +364,31 @@ static const uint32_t *theme_rows(int bands)
 rstv_settings g_set;
 
 static const char *const s_keymap_keys[RSTV_ACT_COUNT] = { "key_b1", "key_b2", "key_b3", "key_b4", "key_coin", "key_start" };
+static const char *const s_keymap2_keys[RSTV_ACT_COUNT] = { "key2_b1", "key2_b2", "key2_b3", "key2_b4", "key2_coin",
+	"key2_start" };
+
+void rstv_settings_default_port(int port)
+{
+	if (port < 0 || port >= RSTV_PROFILES) // (a profile: re_pad_profile)
+		return;
+	rstv_port *p = &g_set.port[port];
+	p->keymap[RSTV_ACT_B1] = RSTV_KEY_CROSS;
+	p->keymap[RSTV_ACT_B2] = RSTV_KEY_CIRCLE;
+	p->keymap[RSTV_ACT_B3] = RSTV_KEY_SQUARE;
+	p->keymap[RSTV_ACT_B4] = RSTV_KEY_TRIANGLE;
+	p->keymap[RSTV_ACT_COIN] = RSTV_KEY_SELECT;
+	p->keymap[RSTV_ACT_START] = RSTV_KEY_START;
+	p->stick = RSTV_STICK_BOTH;
+	p->turbo_key = RSTV_KEY_NONE;
+	p->turbo_btn = 1;
+	p->turbo_speed = RSTV_TURBO_FAST;
+	memset(p->combo, 0, sizeof(p->combo));
+}
 
 void rstv_settings_default_keys(void)
 {
-	g_set.keymap[RSTV_ACT_B1] = RSTV_KEY_CROSS;
-	g_set.keymap[RSTV_ACT_B2] = RSTV_KEY_CIRCLE;
-	g_set.keymap[RSTV_ACT_B3] = RSTV_KEY_SQUARE;
-	g_set.keymap[RSTV_ACT_B4] = RSTV_KEY_TRIANGLE;
-	g_set.keymap[RSTV_ACT_COIN] = RSTV_KEY_SELECT;
-	g_set.keymap[RSTV_ACT_START] = RSTV_KEY_START;
-	g_set.stick = RSTV_STICK_BOTH;
-	g_set.turbo_key = RSTV_KEY_NONE;
-	g_set.turbo_btn = 1;
-	g_set.turbo_speed = RSTV_TURBO_FAST;
-	memset(g_set.combo, 0, sizeof(g_set.combo));
+	for (int i = 0; i < RSTV_PROFILES; i++)
+		rstv_settings_default_port(i);
 	g_set.touch_keys = 1; // (ADR-214: on, shown; nothing happens until a layout has buttons)
 	g_set.touch_show = 1;
 }
@@ -391,19 +406,22 @@ void rstv_settings_defaults(void)
 	g_set.confirm = RSTV_CONFIRM_CROSS;
 	g_set.list_filter = RSTV_LIST_PLAYABLE;
 	g_set.theme = RSTV_THEME_BLUE;
+	g_set.pad_src[0] = g_set.pad_src[1] = RE_PAD_SRC_AUTO;
+	g_set.input_engine = RE_PAD_ENGINE_NATIVE;
 	rstv_settings_default_keys();
 }
 
 uint32_t rstv_key_code(int key)
 {
 	static const uint32_t codes[RSTV_KEY_COUNT] = { SCE_CTRL_CROSS, SCE_CTRL_CIRCLE, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE,
-		SCE_CTRL_LTRIGGER, SCE_CTRL_RTRIGGER, SCE_CTRL_SELECT, SCE_CTRL_START };
+		SCE_CTRL_LTRIGGER, SCE_CTRL_RTRIGGER, SCE_CTRL_SELECT, SCE_CTRL_START, RE_PAD_L2, RE_PAD_R2, RE_PAD_L3, RE_PAD_R3 };
 	return key >= 0 && key < RSTV_KEY_COUNT ? codes[key] : 0;
 }
 
 const char *rstv_key_name(int key)
 {
-	static const char *const n[RSTV_KEY_COUNT] = { "Cross", "Circle", "Square", "Triangle", "L", "R", "Select", "Start" };
+	static const char *const n[RSTV_KEY_COUNT] = { "Cross", "Circle", "Square", "Triangle", "L", "R", "Select", "Start", "L2", "R2",
+		"L3", "R3" };
 	return key >= 0 && key < RSTV_KEY_COUNT ? n[key] : "None";
 }
 
@@ -433,15 +451,21 @@ void rstv_settings_apply_video(void)
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+// a key from a settings file: files before L2 / R2 / L3 / R3 (no keyver=2 line first) had None as 8
+static int s_keyver;
+static int key_val(int v, int hi) { return clampi(s_keyver < 2 && v == 8 ? RSTV_KEY_NONE : v, 0, hi); }
 // ADR-214 combo keys (as ReiREM): Cross .. R can each press two of them together
 #define RSTV_COMBO_KEYS 6
-static const char *const s_combo_keys[RSTV_COMBO_KEYS] = { "cross", "circle", "square", "triangle", "l", "r" };
+// keys that can be combo keys: those six, then a controller's L2 / R2 / L3 / R3 (the pairs stay of the six)
+#define RSTV_COMBO_SRC 10
+static const char *const s_combo_keys[RSTV_KEY_COUNT] = { "cross", "circle", "square", "triangle", "l", "r", NULL, NULL,
+	"l2", "r2", "l3", "r3" };
 static int combo_ok(int v) // two different keys of Cross..R
 {
 	int n = 0;
 	for (int k = 0; k < RSTV_KEY_COUNT; k++)
 		if (v & (1 << k)) {
-			if (k >= RSTV_COMBO_KEYS)
+			if (k == RSTV_KEY_SELECT || k == RSTV_KEY_START) // (pairs of Cross..R, L2 / R2 / L3 / R3)
 				return 0;
 			n++;
 		}
@@ -451,7 +475,8 @@ static int combo_ok(int v) // two different keys of Cross..R
 // items per-game settings can override (global values in s_global)
 typedef struct {
 	int fps, aspect, filter, scan_type, scan_strength, border, border_color, rotate;
-	int keymap[RSTV_ACT_COUNT], stick, turbo_key, turbo_btn, turbo_speed, touch_keys, touch_show, combo[6];
+	rstv_port port[RSTV_PROFILES];
+	int touch_keys, touch_show;
 } game_part;
 static game_part s_global;
 static int s_game_on;   // per-game settings are active for the current game
@@ -460,25 +485,72 @@ static void part_get(game_part *g)
 	g->fps = g_set.fps; g->aspect = g_set.aspect; g->filter = g_set.filter;
 	g->scan_type = g_set.scan_type; g->scan_strength = g_set.scan_strength;
 	g->border = g_set.border; g->border_color = g_set.border_color; g->rotate = g_set.rotate;
-	memcpy(g->keymap, g_set.keymap, sizeof(g->keymap));
-	g->stick = g_set.stick; g->turbo_key = g_set.turbo_key; g->turbo_btn = g_set.turbo_btn; g->turbo_speed = g_set.turbo_speed;
+	memcpy(g->port, g_set.port, sizeof(g->port));
 	g->touch_keys = g_set.touch_keys; g->touch_show = g_set.touch_show;
-	memcpy(g->combo, g_set.combo, sizeof(g->combo));
 }
 static void part_set(const game_part *g)
 {
 	g_set.fps = g->fps; g_set.aspect = g->aspect; g_set.filter = g->filter;
 	g_set.scan_type = g->scan_type; g_set.scan_strength = g->scan_strength;
 	g_set.border = g->border; g_set.border_color = g->border_color; g_set.rotate = g->rotate;
-	memcpy(g_set.keymap, g->keymap, sizeof(g->keymap));
-	g_set.stick = g->stick; g_set.turbo_key = g->turbo_key; g_set.turbo_btn = g->turbo_btn; g_set.turbo_speed = g->turbo_speed;
+	memcpy(g_set.port, g->port, sizeof(g->port));
 	g_set.touch_keys = g->touch_keys; g_set.touch_show = g->touch_show;
-	memcpy(g_set.combo, g->combo, sizeof(g->combo));
+}
+// one port line (ADR-216): Port 1 keeps the names from before ports (stick, turbo_*, combo_*, key_*), Port 2 has "p2_"
+// before them (its keys: key2_*). 1 if recognized
+static int read_port(const char *key, int val)
+{
+	rstv_port *p = &g_set.port[0];
+	const char *dot = strchr(key, '.');
+	if (dot) { // a device's profile: "<profile>.<item>"
+		int i = 0;
+		while (i < RSTV_PROFILES && (strlen(re_pad_profile_key(i)) != (size_t)(dot - key) || strncmp(key, re_pad_profile_key(i), dot - key)))
+			i++;
+		if (i == RSTV_PROFILES)
+			return 0;
+		p = &g_set.port[i];
+		key = dot + 1;
+	} else if (!strncmp(key, "p2_", 3)) {
+		p = &g_set.port[1];
+		key += 3;
+	}
+	if (!strcmp(key, "stick")) p->stick = clampi(val, 0, RSTV_STICK_COUNT - 1);
+	else if (!strcmp(key, "turbo_key")) p->turbo_key = key_val(val, RSTV_KEY_NONE);
+	else if (!strcmp(key, "turbo_btn")) p->turbo_btn = clampi(val, 1, RSTV_GAME_BUTTONS);
+	else if (!strcmp(key, "turbo_speed")) p->turbo_speed = clampi(val, 0, RSTV_TURBO_SPEED_COUNT - 1);
+	else if (!strncmp(key, "combo_", 6)) { // combo_<key>=<mask of two keys>
+		for (int k = 0; k < RSTV_KEY_COUNT; k++)
+			if (s_combo_keys[k] && !strcmp(key + 6, s_combo_keys[k]))
+				p->combo[k] = combo_ok(val) ? val : 0;
+	} else {
+		for (int a = 0; a < RSTV_ACT_COUNT; a++) {
+			const int v = key_val(val, (a == RSTV_ACT_B3 || a == RSTV_ACT_B4) ? RSTV_KEY_NONE : RSTV_KEY_COUNT - 1);
+			if (!strcmp(key, s_keymap_keys[a])) {
+				p->keymap[a] = v;
+				return 1;
+			}
+			if (!strcmp(key, s_keymap2_keys[a])) {
+				g_set.port[1].keymap[a] = v;
+				return 1;
+			}
+		}
+		return 0;
+	}
+	return 1;
 }
 // one overridable line (shared by global and game files). 1 if recognized
+// files before profiles per device (keyver < 3): 1P's controls go to every device
+static void ports_spread(void)
+{
+	if (s_keyver >= 3)
+		return;
+	for (int i = 1; i < RSTV_PROFILES; i++)
+		g_set.port[i] = g_set.port[0];
+}
 static int read_part(const char *key, int val)
 {
-	if (!strcmp(key, "show_fps")) g_set.fps = val != 0;
+	if (!strcmp(key, "keyver")) s_keyver = val;
+	else if (!strcmp(key, "show_fps")) g_set.fps = val != 0;
 	else if (!strcmp(key, "aspect")) g_set.aspect = clampi(val, 0, RSTV_ASPECT_COUNT - 1);
 	else if (!strcmp(key, "filter")) g_set.filter = clampi(val, 0, RSTV_FILTER_COUNT - 1);
 	else if (!strcmp(key, "scan_type")) g_set.scan_type = clampi(val, 0, RSTV_SCAN_COUNT - 1);
@@ -486,37 +558,31 @@ static int read_part(const char *key, int val)
 	else if (!strcmp(key, "border")) g_set.border = clampi(val, 0, RSTV_BORDER_COUNT - 1);
 	else if (!strcmp(key, "border_color")) g_set.border_color = clampi(val, 0, RSTV_BCOL_COUNT - 1);
 	else if (!strcmp(key, "rotate")) g_set.rotate = clampi(val, 0, RSTV_ROT_COUNT - 1);
-	else if (!strcmp(key, "stick")) g_set.stick = clampi(val, 0, RSTV_STICK_COUNT - 1);
-	else if (!strcmp(key, "turbo_key")) g_set.turbo_key = clampi(val, 0, RSTV_KEY_NONE);
-	else if (!strcmp(key, "turbo_btn")) g_set.turbo_btn = clampi(val, 1, RSTV_GAME_BUTTONS);
-	else if (!strcmp(key, "turbo_speed")) g_set.turbo_speed = clampi(val, 0, RSTV_TURBO_SPEED_COUNT - 1);
 	else if (!strcmp(key, "touch_keys")) g_set.touch_keys = val != 0;
 	else if (!strcmp(key, "touch_show")) g_set.touch_show = val != 0;
-	else if (!strncmp(key, "combo_", 6)) { // combo_<key>=<mask of two keys>
-		for (int k = 0; k < RSTV_COMBO_KEYS; k++)
-			if (!strcmp(key + 6, s_combo_keys[k]))
-				g_set.combo[k] = combo_ok(val) ? val : 0;
-	} else {
-		for (int a = 0; a < RSTV_ACT_COUNT; a++)
-			if (!strcmp(key, s_keymap_keys[a])) {
-				g_set.keymap[a] = clampi(val, 0, (a == RSTV_ACT_B3 || a == RSTV_ACT_B4) ? RSTV_KEY_NONE : RSTV_KEY_COUNT - 1);
-				return 1;
-			}
-		return 0;
-	}
+	else
+		return read_port(key, val);
 	return 1;
 }
 static void write_part(FILE *f, const game_part *g)
 {
+	fprintf(f, "keyver=3\n"); // (first: the keys below are read with it; 3: a profile per device)
 	fprintf(f, "show_fps=%d\naspect=%d\nfilter=%d\n", g->fps, g->aspect, g->filter);
 	fprintf(f, "scan_type=%d\nscan_strength=%d\n", g->scan_type, g->scan_strength);
 	fprintf(f, "border=%d\nborder_color=%d\nrotate=%d\n", g->border, g->border_color, g->rotate);
-	for (int a = 0; a < RSTV_ACT_COUNT; a++)
-		fprintf(f, "%s=%d\n", s_keymap_keys[a], g->keymap[a]);
-	fprintf(f, "stick=%d\nturbo_key=%d\nturbo_btn=%d\nturbo_speed=%d\n", g->stick, g->turbo_key, g->turbo_btn, g->turbo_speed);
+	for (int i = 0; i < RSTV_PROFILES; i++) {
+		const rstv_port *p = &g->port[i];
+		char pre[16];
+		snprintf(pre, sizeof(pre), "%s.", re_pad_profile_key(i));
+		for (int a = 0; a < RSTV_ACT_COUNT; a++)
+			fprintf(f, "%s%s=%d\n", pre, s_keymap_keys[a], p->keymap[a]);
+		fprintf(f, "%sstick=%d\n%sturbo_key=%d\n%sturbo_btn=%d\n%sturbo_speed=%d\n", pre, p->stick, pre, p->turbo_key, pre,
+			p->turbo_btn, pre, p->turbo_speed);
+		for (int k = 0; k < RSTV_KEY_COUNT; k++)
+			if (s_combo_keys[k])
+				fprintf(f, "%scombo_%s=%d\n", pre, s_combo_keys[k], p->combo[k]);
+	}
 	fprintf(f, "touch_keys=%d\ntouch_show=%d\n", g->touch_keys, g->touch_show);
-	for (int k = 0; k < RSTV_COMBO_KEYS; k++)
-		fprintf(f, "combo_%s=%d\n", s_combo_keys[k], g->combo[k]);
 }
 // one "key=value" line. 0 at end
 static int read_kv(FILE *f, char *key, int klen, char *val, int vlen)
@@ -550,18 +616,18 @@ static int load_old_settings(void)
 		if (!strcmp(k, "scale")) g_set.aspect = v == 1 ? RSTV_ASPECT_INT : v == 2 ? RSTV_ASPECT_FULL : RSTV_ASPECT_4_3;
 		else if (!strcmp(k, "filter")) g_set.filter = v ? RSTV_FILTER_SMOOTH : RSTV_FILTER_SHARP;
 		else if (!strcmp(k, "fps")) g_set.fps = v != 0;
-		else if (!strcmp(k, "stick2")) g_set.stick = clampi(v, 0, RSTV_STICK_COUNT - 1);
+		else if (!strcmp(k, "stick2")) g_set.port[0].stick = clampi(v, 0, RSTV_STICK_COUNT - 1);
 		else if (!strcmp(k, "confirm")) g_set.confirm = v != 0;
 		else if (!strcmp(k, "list_all")) g_set.list_filter = v ? RSTV_LIST_ALL : RSTV_LIST_PLAYABLE;
 		else if (!strcmp(k, "turbo_btn")) tbtn = v;
 		else if (!strcmp(k, "turbo_key")) tkey = v;
-		else if (!strcmp(k, "turbo_speed")) g_set.turbo_speed = clampi(v, 0, 2);
-		else if (k[0] == 'b' && k[1] >= '1' && k[1] <= '4' && !k[2] && v >= 0 && v < 6) g_set.keymap[k[1] - '1'] = v;
+		else if (!strcmp(k, "turbo_speed")) g_set.port[0].turbo_speed = clampi(v, 0, 2);
+		else if (k[0] == 'b' && k[1] >= '1' && k[1] <= '4' && !k[2] && v >= 0 && v < 6) g_set.port[0].keymap[k[1] - '1'] = v;
 	}
 	fclose(f);
 	if (tbtn > 0 && tbtn <= RSTV_GAME_BUTTONS && tkey >= 0 && tkey < 6) {
-		g_set.turbo_key = tkey;
-		g_set.turbo_btn = tbtn;
+		g_set.port[0].turbo_key = tkey;
+		g_set.port[0].turbo_btn = tbtn;
 	}
 	RSTV_LOG("settings: migrated %s", OLD_SETTINGS_PATH);
 	return 1;
@@ -621,6 +687,7 @@ void rstv_settings_load(void)
 	rstv_settings_defaults();
 	fav_load();
 	FILE *f = fopen(SETTINGS_PATH, "r");
+	s_keyver = 0;
 	if (f) {
 		char key[32], sval[32];
 		while (read_kv(f, key, sizeof(key), sval, sizeof(sval))) {
@@ -630,15 +697,22 @@ void rstv_settings_load(void)
 			else if (!strcmp(key, "menu_confirm")) g_set.confirm = clampi(val, 0, RSTV_CONFIRM_COUNT - 1);
 			else if (!strcmp(key, "list_filter")) g_set.list_filter = clampi(val, 0, RSTV_LIST_FILTER_COUNT - 1);
 			else if (!strcmp(key, "theme")) g_set.theme = clampi(val, 0, RSTV_THEME_COUNT - 1);
+			else if (!strcmp(key, "pad_p1")) g_set.pad_src[0] = clampi(val, 0, RE_PAD_SRC_COUNT - 1);
+			else if (!strcmp(key, "pad_p2")) g_set.pad_src[1] = clampi(val, 0, RE_PAD_SRC_COUNT - 1);
+			else if (!strcmp(key, "input_engine")) g_set.input_engine = clampi(val, 0, RE_PAD_ENGINE_COUNT - 1);
 		}
 		fclose(f);
 	} else
 		load_old_settings();
+	ports_spread();
 	part_get(&s_global);
+	re_pad_set_source(0, g_set.pad_src[0]);
+	re_pad_set_source(1, g_set.pad_src[1]);
+	g_set.input_engine = re_pad_engine_fit(g_set.input_engine); // (as the Vita is: VitaControl when a list loads it)
 	RSTV_LOG("settings: fps %d aspect %d filter %d scan %d/%d border %d/%d keys %d %d %d %d coin %d start %d turbo %d/%d",
 		g_set.fps, g_set.aspect, g_set.filter, g_set.scan_type, g_set.scan_strength, g_set.border, g_set.border_color,
-		g_set.keymap[0], g_set.keymap[1], g_set.keymap[2], g_set.keymap[3], g_set.keymap[4], g_set.keymap[5], g_set.turbo_key,
-		g_set.turbo_btn);
+		g_set.port[0].keymap[0], g_set.port[0].keymap[1], g_set.port[0].keymap[2], g_set.port[0].keymap[3],
+		g_set.port[0].keymap[4], g_set.port[0].keymap[5], g_set.port[0].turbo_key, g_set.port[0].turbo_btn);
 }
 
 void rstv_settings_load_game(const char *set)
@@ -652,12 +726,14 @@ void rstv_settings_load_game(const char *set)
 	char p[96];
 	snprintf(p, sizeof(p), DATA_DIR "/%s_game.cfg", s_game);
 	FILE *f = fopen(p, "r");
+	s_keyver = 0;
 	if (!f)
 		return;
 	char key[32], sval[32];
 	while (read_kv(f, key, sizeof(key), sval, sizeof(sval)))
 		read_part(key, atoi(sval));
 	fclose(f);
+	ports_spread();
 	s_game_on = 1;
 	RSTV_LOG("settings: game settings %s", p);
 }
@@ -674,6 +750,7 @@ void rstv_settings_save(void)
 		part_get(&s_global);
 	write_part(f, &s_global);
 	fprintf(f, "menu_confirm=%d\nlist_filter=%d\ntheme=%d\n", g_set.confirm, g_set.list_filter, g_set.theme);
+	fprintf(f, "pad_p1=%d\npad_p2=%d\ninput_engine=%d\n", g_set.pad_src[0], g_set.pad_src[1], g_set.input_engine);
 	fclose(f);
 	if (s_game[0] && s_game_on)
 		rstv_settings_save_game();
@@ -729,9 +806,9 @@ int rstv_settings_delete_game(void)
 static char s_set[32], s_title[96];
 static UiCanvas *s_cv, *s_osd_cv, *s_fps_cv;
 enum { PAGE_MAIN, PAGE_STATES, PAGE_DISPLAY, PAGE_CONTROLS, PAGE_ABOUT, PAGE_CHEATS, PAGE_TURBO, PAGE_TOUCH, PAGE_TEDIT,
-	PAGE_COMBO };
+	PAGE_COMBO, PAGE_PORT };
 static int s_page; // (defined with the other menu state below)
-#define CTRL_PAGE (s_page == PAGE_CONTROLS || s_page == PAGE_TURBO || s_page == PAGE_TOUCH) // (sub pages of Controls)
+#define CTRL_PAGE (s_page == PAGE_CONTROLS || s_page == PAGE_TURBO || s_page == PAGE_TOUCH || s_page == PAGE_PORT) // (+ sub pages)
 // rows in groups (a gap before M_STATES, M_DISPLAY and M_ABOUT): game, states / cheats, settings, about / leave
 // M_REFRESH (read the ROM folder again) only in the game list options (owner: not in the in-game menu)
 enum { M_RESUME, M_RESET, M_TEST, M_STATES, M_CHEATS, M_DISPLAY, M_CONTROLS, M_GAME_SAVE, M_GAME_DEL, M_ABOUT, M_SELECT_GAME, M_EXIT, M_BACK,
@@ -770,23 +847,27 @@ static int main_kind(int row)
 }
 enum { S_SLOT, S_SAVE, S_LOAD, S_BACK, S_COUNT };
 enum { D_FPS, D_ASPECT, D_ROTATE, D_FILTER, D_SCAN, D_SCAN_STR, D_BORDER, D_BORDER_COL, D_THEME, D_BACK, D_COUNT };
-// Controls rows: game buttons (as many as the game uses, 4 in list options), coin, start, Turbo (sub page, owner), analog stick,
-// Touch controls (sub page, ADR-214), confirm button, defaults, back. Turbo page: turbo key, turbo button, turbo speed,
-// back. Touch page: on, show, edit, clear, back
+// ADR-216 Controls (RetroArch style): Port 1 Controls, Port 2 Controls, Touch controls (ADR-214), confirm button,
+// defaults (every port), back. Port N Controls (PAGE_PORT, s_kp = the port): device, analog stick, Set all controls, the
+// game buttons (as many as the game uses, 4 in list options), coin, start, Turbo, Combo keys, reset this port, back.
+// A key row: left / right step through the keys, confirm waits for the button to press (key binding).
+// Turbo page: turbo key, turbo button, turbo speed, back (the port's). Touch page: on, show, edit, clear, back
 enum { CK_ACT, CK_TURBO_KEY, CK_TURBO_BTN, CK_TURBO_SPEED, CK_TURBO, CK_STICK, CK_CONFIRM, CK_DEFAULTS, CK_BACK, CK_TOUCH,
-	CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_COMBO };
-static const int s_ctrl_tail[] = { CK_TURBO, CK_STICK, CK_TOUCH, CK_CONFIRM, CK_COMBO, CK_DEFAULTS, CK_BACK }; // (after coin, start)
+	CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_COMBO, CK_PORT1, CK_PORT2, CK_DEVICE, CK_BIND_ALL, CK_RESET_PORT, CK_ENGINE };
+static const int s_ctrl_list[] = { CK_PORT1, CK_PORT2, CK_ENGINE, CK_TOUCH, CK_CONFIRM, CK_DEFAULTS, CK_BACK };
+static const int s_port_head[] = { CK_DEVICE, CK_STICK, CK_BIND_ALL };            // (before the buttons)
+static const int s_port_tail[] = { CK_TURBO, CK_COMBO, CK_RESET_PORT, CK_BACK }; // (after coin, start)
 // combo keys in screen order (Square, Triangle, Cross, Circle, L, R) and the choices for one key: None, then every pair
-static const int s_combo_order[RSTV_COMBO_KEYS] = { RSTV_KEY_SQUARE, RSTV_KEY_TRIANGLE, RSTV_KEY_CROSS, RSTV_KEY_CIRCLE,
-	RSTV_KEY_L, RSTV_KEY_R };
-#define COMBO_CHOICES (1 + RSTV_COMBO_KEYS * (RSTV_COMBO_KEYS - 1) / 2)
-#define COMBO_ROWS (RSTV_COMBO_KEYS + 1)
+static const int s_combo_order[RSTV_COMBO_SRC] = { RSTV_KEY_SQUARE, RSTV_KEY_TRIANGLE, RSTV_KEY_CROSS, RSTV_KEY_CIRCLE,
+	RSTV_KEY_L, RSTV_KEY_R, RSTV_KEY_L2, RSTV_KEY_R2, RSTV_KEY_L3, RSTV_KEY_R3 };
+#define COMBO_CHOICES (1 + RSTV_COMBO_SRC * (RSTV_COMBO_SRC - 1) / 2)
+#define COMBO_ROWS (RSTV_COMBO_SRC + 1)
 static int combo_choice(int i) // choice index -> key mask
 {
 	if (i <= 0)
 		return 0;
-	for (int a = 0, n = 1; a < RSTV_COMBO_KEYS; a++)
-		for (int b = a + 1; b < RSTV_COMBO_KEYS; b++, n++)
+	for (int a = 0, n = 1; a < RSTV_COMBO_SRC; a++)
+		for (int b = a + 1; b < RSTV_COMBO_SRC; b++, n++)
 			if (n == i)
 				return (1 << s_combo_order[a]) | (1 << s_combo_order[b]);
 	return 0;
@@ -798,10 +879,40 @@ static int combo_index(int mask) // key mask -> choice index (0 if not a pair)
 			return i;
 	return 0;
 }
-#define CTRL_TAIL_N ((int)(sizeof(s_ctrl_tail) / sizeof(s_ctrl_tail[0])))
+#define NOF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 static int s_nbuttons = 4;
 static int ctrl_buttons(void) { return s_list_mode ? RSTV_GAME_BUTTONS : s_nbuttons; }
-static int ctrl_rows(void) { return s_page == PAGE_TURBO ? 4 : s_page == PAGE_TOUCH ? 5 : ctrl_buttons() + 2 + CTRL_TAIL_N; }
+// the port whose page is open (0 = Port 1 = 1P, 1 = Port 2 = 2P): its settings
+static int s_kp;
+// the controls the page shows: the profile of the device the player reads now (they belong to the device)
+static rstv_port *prt(void) { return &g_set.port[re_pad_player_profile(s_kp)]; }
+// key binding (button rows, turbo key): confirm on the row waits for the button to use. Left / right step through the
+// keys as before (no wait)
+static int s_bind;          // waiting for a button
+static int s_bind_all;      // Set all controls: on to the next key row after each button, until Start
+static int s_bind_ready;    // every button was released since the wait began (not the confirm press itself)
+static uint64_t s_bind_t;   // when the wait began: 5 s without a button cancels
+#define BIND_US 5000000
+// Controls rows now: Port 2 only while there is a second device to play with (re_pad_devices). k may be NULL
+static int ctrl_list(int *k)
+{
+	int n = 0;
+	for (int j = 0; j < (int)(sizeof(s_ctrl_list) / sizeof(s_ctrl_list[0])); j++)
+		if (s_ctrl_list[j] != CK_PORT2 || re_pad_player_shown(1)) { // (hidden while 2P's controller is away)
+			if (k)
+				k[n] = s_ctrl_list[j];
+			n++;
+		}
+	return n;
+}
+// the player reads no device (Device None, or its controller away with nothing free): its page has only Device and Back
+// (the controls belong to a device: with none there is nothing to set)
+static int port_none(void) { return re_pad_port(s_kp) < 0; }
+static int ctrl_rows(void)
+{
+	return s_page == PAGE_TURBO ? 4 : s_page == PAGE_TOUCH ? 5 : s_page == PAGE_PORT ? (port_none() ? 2 :
+		NOF(s_port_head) + ctrl_buttons() + 2 + NOF(s_port_tail)) : ctrl_list(NULL);
+}
 static int ctrl_kind(int i, int *act)
 {
 	const int b = ctrl_buttons();
@@ -812,6 +923,16 @@ static int ctrl_kind(int i, int *act)
 		static const int k[5] = { CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_BACK };
 		return i >= 0 && i < 5 ? k[i] : CK_BACK;
 	}
+	if (s_page != PAGE_PORT) {
+		int k[NOF(s_ctrl_list)];
+		const int n = ctrl_list(k);
+		return i >= 0 && i < n ? k[i] : CK_BACK;
+	}
+	if (port_none())
+		return i == 0 ? CK_DEVICE : CK_BACK;
+	if (i < NOF(s_port_head))
+		return s_port_head[i];
+	i -= NOF(s_port_head);
 	if (i < b) {
 		*act = RSTV_ACT_B1 + i;
 		return CK_ACT;
@@ -820,16 +941,47 @@ static int ctrl_kind(int i, int *act)
 		*act = i == b ? RSTV_ACT_COIN : RSTV_ACT_START;
 		return CK_ACT;
 	}
-	return i - b - 2 < CTRL_TAIL_N ? s_ctrl_tail[i - b - 2] : CK_BACK;
+	return i - b - 2 < NOF(s_port_tail) ? s_port_tail[i - b - 2] : CK_BACK;
 }
-// row of a kind on the Controls page (coming back from a sub page)
+// row of a kind on the Controls page (coming back from a Port or Touch page)
 static int ctrl_row_of(int kind)
 {
-	for (int j = 0; j < CTRL_TAIL_N; j++)
-		if (s_ctrl_tail[j] == kind)
-			return ctrl_buttons() + 2 + j;
+	int k[NOF(s_ctrl_list)];
+	const int n = ctrl_list(k);
+	for (int j = 0; j < n; j++)
+		if (k[j] == kind)
+			return j;
 	return 0;
 }
+// row of a kind after the buttons on the Port page (coming back from Turbo or Combo keys)
+static int port_row_of(int kind)
+{
+	for (int j = 0; j < NOF(s_port_tail); j++)
+		if (s_port_tail[j] == kind)
+			return NOF(s_port_head) + ctrl_buttons() + 2 + j;
+	return 0;
+}
+// row of a key action on the Port page
+static int port_row_of_act(int act)
+{
+	const int b = ctrl_buttons();
+	return NOF(s_port_head) + (act == RSTV_ACT_COIN ? b : act == RSTV_ACT_START ? b + 1 : act - RSTV_ACT_B1);
+}
+// key of a row that assigns one (button rows, turbo key; 0 = not such a row), set it, its name
+static int row_key(int kind, int act, int *key)
+{
+	if (kind == CK_ACT) *key = prt()->keymap[act];
+	else if (kind == CK_TURBO_KEY) *key = prt()->turbo_key;
+	else return 0;
+	return 1;
+}
+static void row_set_key(int kind, int act, int key)
+{
+	if (kind == CK_ACT) prt()->keymap[act] = key;
+	else if (kind == CK_TURBO_KEY) prt()->turbo_key = key;
+}
+static const char *act_name(int act);
+static const char *row_key_name(int kind, int act) { return kind == CK_ACT ? act_name(act) : "Turbo key"; }
 static const char *act_name(int act)
 {
 	static const char *const n[RSTV_ACT_COUNT] = { "Button 1", "Button 2", "Button 3", "Button 4", "Coin", "Start" };
@@ -838,7 +990,120 @@ static const char *act_name(int act)
 int rstv_menu_buttons(void) { return s_nbuttons; }
 static int s_page, s_sel, s_main_sel, s_reset_armed, s_state_slot, s_about_scroll, s_dirty = 1;
 static int s_drawn_h; // panel height currently drawn on the menu canvas (0 = other content)
+// the footer line on the Controls pages: what the selected row does (NULL: the page's own footer)
+static const char *row_help(int kind)
+{
+	switch (kind) {
+	case CK_PORT1: return "1P Controller: its device, buttons, analog stick, turbo and combo keys";
+	case CK_PORT2: return "2P Controller: its device, buttons, analog stick, turbo and combo keys";
+	case CK_ENGINE: return "Native: the Vita's own controls. RePad: Bluetooth controllers through the RePad plugin that comes "
+		"with the app (a controller as 2P). VitaControl: the VitaControl plugin installed on the Vita (1P only)";
+	case CK_TOUCH: return "On-screen touch buttons: on or off, shown or not, their layout";
+	case CK_CONFIRM: return "The button that confirms in the menus (the other one goes back)";
+	case CK_DEFAULTS: return "Every player's buttons, analog stick, turbo and combo keys back to the defaults";
+	case CK_DEVICE: return "The device this player reads. Auto: the Vita for 1P, then the controllers in order";
+	case CK_STICK: return "The analog stick that works as the d-pad too";
+	case CK_BIND_ALL: return "Press each button in turn, from Button 1 to Start";
+	case CK_ACT: return "Confirm, then press the button to use. Left / Right: step through the buttons. Square: None (where it can be)";
+	case CK_TURBO: return "A key that repeats a game button while it is held";
+	case CK_COMBO: return "Keys that press two keys together";
+	case CK_RESET_PORT: return "This player's buttons, analog stick, turbo and combo keys back to the defaults";
+	case CK_TURBO_KEY: return "The key that repeats the turbo button while held (None: off). Confirm, then press the key. Square: None";
+	case CK_TURBO_BTN: return "The game button the turbo key repeats";
+	case CK_TURBO_SPEED: return "How fast the turbo button repeats";
+	case CK_T_ON: return "The touch buttons press their keys";
+	case CK_T_SHOW: return "The touch buttons are drawn over the game";
+	case CK_T_EDIT: return "Add, move and resize touch buttons and give them keys";
+	case CK_T_CLEAR: return "Remove every touch button (press twice)";
+	default: return NULL;
+	}
+}
+// the other pages' rows
+static const char *page_row_help(void)
+{
+	switch (s_page) {
+	case PAGE_MAIN:
+		switch (main_kind(s_sel)) {
+		case M_RESUME: return "Back to the game";
+		case M_RESET: return "Start the game again from power-on (press twice)";
+		case M_TEST: return "The board's TEST switch: the BIOS test menu (in it: L = SERVICE moves, R = TEST enters)";
+		case M_STATES: return "Save the game at this point or load it again (10 slots)";
+		case M_CHEATS: return "This game's cheats (ux0:data/restv/cheats); they apply from the next game start";
+		case M_DISPLAY: return "Screen size, rotation, filter, scanlines, border, FPS and menu colors";
+		case M_CONTROLS: return "Controllers, input engine, buttons, analog stick, turbo, combo keys and touch buttons";
+		case M_GAME_SAVE: return "Keep the display and control settings as they are now for this game only";
+		case M_GAME_DEL: return "This game uses the global settings again";
+		case M_ABOUT: return "Version, credits and licenses";
+		case M_SELECT_GAME: return "Back to the game list";
+		case M_EXIT: return "Close the app";
+		case M_BACK: return "Close the options";
+		case M_REFRESH: return "Read the ROM folder again (ROMs copied while the app runs)";
+		case M_UPDATE: return "Look for a newer version of the app on GitHub and install it";
+		}
+		return NULL;
+	case PAGE_DISPLAY:
+		switch (s_sel) {
+		case D_FPS: return "Frames per second in a corner of the game picture";
+		case D_ASPECT: return "4:3, the full screen, or the largest whole-number scale";
+		case D_ROTATE: return "Auto: vertical games upright. Vertical L / R: hold the Vita turned, the controls turn with it";
+		case D_FILTER: return "Smooth or sharp pixels";
+		case D_SCAN: return "Lines over the picture like an arcade monitor (CRT) or a pixel grid";
+		case D_SCAN_STR: return "How dark the scanlines are";
+		case D_BORDER: return "Beside the game picture (4:3, Integer): black, the game's artwork, or a color";
+		case D_BORDER_COL: return "The border color (Border: Color)";
+		case D_THEME: return "The colors of the menus";
+		}
+		return NULL;
+	case PAGE_STATES:
+		switch (s_sel) {
+		case S_SLOT: return "The slot to save to or load from (0-9)";
+		case S_SAVE: return "Save the game in this slot (in the game: SELECT+L)";
+		case S_LOAD: return "Load this slot (in the game: SELECT+R)";
+		}
+		return NULL;
+	case PAGE_CHEATS:
+		return s_sel < rstv_cheats_count() ? "This cheat's value; it applies from the next game start (Reset game to use it now)"
+			: NULL;
+	case PAGE_COMBO:
+		return s_sel < RSTV_COMBO_SRC ? "This key presses the two keys picked here together (None: it is itself). Square: None" : NULL;
+	default:
+		return NULL;
+	}
+}
+static int s_help_scroll;   // the footer help is longer than the line: it scrolls (the menu is drawn every frame)
+static int s_help_key = -1; // page and row the help belongs to (scrolling starts over on another row)
+static uint64_t s_help_t0;
+// VitaControl keeps RePad out: the window that offers to switch it off and restart the Vita
+// a restart the chosen input engine needs, asked when Back leaves Controls (0 = none):
+// 1 RePad chosen, VitaControl keeps it out: switch VitaControl off and restart
+// 2 VitaControl chosen, its plugin list line is commented out: switch it on and restart
+// 3 VitaControl chosen and listed, but not running since the last restart: restart
+static int s_vc_ask;
+static int engine_restart_ask(void)
+{
+	if (g_set.input_engine == RE_PAD_ENGINE_REPAD)
+		return !re_pad_plugin() && re_pad_vitacontrol_listed() ? 1 : 0;
+	if (g_set.input_engine == RE_PAD_ENGINE_VITACONTROL) {
+		const int st = re_pad_vitacontrol_state();
+		if (st == RE_PAD_VC_OFF)
+			return 2;
+		if (st == RE_PAD_VC_ON && !re_pad_vitacontrol_running())
+			return 3;
+	}
+	return 0;
+}
+static int s_pad_redraw; // a controller came or went (the game list options: draw the panel again)
 static uint32_t s_prev_buttons;
+static uint32_t s_bind_prev; // the bound player's buttons last frame
+static void bind_begin(int all)
+{
+	s_bind = 1;
+	s_bind_all = all;
+	s_bind_ready = 0;
+	s_bind_t = rstv_time_us();
+	s_bind_prev = ~0u; // (pressed only after a release)
+	s_dirty = 1;
+}
 
 // About: vertically scrolling text (empty string = blank line, starting with '#' = heading line)
 static const char *const s_about[] = {
@@ -911,8 +1176,9 @@ static void ensure_canvases(void)
 void rstv_menu_init(const char *set, const char *title, int buttons)
 {
 	s_nbuttons = buttons < 2 ? 2 : buttons > RSTV_GAME_BUTTONS ? RSTV_GAME_BUTTONS : buttons;
-	if (g_set.turbo_btn > s_nbuttons)
-		g_set.turbo_btn = 1;
+	for (int i = 0; i < RSTV_PROFILES; i++)
+		if (g_set.port[i].turbo_btn > s_nbuttons)
+			g_set.port[i].turbo_btn = 1;
 	snprintf(s_set, sizeof(s_set), "%s", set);
 	snprintf(s_title, sizeof(s_title), "%s", title ? title : set);
 	rstv_cheats_init(set);
@@ -1012,6 +1278,8 @@ int rstv_menu_should_open(uint32_t buttons)
 		}
 		s_keep_place = 0;
 		s_pop = 0;
+		s_bind = 0;
+		s_vc_ask = 0;
 		s_reset_armed = 0;
 		s_dirty = 1;
 	}
@@ -1029,7 +1297,8 @@ static int page_items(void)
 	case PAGE_DISPLAY: return D_COUNT;
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
-	case PAGE_TOUCH: return ctrl_rows();
+	case PAGE_TOUCH:
+	case PAGE_PORT: return ctrl_rows();
 	case PAGE_TEDIT: return 1;
 	case PAGE_COMBO: return COMBO_ROWS;
 	case PAGE_STATES: return S_COUNT;
@@ -1049,8 +1318,8 @@ static void go_page(int page)
 		s_sel = 0;
 	s_reset_armed = 0;
 }
-// back one level: Turbo and Touch return to their row in Controls, the touch editor to the Touch page, other pages to
-// the main page
+// back one level: Turbo and Combo keys return to their row in the Port page; a Port page and Touch to their row in
+// Controls; the touch editor to the Touch page; other pages to the main page
 static void page_back(void)
 {
 	if (s_page == PAGE_TEDIT) {
@@ -1058,8 +1327,15 @@ static void page_back(void)
 		s_sel = 2; // (Edit touch layout)
 		return;
 	}
-	if (s_page == PAGE_TURBO || s_page == PAGE_TOUCH || s_page == PAGE_COMBO) {
-		const int kind = s_page == PAGE_TURBO ? CK_TURBO : s_page == PAGE_TOUCH ? CK_TOUCH : CK_COMBO;
+	if (s_page == PAGE_TURBO || s_page == PAGE_COMBO) {
+		const int kind = s_page == PAGE_TURBO ? CK_TURBO : CK_COMBO;
+		s_page = PAGE_PORT;
+		s_sel = port_row_of(kind);
+		s_reset_armed = 0;
+		return;
+	}
+	if (s_page == PAGE_TOUCH || s_page == PAGE_PORT) {
+		const int kind = s_page == PAGE_TOUCH ? CK_TOUCH : s_kp ? CK_PORT2 : CK_PORT1;
 		s_page = PAGE_CONTROLS;
 		s_sel = ctrl_row_of(kind);
 		s_reset_armed = 0;
@@ -1104,10 +1380,24 @@ static const char *const stick[] = { "Off", "Left", "Right", "Both" };
 static const char *const turbo_speed[] = { "Fast (15/s)", "Medium (10/s)", "Slow (7.5/s)" };
 
 static void change(int dir);
+static void engine_pick(int engine);
+static int engine_list(int *e);
 // owner: an item with several values opens a window listing them all on the confirm button. The values of the selected
 // item: names, count (0 = not such an item), current index
 #define MAX_CHOICES 16
-static int s_choice_keys; // the last item_choices() listed buttons (drawn as button icons); 2: key pairs (combo keys)
+static int s_choice_keys; // the last item_choices() listed buttons (drawn as button icons); 2: a combo's keys
+// the combo page's window: -1 = its first step (None or the first key), else the first key picked (the second step)
+static int s_combo_first = -1, s_pop_keep;
+// that window's key at row i: first step None (-1) then the ten keys, second step the keys but the first
+static int combo_pick(int i)
+{
+	if (s_combo_first < 0)
+		return i <= 0 ? -1 : s_combo_order[i - 1];
+	for (int k = 0, n = 0; k < RSTV_COMBO_SRC; k++)
+		if (s_combo_order[k] != s_combo_first && n++ == i)
+			return s_combo_order[k];
+	return -1;
+}
 static int item_choices(const char **out, int *cur, const char **title)
 {
 	int n = 0;
@@ -1141,35 +1431,76 @@ static int item_choices(const char **out, int *cur, const char **title)
 			n = RSTV_KEY_COUNT + with_none;
 			for (int i = 0; i < n; i++)
 				out[i] = rstv_key_name(i);
-			*cur = k == CK_ACT ? g_set.keymap[act] : g_set.turbo_key;
+			*cur = k == CK_ACT ? prt()->keymap[act] : prt()->turbo_key;
 			s_choice_keys = 1;
 			*title = k == CK_ACT ? act_name(act) : "Turbo key";
+		} else if (k == CK_ENGINE) {
+			int e[RE_PAD_ENGINE_COUNT];
+			n = engine_list(e);
+			for (int i = 0; i < n; i++) {
+				out[i] = re_pad_engine_name(e[i]);
+				if (e[i] == g_set.input_engine)
+					*cur = i;
+			}
+			*title = "Input engine";
+		} else if (k == CK_DEVICE) {
+			// the sources there are now (connected controllers only), with their devices
+			int src[RE_PAD_SRC_COUNT];
+			n = re_pad_sources(s_kp, src, cur);
+			for (int i = 0; i < n; i++)
+				out[i] = re_pad_source_text(src[i], s_devtext[i], sizeof(s_devtext[i]));
+			*title = "Device";
 		} else if (k == CK_TURBO_BTN) {
 			n = ctrl_buttons();
 			for (int i = 0; i < n && i < 8; i++) {
 				snprintf(btn[i], sizeof(btn[i]), "Button %d", i + 1);
 				out[i] = btn[i];
 			}
-			*cur = g_set.turbo_btn - 1;
+			*cur = prt()->turbo_btn - 1;
 			*title = "Turbo button";
 		} else if (k == CK_TURBO_SPEED) {
 			n = RSTV_TURBO_SPEED_COUNT;
 			for (int i = 0; i < n; i++)
 				out[i] = turbo_speed[i];
-			*cur = g_set.turbo_speed;
+			*cur = prt()->turbo_speed;
 			*title = "Turbo speed";
 		} else if (k == CK_STICK) {
 			n = RSTV_STICK_COUNT;
 			for (int i = 0; i < n; i++)
 				out[i] = stick[i];
-			*cur = g_set.stick;
+			*cur = prt()->stick;
 			*title = "Analog stick";
 		}
-	} else if (s_page == PAGE_COMBO && s_sel < RSTV_COMBO_KEYS) {
-		n = COMBO_CHOICES;
+	} else if (s_page == PAGE_STATES && s_sel == S_SLOT) {
+		static char slot[STATE_SLOTS][24];
+		n = STATE_SLOTS;
+		for (int i = 0; i < n; i++) {
+			snprintf(slot[i], sizeof(slot[i]), "Slot %d%s", i, slot_used(i) ? "" : "  (empty)");
+			out[i] = slot[i];
+		}
+		*cur = s_state_slot;
+		*title = "Save slot";
+	} else if (s_page == PAGE_CHEATS && s_sel < rstv_cheats_count()) {
+		n = rstv_cheats_values(s_sel);
+		if (n > MAX_CHOICES)
+			n = MAX_CHOICES;
 		for (int i = 0; i < n; i++)
-			out[i] = "";
-		*cur = combo_index(g_set.combo[s_combo_order[s_sel]]);
+			out[i] = rstv_cheats_label(s_sel, i);
+		*cur = rstv_cheats_current(s_sel);
+		*title = rstv_cheats_name(s_sel);
+	} else if (s_page == PAGE_COMBO && s_sel < RSTV_COMBO_SRC) {
+		// two steps (the pairs are too many for one list): None or the first key, then the second key
+		const int v = prt()->combo[s_combo_order[s_sel]];
+		n = s_combo_first < 0 ? 1 + RSTV_COMBO_SRC : RSTV_COMBO_SRC - 1;
+		*cur = 0;
+		for (int i = 0, found = 0; i < n; i++) {
+			const int key = combo_pick(i);
+			out[i] = key < 0 ? "None" : rstv_key_name(key);
+			if (key >= 0 && (v & (1 << key)) && !found && (s_combo_first < 0 || (v & (1 << s_combo_first)))) {
+				*cur = i;
+				found = 1;
+			}
+		}
 		s_choice_keys = 2;
 		*title = "Combo for";
 	}
@@ -1179,10 +1510,53 @@ static void set_choice(int idx)
 {
 	const char *names[MAX_CHOICES], *title;
 	int cur, n = item_choices(names, &cur, &title);
+	int eact;
+	if (s_page == PAGE_COMBO && s_sel < RSTV_COMBO_SRC) { // the combo window's two steps
+		const int key = combo_pick(idx), src = s_combo_order[s_sel];
+		if (s_combo_first < 0 && key >= 0) {
+			s_combo_first = key; // on to the second key: the window stays
+			s_pop_keep = 1;
+			return;
+		}
+		prt()->combo[src] = key < 0 || s_combo_first < 0 ? 0 : (1 << s_combo_first) | (1 << key);
+		s_combo_first = -1;
+		return;
+	}
+	if (CTRL_PAGE && ctrl_kind(s_sel, &eact) == CK_DEVICE) { // the source picked, set even when it is the one shown
+		g_set.pad_src[s_kp] = re_pad_pick_source(s_kp, idx);
+		return;
+	}
+	if (CTRL_PAGE && ctrl_kind(s_sel, &eact) == CK_ENGINE) {
+		int e[RE_PAD_ENGINE_COUNT];
+		const int ne = engine_list(e);
+		if (idx >= 0 && idx < ne && e[idx] != g_set.input_engine)
+			engine_pick(e[idx]);
+		return;
+	}
 	for (int guard = 0; n && cur != idx && guard < MAX_CHOICES + 2; guard++) {
 		change(+1); // the same steps as the right button (wraps, applies)
 		n = item_choices(names, &cur, &title);
 	}
+}
+
+// the input engine picked (left / right or its choice window): at once, either way. VitaControl keeping RePad out is
+// asked about when Back leaves Controls (switch it off and restart, or back to Native). Saved when the menu closes
+static void engine_pick(int engine)
+{
+	g_set.input_engine = engine;
+	re_pad_engine_set(engine);
+	if (engine == RE_PAD_ENGINE_REPAD && !re_pad_plugin() && !re_pad_vitacontrol_listed())
+		rstv_osd_show("RePad could not start: another controller plugin is running");
+}
+// the engines offered: Native, RePad, VitaControl when a plugin list names it
+static int engine_list(int *e)
+{
+	int n = 0;
+	e[n++] = RE_PAD_ENGINE_NATIVE;
+	e[n++] = RE_PAD_ENGINE_REPAD;
+	if (re_pad_vitacontrol_state() != RE_PAD_VC_NONE)
+		e[n++] = RE_PAD_ENGINE_VITACONTROL;
+	return n;
 }
 
 static void change(int dir)
@@ -1204,20 +1578,27 @@ static void change(int dir)
 		break;
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
-	case PAGE_TOUCH: {
+	case PAGE_TOUCH:
+	case PAGE_PORT: {
 		int act;
 		const int k = ctrl_kind(s_sel, &act);
 		if (k == CK_ACT) // buttons 3 and 4 can also be None
-			g_set.keymap[act] = wrap(g_set.keymap[act] + dir,
+			prt()->keymap[act] = wrap(prt()->keymap[act] + dir,
 				(act == RSTV_ACT_B3 || act == RSTV_ACT_B4) ? RSTV_KEY_COUNT + 1 : RSTV_KEY_COUNT);
+		else if (k == CK_ENGINE)
+			engine_pick(re_pad_engine_step(g_set.input_engine, dir)); // (VitaControl only when a list names it)
+		else if (k == CK_DEVICE) // (through the sources there are now)
+			g_set.pad_src[s_kp] = re_pad_step_source(s_kp, dir);
+		else if (k == CK_PORT1 || k == CK_PORT2) // (the player's device, as its Device row)
+			g_set.pad_src[k == CK_PORT2] = re_pad_step_source(k == CK_PORT2, dir);
 		else if (k == CK_TURBO_KEY)
-			g_set.turbo_key = wrap(g_set.turbo_key + dir, RSTV_KEY_COUNT + 1); // + None (off)
+			prt()->turbo_key = wrap(prt()->turbo_key + dir, RSTV_KEY_COUNT + 1); // + None (off)
 		else if (k == CK_TURBO_BTN) // 1..number of game buttons
-			g_set.turbo_btn = wrap(g_set.turbo_btn - 1 + dir, ctrl_buttons()) + 1;
+			prt()->turbo_btn = wrap(prt()->turbo_btn - 1 + dir, ctrl_buttons()) + 1;
 		else if (k == CK_TURBO_SPEED)
-			g_set.turbo_speed = wrap(g_set.turbo_speed + dir, RSTV_TURBO_SPEED_COUNT);
+			prt()->turbo_speed = wrap(prt()->turbo_speed + dir, RSTV_TURBO_SPEED_COUNT);
 		else if (k == CK_STICK)
-			g_set.stick = wrap(g_set.stick + dir, RSTV_STICK_COUNT);
+			prt()->stick = wrap(prt()->stick + dir, RSTV_STICK_COUNT);
 		else if (k == CK_CONFIRM)
 			g_set.confirm = wrap(g_set.confirm + dir, RSTV_CONFIRM_COUNT);
 		else if (k == CK_T_ON)
@@ -1231,8 +1612,8 @@ static void change(int dir)
 			s_state_slot = wrap(s_state_slot + dir, STATE_SLOTS);
 		break;
 	case PAGE_COMBO:
-		if (s_sel < RSTV_COMBO_KEYS) {
-			int *v = &g_set.combo[s_combo_order[s_sel]];
+		if (s_sel < RSTV_COMBO_SRC) {
+			int *v = &prt()->combo[s_combo_order[s_sel]];
 			*v = combo_choice(wrap(combo_index(*v) + dir, COMBO_CHOICES));
 		}
 		break;
@@ -1249,16 +1630,24 @@ static void change(int dir)
 #define TE_MIN 42    // smallest button side (sizes go in TE_STEP steps)
 #define TE_STEP 6
 #define TE_GRAB 22   // an edge or corner is grabbed this far from it, inside or outside the button
-#define TE_POP_N (RSTV_TKEY_COUNT + 2) // the keys, Combo >, then Delete
+#define TE_POP_N (RSTV_TKEY_COUNT + 3) // the keys, Combo >, Duplicate, then Delete
 #define TE_ROW_COMBO RSTV_TKEY_COUNT
-#define TE_ROW_DEL (RSTV_TKEY_COUNT + 1)
-#define TE_CPOP_N (COMBO_CHOICES - 1) // the key pairs (owner: a touch button can press two keys, e.g. L+R)
+#define TE_ROW_DUP (RSTV_TKEY_COUNT + 1)
+#define TE_ROW_DEL (RSTV_TKEY_COUNT + 2)
+#define TE_CPOP_N (te_cpop == 2 ? RSTV_COMBO_SRC - 1 : RSTV_COMBO_SRC) // a pair: its first key, then its second (e.g. L, R)
 #define TE_CPOP_RH 26
-#define TE_POP_RH 32
+#define TE_POP_RH 30 // (with Duplicate the window still fits the screen)
 enum { TE_IDLE, TE_NEW, TE_MOVE, TE_SIZE };
 enum { TE_L = 1, TE_R = 2, TE_T = 4, TE_B = 8 }; // edges being dragged (TE_SIZE)
 static int te_sel = -1, te_mode, te_prev_n, te_sx, te_sy, te_ox, te_oy, te_ow, te_oh, te_moved, te_pop = -1, te_pop_sel;
-static int te_cpop, te_cpop_sel; // the combo list (from the key window's Combo row)
+static int te_cpop, te_cpop_sel, te_cfirst; // the pair lists (from the key window's Combo row): 1 its first key, 2 its second
+static int te_ckey(int i) // the pair list's key at row i (the second list leaves the first key out)
+{
+	for (int k = 0, n = 0; k < RSTV_COMBO_SRC; k++)
+		if ((te_cpop == 1 || s_combo_order[k] != te_cfirst) && n++ == i)
+			return s_combo_order[k];
+	return -1;
+}
 static int te_edges;
 static int te_snap(int v) // a size in TE_STEP steps, at least TE_MIN
 {
@@ -1313,20 +1702,46 @@ static void te_pop_open(int i)
 static void te_pop_apply(int row)
 {
 	RstvTouchArea *a = rstv_touch_area(te_pop);
-	if (te_cpop) { // a key pair
-		if (a && row >= 0 && row < TE_CPOP_N) {
-			a->key = (int16_t)(RSTV_TKEY_COMBO + combo_choice(row + 1));
+	if (te_cpop) { // a key pair: the first key, then the second
+		const int key = row >= 0 && row < TE_CPOP_N ? te_ckey(row) : -1;
+		if (te_cpop == 1 && key >= 0) {
+			te_cfirst = key;
+			te_cpop = 2;
+			te_cpop_sel = 0;
+			return;
+		}
+		if (a && key >= 0) {
+			a->key = (int16_t)(RSTV_TKEY_COMBO + (1 << te_cfirst) + (1 << key));
 			rstv_touch_changed();
 		}
 		te_cpop = 0;
 		te_pop = -1;
 		return;
 	}
-	if (row == TE_ROW_COMBO) { // the pair list (owner: entered from the key window)
+	if (row == TE_ROW_COMBO) { // the pair lists (owner: entered from the key window)
 		te_cpop = 1;
-		te_cpop_sel = a && RSTV_TKEY_IS_COMBO(a->key) ? combo_index(a->key - RSTV_TKEY_COMBO) - 1 : 0;
-		if (te_cpop_sel < 0)
-			te_cpop_sel = 0;
+		te_cpop_sel = 0;
+		for (int i = RSTV_COMBO_SRC - 1; i >= 0; i--) // (on the button's first key, if it has a pair)
+			if (a && RSTV_TKEY_IS_COMBO(a->key) && ((a->key - RSTV_TKEY_COMBO) & (1 << s_combo_order[i])))
+				te_cpop_sel = i;
+		return;
+	}
+	if (row == TE_ROW_DUP) { // a copy beside it (same size and key), then the copy's key
+		if (a) {
+			const int w = a->w, h = a->h, key = a->key;
+			int nx = a->x + 24, ny = a->y + 24;
+			if (nx + w > SCREEN_W)
+				nx = a->x >= 24 ? a->x - 24 : 0;
+			if (ny + h > SCREEN_H)
+				ny = a->y >= 24 ? a->y - 24 : 0;
+			const int i = rstv_touch_add(nx, ny, w, h, key);
+			if (i >= 0) {
+				te_sel = i;
+				te_pop_open(i);
+				return;
+			}
+		}
+		te_pop = -1;
 		return;
 	}
 	if (row == TE_ROW_DEL) { // Delete
@@ -1363,7 +1778,7 @@ static void tedit_update(uint32_t pressed)
 			te_pop_apply(*sel);
 		else if (pressed & (back | SCE_CTRL_START)) {
 			if (te_cpop)
-				te_cpop = 0; // (back to the key window)
+				te_cpop--; // (back to the first key, or to the key window)
 			else
 				te_pop = -1;
 		} else if (down) {
@@ -1491,6 +1906,16 @@ static void tedit_update(uint32_t pressed)
 	}
 }
 
+// Back out of a page (the back button or the Back row): leaving Controls itself, first the restart the chosen input
+// engine needs, if any (its window: restart, or back to Native)
+static void back_out(void)
+{
+	if (s_page == PAGE_CONTROLS && (s_vc_ask = engine_restart_ask()) != 0)
+		s_drawn_h = 0;
+	else
+		page_back();
+}
+
 static rstv_menu_result confirm(void)
 {
 	switch (s_page) {
@@ -1537,9 +1962,25 @@ static rstv_menu_result confirm(void)
 		break;
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
-	case PAGE_TOUCH: {
+	case PAGE_TOUCH:
+	case PAGE_PORT: {
 		int act;
 		const int k = ctrl_kind(s_sel, &act);
+		if (k == CK_PORT1 || k == CK_PORT2) {
+			s_kp = k == CK_PORT2;
+			go_page(PAGE_PORT);
+			break;
+		}
+		if (k == CK_BIND_ALL) { // every key row in turn, from button 1
+			s_sel = port_row_of_act(RSTV_ACT_B1);
+			bind_begin(1);
+			break;
+		}
+		if (k == CK_RESET_PORT) {
+			rstv_settings_default_port(re_pad_player_profile(s_kp)); // (the device's controls)
+			rstv_osd_show("%dP controls reset", s_kp + 1);
+			break;
+		}
 		if (k == CK_T_EDIT) {
 			go_page(PAGE_TEDIT);
 			tedit_open();
@@ -1558,7 +1999,7 @@ static rstv_menu_result confirm(void)
 		}
 		if (k == CK_TOUCH) go_page(PAGE_TOUCH);
 		else if (k == CK_COMBO) go_page(PAGE_COMBO);
-		else if (k == CK_BACK) page_back();
+		else if (k == CK_BACK) back_out();
 		else if (k == CK_TURBO) go_page(PAGE_TURBO);
 		else if (k == CK_DEFAULTS) rstv_settings_default_keys();
 		else change(+1);
@@ -1599,12 +2040,102 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 	s_prev_buttons = buttons;
 	if (pressed)
 		s_dirty = 1;
+	if (re_pad_changed()) { // a controller came or went: the Port pages and the Device list show them, the whole panel again
+		s_dirty = 1;
+		s_drawn_h = 0;
+		s_pad_redraw = 1; // (the game list options draw again only when told)
+		if (!re_pad_player_shown(s_kp) && (s_page == PAGE_PORT || s_page == PAGE_TURBO || s_page == PAGE_COMBO)) {
+			// the device of this port went away (its row is gone): back to Controls
+			s_pop = s_bind = 0;
+			go_page(PAGE_CONTROLS);
+			s_kp = 0;
+		}
+		if (s_sel >= page_items())
+			s_sel = page_items() - 1;
+	}
 	rstv_menu_result r = RSTV_MENU_STAY;
 	if (s_page == PAGE_TEDIT && !ps_closed) { // touch layout editor: touch and its own buttons
 		tedit_update(pressed);
 		return RSTV_MENU_STAY;
 	}
 	const int n = page_items();
+	if (s_vc_ask) {
+		// VitaControl off: confirm = its lines commented out in the plugin lists (copies kept), then the Vita restarts
+		const int o_ok = g_set.confirm == RSTV_CONFIRM_CIRCLE;
+		const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
+		if ((pressed & ok) && !ps_closed) {
+			const int kind = s_vc_ask;
+			s_vc_ask = 0;
+			const int r = kind == 1 ? re_pad_vitacontrol_off() : kind == 2 ? re_pad_vitacontrol_on() : 1;
+			RSTV_LOG("input engine restart %d: %d", kind, r);
+			if (r > 0) {
+				rstv_settings_save(); // (the chosen engine stays)
+				scePowerRequestColdReset();
+			} else
+				rstv_osd_show(r < 0 ? "Could not change the plugin list (config.txt)" : "VitaControl is not in the plugin list");
+		} else if ((pressed & (back | SCE_CTRL_START)) || ps_closed) {
+			s_vc_ask = 0; // cancelled: Native again (the chosen engine cannot run without the restart), and on out of Controls
+			g_set.input_engine = RE_PAD_ENGINE_NATIVE;
+			re_pad_engine_set(g_set.input_engine); // (saved when the menu closes)
+			page_back();
+		}
+		if (!s_vc_ask) {
+			s_dirty = 1;
+			s_drawn_h = 0;
+		}
+		return RSTV_MENU_STAY;
+	}
+	if (s_bind) {
+		// key binding: wait until every button is up (the confirm press), then the first button pressed is the key.
+		// The d-pad, the PS button or 5 s without a button cancel
+		int act, key = -1, cur, cancel = ps_closed || !CTRL_PAGE;
+		const int k = ctrl_kind(s_sel, &act);
+		uint32_t keys = 0;
+		for (int i = 0; i < RSTV_KEY_COUNT; i++)
+			keys |= rstv_key_code(i);
+		// a player's own page: its own device alone (another controller's buttons are not taken). Keys are looked for
+		// from the last: a controller's L2 / R2 is also L / R in the menus, the key is L2 / R2
+		uint32_t bb = buttons, bp = pressed;
+		if (s_page == PAGE_PORT || s_page == PAGE_TURBO) {
+			SceCtrlData pd;
+			re_pad_read(s_kp, &pd);
+			bb = pd.buttons;
+			bp = bb & ~s_bind_prev;
+			s_bind_prev = bb;
+		}
+		if (!s_bind_ready) {
+			if (!((buttons | bb) & (keys | REPEAT_KEYS)))
+				s_bind_ready = 1;
+		} else {
+			for (int i = RSTV_KEY_COUNT - 1; i >= 0 && key < 0; i--)
+				if (bp & rstv_key_code(i))
+					key = i;
+			if (key < 0 && ((pressed | bp) & REPEAT_KEYS))
+				cancel = 1;
+		}
+		if (key < 0 && rstv_time_us() - s_bind_t > BIND_US)
+			cancel = 1;
+		if (!row_key(k, act, &cur))
+			cancel = 1;
+		if (key >= 0 && !cancel) {
+			row_set_key(k, act, key);
+			if (s_bind_all && k == CK_ACT && act != RSTV_ACT_START) { // Set all controls: the next key row
+				s_sel++;
+				s_bind_ready = 0;
+				s_bind_t = rstv_time_us();
+			} else {
+				s_bind = 0;
+				rstv_settings_save();
+			}
+			s_dirty = 1;
+		} else if (cancel) {
+			s_bind = 0;
+			s_dirty = 1;
+			if (s_bind_all)
+				rstv_settings_save();
+		}
+		return RSTV_MENU_STAY;
+	}
 	{
 		const int o_ok = g_set.confirm == RSTV_CONFIRM_CIRCLE;
 		const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
@@ -1612,6 +2143,8 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 		int cur;
 		const int nc = item_choices(names, &cur, &title);
 		if (s_pop) { // choice window: up/down, confirm sets, back closes
+			if (s_pop_sel >= nc) // (the Device list got shorter)
+				s_pop_sel = nc > 0 ? nc - 1 : 0;
 			if (!nc)
 				s_pop = 0;
 			else if (pressed & SCE_CTRL_UP)
@@ -1620,13 +2153,48 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 				s_pop_sel = wrap(s_pop_sel + 1, nc);
 			else if (pressed & ok) {
 				set_choice(s_pop_sel);
-				s_pop = 0;
-				rstv_settings_save();
-			} else if (pressed & (back | SCE_CTRL_START))
-				s_pop = 0;
-			if (!s_pop)
+				if (s_pop_keep) { // (the combo window's second key next)
+					s_pop_keep = 0;
+					s_pop_sel = 0;
+				} else {
+					s_pop = 0;
+					rstv_settings_save();
+				}
+			} else if (pressed & (back | SCE_CTRL_START)) {
+				if (s_combo_first >= 0) { // the combo window: back to its first key
+					for (int i = 0; i < RSTV_COMBO_SRC; i++)
+						if (s_combo_order[i] == s_combo_first)
+							s_pop_sel = i + 1;
+					s_combo_first = -1;
+				} else
+					s_pop = 0;
+			}
+			if (!s_pop) {
 				s_drawn_h = 0; // the whole panel again (the window covered part of it)
+				s_combo_first = -1;
+			}
 			return RSTV_MENU_STAY;
+		}
+		if ((pressed & SCE_CTRL_SQUARE) && s_page == PAGE_COMBO && s_sel < RSTV_COMBO_SRC && !ps_closed) { // Square: no combo
+			prt()->combo[s_combo_order[s_sel]] = 0;
+			s_dirty = 1;
+			return RSTV_MENU_STAY;
+		}
+		if ((pressed & SCE_CTRL_SQUARE) && CTRL_PAGE && !ps_closed) { // a key row that can be none: Square sets None
+			int act, cur;
+			const int k = ctrl_kind(s_sel, &act);
+			if (row_key(k, act, &cur) && (k == CK_TURBO_KEY || act == RSTV_ACT_B3 || act == RSTV_ACT_B4)) {
+				row_set_key(k, act, RSTV_KEY_NONE);
+				s_dirty = 1;
+				return RSTV_MENU_STAY;
+			}
+		}
+		if ((pressed & ok) && CTRL_PAGE && !ps_closed) { // a key row: wait for the button (no choice window)
+			int act, cur;
+			if (row_key(ctrl_kind(s_sel, &act), act, &cur)) {
+				bind_begin(0);
+				return RSTV_MENU_STAY;
+			}
 		}
 		if ((pressed & ok) && nc) {
 			s_pop = 1;
@@ -1664,7 +2232,7 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 		if (s_page == PAGE_MAIN)
 			r = RSTV_MENU_CLOSE;
 		else
-			page_back();
+			back_out();
 	}
 	if (pressed & SCE_CTRL_START) {
 		r = RSTV_MENU_CLOSE;
@@ -1770,7 +2338,7 @@ static int draw_combo(UiCanvas *c, int x, int ty, int mask, uint32_t col)
 	}
 	const int x0 = x;
 	int first = 1;
-	for (int k = 0; k < RSTV_COMBO_KEYS; k++) {
+	for (int k = 0; k < RSTV_COMBO_SRC; k++) {
 		const int key = s_combo_order[k];
 		if (!(mask & (1 << key)))
 			continue;
@@ -1835,7 +2403,7 @@ static void text_keys(UiCanvas *c, int x, int ty, uint32_t col, const char *s)
 static int s_paint_x0, s_paint_y0, s_paint_x1, s_paint_y1;
 static float s_mscr, s_mtgt; // menu rows scroll (px): drawn, target
 static const uint32_t *s_under; // game list options: the dimmed list under the window (NULL: just drawn in full)
-static int menu_anim(void) { return s_mscr != s_mtgt; } // (the menu is still scrolling: draw again)
+static int menu_anim(void) { return s_mscr != s_mtgt || s_help_scroll; } // (the menu is still moving: draw again)
 static void tedit_paint(UiCanvas *c);
 static void menu_paint(UiCanvas *c, int overlay)
 {
@@ -1924,20 +2492,36 @@ static void menu_paint(UiCanvas *c, int overlay)
 			foot = "Left/Right: change   (global settings)";
 		break;
 	case PAGE_TURBO:
-		title = "TURBO";
+		title = s_kp ? "2P TURBO" : "1P TURBO";
 		foot = "Hold the turbo key: the turbo button repeats";
 		break;
 	case PAGE_COMBO:
-		title = "COMBO KEYS";
-		snprintf(foot_buf, sizeof(foot_buf), "A key acts as two keys pressed together   Left/Right: change   %s: list", ok_name);
+		title = s_kp ? "2P COMBO KEYS" : "1P COMBO KEYS";
+		snprintf(foot_buf, sizeof(foot_buf), "A key acts as two keys pressed together   Left/Right: change   %s: list   " G_SQU ": none", ok_name);
 		break;
 	case PAGE_TOUCH:
 		title = "TOUCH CONTROLS";
 		foot = s_reset_armed ? "Press again to clear every touch button" : "Touch buttons on the screen press the keys you give them";
 		break;
+	case PAGE_PORT: {
+		// connected controllers
+		int m = snprintf(foot_buf, sizeof(foot_buf), "Connected: %s", re_pad_port_name(0));
+		for (int i = 1; i < RE_PAD_PORTS && m < (int)sizeof(foot_buf); i++)
+			if (re_pad_connected(i))
+				m += snprintf(foot_buf + m, sizeof(foot_buf) - m, ", %s (%d)", re_pad_port_name(i), i);
+		{ // with the device whose controls these are
+			static char tb[48];
+			snprintf(tb, sizeof(tb), "%dP CONTROLLER  (%s)", s_kp + 1, port_none() ? "no device" :
+				re_pad_profile_name(re_pad_player_profile(s_kp)));
+			title = tb;
+		}
+		foot = foot_buf;
+		break;
+	}
 	case PAGE_CONTROLS:
 		title = "CONTROLS";
-		foot = s_list_mode ? "Left/Right: choose button   (global settings)" : "Left/Right: choose button   Menu: SELECT+START";
+		foot = s_list_mode ? "Each player: its device, buttons, stick, turbo, combo keys   (global settings)"
+			: "Each player: its device, buttons, stick, turbo, combo keys";
 		break;
 	case PAGE_CHEATS:
 		title = "CHEATS";
@@ -1956,6 +2540,19 @@ static void menu_paint(UiCanvas *c, int overlay)
 		if (!s_list_mode && rstv_settings_has_game())
 			foot = "This game uses its own settings (Delete game settings to undo)";
 		break;
+	}
+	if (s_bind) {
+		int act;
+		const int k = ctrl_kind(s_sel, &act);
+		snprintf(foot_buf, sizeof(foot_buf), "%sPress the button for %s   (D-pad or 5 s: cancel)",
+			s_bind_all ? "Set all controls: " : "", row_key_name(k, act));
+		foot = foot_buf;
+	} else if (s_page == PAGE_PORT || s_page == PAGE_TURBO) {
+		int act, cur;
+		if (row_key(ctrl_kind(s_sel, &act), act, &cur)) {
+			snprintf(foot_buf, sizeof(foot_buf), "%s: press a button to set it   " G_SQU ": none   Left/Right: change", ok_name);
+			foot = foot_buf;
+		}
 	}
 	{
 		// title: cut with "..." when it overflows the panel (ST-V set names are long)
@@ -2017,11 +2614,27 @@ static void menu_paint(UiCanvas *c, int overlay)
 		}
 		case PAGE_CONTROLS:
 		case PAGE_TURBO:
-		case PAGE_TOUCH: {
-			int act;
+		case PAGE_TOUCH:
+		case PAGE_PORT: {
+			int act, cur;
 			const int k = ctrl_kind(i, &act);
-			if (k == CK_ACT)
-				item_key(c, px, ty, i, s_sel, act_name(act), g_set.keymap[act]);
+			if (s_bind && i == s_sel && row_key(k, act, &cur))
+				item(c, px, ty, i, s_sel, row_key_name(k, act), "Press a button...");
+			else if (k == CK_ACT)
+				item_key(c, px, ty, i, s_sel, act_name(act), prt()->keymap[act]);
+			else if (k == CK_PORT1 || k == CK_PORT2) {
+				char pbuf[48], lbuf[24];
+				snprintf(lbuf, sizeof(lbuf), "%dP Controller  >", k == CK_PORT2 ? 2 : 1);
+				item(c, px, ty, i, s_sel, lbuf, re_pad_player_text(k == CK_PORT2, pbuf, sizeof(pbuf)));
+			} else if (k == CK_ENGINE)
+				item(c, px, ty, i, s_sel, "Input engine", re_pad_engine_text(g_set.input_engine));
+			else if (k == CK_DEVICE) {
+				char pbuf[48];
+				item(c, px, ty, i, s_sel, "Device", re_pad_player_text(s_kp, pbuf, sizeof(pbuf)));
+			} else if (k == CK_BIND_ALL)
+				item(c, px, ty, i, s_sel, "Set all controls", NULL);
+			else if (k == CK_RESET_PORT)
+				item(c, px, ty, i, s_sel, "Reset to default controls", NULL);
 			else if (k == CK_TOUCH)
 				item(c, px, ty, i, s_sel, "Touch controls  >", NULL);
 			else if (k == CK_COMBO)
@@ -2037,21 +2650,21 @@ static void menu_paint(UiCanvas *c, int overlay)
 			} else if (k == CK_T_CLEAR)
 				item(c, px, ty, i, s_sel, s_reset_armed && i == s_sel ? "Clear touch layout - press again" : "Clear touch layout", NULL);
 			else if (k == CK_TURBO_KEY)
-				item_key(c, px, ty, i, s_sel, "Turbo key", g_set.turbo_key);
+				item_key(c, px, ty, i, s_sel, "Turbo key", prt()->turbo_key);
 			else if (k == CK_TURBO_BTN) {
 				char bbuf[16];
-				snprintf(bbuf, sizeof(bbuf), "Button %d", g_set.turbo_btn);
+				snprintf(bbuf, sizeof(bbuf), "Button %d", prt()->turbo_btn);
 				item(c, px, ty, i, s_sel, "Turbo button", bbuf);
 			} else if (k == CK_TURBO_SPEED)
-				item(c, px, ty, i, s_sel, "Turbo speed", turbo_speed[g_set.turbo_speed]);
+				item(c, px, ty, i, s_sel, "Turbo speed", turbo_speed[prt()->turbo_speed]);
 			else if (k == CK_TURBO)
 				item(c, px, ty, i, s_sel, "Turbo  >", NULL);
 			else if (k == CK_STICK)
-				item(c, px, ty, i, s_sel, "Analog stick", stick[g_set.stick]);
+				item(c, px, ty, i, s_sel, "Analog stick to d-pad", stick[prt()->stick]);
 			else if (k == CK_CONFIRM)
 				item_key(c, px, ty, i, s_sel, "Menu confirm button", o_ok ? RSTV_KEY_CIRCLE : RSTV_KEY_CROSS);
 			else
-				item(c, px, ty, i, s_sel, k == CK_DEFAULTS ? "Restore defaults" : "Back", NULL);
+				item(c, px, ty, i, s_sel, k == CK_DEFAULTS ? "Restore defaults (every player)" : "Back", NULL);
 			break;
 		}
 		case PAGE_COMBO:
@@ -2065,7 +2678,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 				int x = px + VALUE_X;
 				ui_text(c, x, ty, col, 1.0f, "<");
 				x += ui_text_width(1.0f, "< ");
-				x += draw_combo(c, x, ty, g_set.combo[key], col);
+				x += draw_combo(c, x, ty, prt()->combo[key], col);
 				ui_text(c, x + 6, ty, col, 1.0f, ">");
 			}
 			break;
@@ -2120,7 +2733,49 @@ static void menu_paint(UiCanvas *c, int overlay)
 		rrect(c, tx, t0, 4, th, 2, UI_RGBA(0xFF, 0xFF, 0xFF, 0x18));
 		rrect(c, tx, by, 4, bh, 2, COL_THUMB);
 	}
-	text_keys(c, px + 24, py + h - 18, COL_DIM, foot);
+	{
+		// the footer: the selected row's help (it scrolls left when longer than the line: 1 s,
+		// then 60 px/s to its end, 1 s, from the start), else the page's own line
+		int act;
+		const char *help = s_bind || s_pop || s_vc_ask || s_page == PAGE_ABOUT ? NULL : CTRL_PAGE ?
+			row_help(ctrl_kind(s_sel, &act)) : page_row_help();
+		s_help_scroll = 0;
+		if (help) {
+			const int x0 = px + 24, avail = PANEL_W - 48, w = ui_text_width(0.8f, help), key = s_page * 256 + s_sel;
+			const uint64_t now = rstv_time_us();
+			if (key != s_help_key) {
+				s_help_key = key;
+				s_help_t0 = now;
+			}
+			int off = 0;
+			if (w > avail) {
+				const int over = w - avail, hold = 1000, travel = over * 1000 / 60, ms = (int)((now - s_help_t0) / 1000);
+				const int t = ms % (hold + travel + hold);
+				off = t < hold ? 0 : t < hold + travel ? (t - hold) * 60 / 1000 : over;
+				s_help_scroll = 1;
+			}
+			ui_text_clip(c, x0 - off, py + h - 18, COL_DIM, 0.8f, help, x0, x0 + avail);
+		} else
+			text_keys(c, px + 24, py + h - 18, COL_DIM, foot);
+	}
+	if (s_vc_ask) { // the engine's restart? (over the panel)
+		s_focus_want = 0; // (the row's blinking outline is a layer above the canvas: off while the window is up)
+		const int ww = 560, wh = 170, wx = (SCREEN_W - ww) / 2, wy = (SCREEN_H - wh) / 2;
+		ui_rect(c, px, py, PANEL_W, h, UI_RGBA(0x00, 0x00, 0x00, 0x80));
+		window_box(c, wx, wy, ww, wh, COL_SEL, COL_PANEL);
+		static const char *const head[3] = { "VitaControl keeps RePad out", "VitaControl is switched off",
+			"VitaControl starts after a restart" };
+		static const char *const line1[3] = { "Switch VitaControl off in the plugin list (config.txt, a copy is kept)",
+			"Switch VitaControl on in the plugin list (config.txt, a copy is kept)", "It is in the plugin list but not running yet." };
+		static const char *const act[3] = { "switch off and restart", "switch on and restart", "restart" };
+		const int k = s_vc_ask - 1;
+		ui_text(c, wx + 24, wy + 38, COL_TEXT, 1.0f, head[k]);
+		ui_text(c, wx + 24, wy + 72, COL_TEXT, 0.8f, line1[k]);
+		ui_text(c, wx + 24, wy + 96, COL_TEXT, 0.8f, k < 2 ? "and restart the Vita now?" : "Restart the Vita now?");
+		char kb[80];
+		snprintf(kb, sizeof(kb), "%s: %s   %s: cancel (Native)", ok_name, act[k], back_name);
+		text_keys(c, wx + 24, wy + 140, COL_DIM, kb);
+	}
 	if (s_pop) { // choice window over the panel
 		const char *names[MAX_CHOICES], *title;
 		int cur;
@@ -2133,8 +2788,16 @@ static void menu_paint(UiCanvas *c, int overlay)
 			ui_rect(c, px, py, PANEL_W, h, UI_RGBA(0x00, 0x00, 0x00, 0x80)); // dim the panel under it
 			window_box(c, wx, wy, ww, wh, COL_SEL, COL_PANEL);
 			ui_text(c, wx + 24, wy + 38, COL_TEXT, 1.0f, title);
-			if (s_choice_keys == 2) // "Combo for" the key
-				draw_key(c, wx + 24 + ui_text_width(1.0f, title) + 8, wy + 31, wy + 38, s_combo_order[s_sel], COL_TEXT);
+			if (s_choice_keys == 2) { // "Combo for" the key (second step: "= first +")
+				int x = wx + 24 + ui_text_width(1.0f, title) + 8;
+				x += draw_key(c, x, wy + 31, wy + 38, s_combo_order[s_sel], COL_TEXT);
+				if (s_combo_first >= 0) {
+					ui_text(c, x + 10, wy + 38, COL_TEXT, 1.0f, "=");
+					x += ui_text_width(1.0f, "=") + 20;
+					x += draw_key(c, x, wy + 31, wy + 38, s_combo_first, COL_TEXT);
+					ui_text(c, x + 6, wy + 38, COL_TEXT, 1.0f, "+");
+				}
+			}
 			ui_rect(c, wx + 20, wy + 50, ww - 40, 1, COL_DIM);
 			for (int i = 0; i < nc; i++) {
 				const int ty = wy + 60 + i * plh + plh / 2 + 7, by = ty - 7 - (plh - 6) / 2;
@@ -2143,8 +2806,13 @@ static void menu_paint(UiCanvas *c, int overlay)
 					rrect(c, wx + 12, by, ww - 24, plh - 6, 6, COL_HILITE);
 					focus_at(c, wx + 12, by, ww - 24, plh - 6);
 				}
-				if (s_choice_keys == 2)
-					draw_combo(c, wx + 44, ty, combo_choice(i), i == s_pop_sel ? COL_SEL : COL_TEXT);
+				if (s_choice_keys == 2) {
+					const int key = combo_pick(i);
+					if (key < 0)
+						ui_text(c, wx + 44, ty, i == s_pop_sel ? COL_SEL : COL_TEXT, 1.0f, "None");
+					else
+						draw_key(c, wx + 44, ty - 7, ty, key, i == s_pop_sel ? COL_SEL : COL_TEXT);
+				}
 				else if (s_choice_keys) // owner: button icons as in the item, not their names
 					draw_key(c, wx + 44, ty - 7, ty, i, i == s_pop_sel ? COL_SEL : COL_TEXT);
 				else
@@ -2215,14 +2883,14 @@ static void tedit_paint(UiCanvas *c)
 	rrect(c, SCREEN_W - 120, 7, 108, 32, 6, COL_SEL);
 	ui_text(c, SCREEN_W - 120 + (108 - ui_text_width(0.9f, "Done")) / 2, 29, COL_PANEL, 0.9f, "Done");
 	ui_rect(c, 0, SCREEN_H - 52, SCREEN_W, 52, UI_RGBA(0x00, 0x00, 0x00, 0xA8));
-	text_keys(c, 20, SCREEN_H - 30, COL_DIM, "Drag on an empty spot: new button   Tap a button: its key or Delete   Drag it: move   Drag an edge or corner: size");
+	text_keys(c, 20, SCREEN_H - 30, COL_DIM, "Drag on an empty spot: new button   Tap a button: its key, Duplicate or Delete   Drag it: move   Drag an edge or corner: size");
 	text_keys(c, 20, SCREEN_H - 10, COL_DIM, G_SQU ": new button   " G_TRI ": key of the selected one   START: done");
 	if (te_pop >= 0) {
 		int wx, wy, ww, wh;
 		te_pop_rect(&wx, &wy, &ww, &wh);
 		const RstvTouchArea *a = rstv_touch_area(te_pop);
 		window_box(c, wx, wy, ww, wh, COL_SEL, COL_PANEL);
-		ui_text(c, wx + 24, wy + 38, COL_TEXT, 1.0f, te_cpop ? "Combo key (two at once)" : "Button key");
+		ui_text(c, wx + 24, wy + 38, COL_TEXT, 1.0f, te_cpop == 1 ? "Combo: first key" : te_cpop ? "Combo: second key" : "Button key");
 		ui_rect(c, wx + 20, wy + 50, ww - 40, 1, COL_DIM);
 		for (int i = 0; te_cpop && i < TE_CPOP_N; i++) {
 			const int ty = wy + 60 + i * TE_CPOP_RH + TE_CPOP_RH / 2 + 7, by = ty - 7 - (TE_CPOP_RH - 4) / 2;
@@ -2231,8 +2899,10 @@ static void tedit_paint(UiCanvas *c)
 				rrect(c, wx + 12, by, ww - 24, TE_CPOP_RH - 4, 6, COL_HILITE);
 				rrect_outline(c, wx + 12, by, ww - 24, TE_CPOP_RH - 4, 6, 2, COL_FOCUS_STILL);
 			}
-			draw_combo(c, wx + 44, ty, combo_choice(i + 1), col);
-			if (a && a->key == RSTV_TKEY_COMBO + combo_choice(i + 1))
+			const int key = te_ckey(i);
+			draw_key(c, wx + 44, ty - 7, ty, key, col);
+			if (a && RSTV_TKEY_IS_COMBO(a->key) && ((a->key - RSTV_TKEY_COMBO) & (1 << key)) &&
+				(te_cpop == 1 || ((a->key - RSTV_TKEY_COMBO) & (1 << te_cfirst))))
 				ui_circle(c, (float)(wx + 28), (float)(ty - 7), 5.0f, col);
 		}
 		for (int i = 0; !te_cpop && i < TE_POP_N; i++) {
@@ -2244,6 +2914,8 @@ static void tedit_paint(UiCanvas *c)
 			}
 			if (i == TE_ROW_DEL)
 				ui_text(c, wx + 44, ty, COL_WARN, 1.0f, "Delete");
+			else if (i == TE_ROW_DUP)
+				ui_text(c, wx + 44, ty, col, 1.0f, "Duplicate");
 			else if (i == TE_ROW_COMBO) { // the button's pair, if it has one
 				int x = wx + 44;
 				ui_text(c, x, ty, col, 1.0f, "Combo  >");
@@ -2477,6 +3149,7 @@ void rstv_loading_progress(int permille)
 	}
 #endif
 	ui_commit(c);
+	rstv_video_strips(NULL, 0, 0, 0); // (the game list's rows, left on the screen until the loading screen)
 	rstv_video_present();
 #ifdef RSTV_DEBUG_TOOLS
 	if (rstv_time_us() - now > 50000)
@@ -2665,12 +3338,85 @@ static void gl_row(UiCanvas *c, int px, int w, int ty, int g, int selected, int 
 		rrect(c, px + 12, by, w - 24, GL_LINE - 6, 6, COL_HILITE);
 		if (selected == 2)
 			rrect_outline(c, px + 12, by, w - 24, GL_LINE - 6, 6, 2, COL_FOCUS_STILL);
-		else
+		else if (selected == 1)
 			focus_at(c, px + 12, by, w - 24, GL_LINE - 6);
+		// (3: the bar only, the caller places the focus)
 	}
 	if (rstv_fav_is(s_stv_list[g].set))
 		star(c, (float)(px + 36), (float)(ty - 7), 7.0f, COL_STAR);
 	ui_text_clip(c, px + 48 - off, ty, col, 1.0f, s_stv_list[g].title, px + 48, px + w - 24);
+}
+
+// The list rows while nothing is open over the list: each row is drawn once into a small texture of its own and the
+// GPU places the rows (rstv_video_strips) as the list scrolls (ReiREM's way). Redrawing and copying the whole 960x544
+// canvas every frame took 22-25 ms on the device (the CPU reaches main memory at ~200 MB/s): the list scrolled at ~41 fps
+#define ROW_H 48      // row texture: the bar, its shadow and the text
+#define ROW_TY 28     // text baseline in it
+#define ROW_CACHE 16  // more than the rows on screen at once
+static struct { UiCanvas *cv; int g, var, off, fav, gen; unsigned used; } s_rowc[ROW_CACHE];
+static unsigned s_row_frame;
+static const struct GxTex *row_tex(int g, int var, int off, int w)
+{
+	const int fav = rstv_fav_is(s_stv_list[g].set), gen = s_theme_gen;
+	int k = -1;
+	for (int i = 0; i < ROW_CACHE && k < 0; i++)
+		if (s_rowc[i].cv && s_rowc[i].g == g && s_rowc[i].var == var)
+			k = i;
+	if (k < 0) { // a free entry, else the one shown longest ago (never one shown this frame)
+		for (int i = 0; i < ROW_CACHE; i++) {
+			if (!s_rowc[i].cv) {
+				k = i;
+				break;
+			}
+			if (s_rowc[i].used != s_row_frame && (k < 0 || s_rowc[i].used < s_rowc[k].used))
+				k = i;
+		}
+		if (k < 0)
+			return NULL;
+		if (!s_rowc[k].cv)
+			s_rowc[k].cv = ui_canvas(-1, 0, 0, w, ROW_H);
+		if (!s_rowc[k].cv)
+			return NULL;
+		s_rowc[k].g = g;
+		s_rowc[k].var = var;
+		s_rowc[k].gen = -1; // (drawn below)
+	}
+	if (s_rowc[k].off != off || s_rowc[k].fav != fav || s_rowc[k].gen != gen) {
+		ui_clear(s_rowc[k].cv);
+		gl_row(s_rowc[k].cv, 0, w, ROW_TY, g, var, off);
+		ui_commit(s_rowc[k].cv);
+		s_rowc[k].off = off;
+		s_rowc[k].fav = fav;
+		s_rowc[k].gen = gen;
+	}
+	s_rowc[k].used = s_row_frame;
+	return ui_tex(s_rowc[k].cv);
+}
+
+// the list's scroll bar (display only), in the 16 px right of the rows; ox, oy: the canvas's corner on the screen
+static void gl_scrollbar(UiCanvas *c, int n, float scr, float rows_f, int la, int lb, int ox, int oy)
+{
+	if (!n)
+		return;
+	const int tx = SCREEN_W - 14 - ox, ty0 = la + 8 - oy, th = lb - la - 16;
+	const float vis = rows_f < (float)n ? rows_f : (float)n;
+	int bh = (int)(th * vis / n), by = ty0 + (int)(th * scr / n);
+	if (bh < 16) bh = 16;
+	if (by + bh > ty0 + th) by = ty0 + th - bh;
+	rrect(c, tx, ty0, 5, th, 2, UI_RGBA(0xFF, 0xFF, 0xFF, 0x18));
+	rrect(c, tx, by, 5, bh, 2, COL_THUMB);
+}
+
+// the list's header: the app name in its colours, the version, the position in the list, the filter with its count
+static void gl_header(UiCanvas *c, int n, int sel)
+{
+	char title[96];
+	snprintf(title, sizeof(title), " (" RSTV_VERSION ") - SELECT GAME (%d/%d)", n ? sel + 1 : 0, n);
+	const int bw = draw_brand(c, 24, 36, 1.1f);
+	ui_text(c, 24 + bw, 36, COL_TEXT, 1.1f, title);
+	char have[40];
+	snprintf(have, sizeof(have), "%s %d", s_gl_filter_name[g_set.list_filter], s_gl_nvis);
+	ui_text(c, SCREEN_W - 24 - ui_text_width(0.85f, have), 34, COL_DIM, 0.85f, have);
 }
 
 // ---- ADR-209: update window over the game list (Update / Close / Skip this version) ----
@@ -2798,7 +3544,9 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 	float scr = -1, tgt = 0; // list scroll (rows): drawn position easing to the target
 	static uint32_t *under; // the dimmed list under the options window
 	int under_ok = 0, under_gen = 0;
-	int mq_sel = -1, mq_t = 0, mq_y = 0, mq_px = 0, mq_w = 0, mq_tw = 0; // scrolling title of the selected row (marquee)
+	int mq_sel = -1, mq_t = 0, mq_tw = 0; // scrolling title of the selected row (marquee)
+	int fast_ok = 0, fast_key[7] = { 0 }, hdr_sel = -1, bar_n = -1, sync_left = 0; // rows as strips
+	float bar_scr = -1;
 	s_gl_ntabs = s_gl_tab = 0;
 	int n = gl_build(idx, want, &sel);
 	ui_clear(c); // whole canvas the first time (what loading/menu left there)
@@ -2811,7 +3559,9 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 		sceIoRemove(DATA_DIR "/gstest");
 	for (unsigned tick = 0;; tick++) {
 		SceCtrlData pad;
-		sceCtrlPeekBufferPositive(0, &pad, 1);
+		re_pad_poll();
+		re_pad_read_all(&pad);
+		rstv_osd_tick(); // (a notice from the options, e.g. a duplicate key, goes away after 2 s here too)
 		uint32_t b = pad.buttons;
 		if ((tick & 63) == 63) {
 			// no auto suspend in the list either (a device left here went to sleep and looked switched off)
@@ -2883,6 +3633,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			s_prev_buttons = b;
 			dirty = 1;
 		}
+
 		uint32_t pressed = key_repeat(b, b & ~prev, &rep);
 		prev = b;
 		if (pressed)
@@ -3023,6 +3774,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					s_drawn_h = 0;
 					focus_off();
 					ui_hide(c);
+					rstv_video_strips(NULL, 0, 0, 0); // (the rows go with the list)
 					return s_stv_list[g].set;
 				}
 				const char *par = s_stv_list[g].parent;
@@ -3034,8 +3786,13 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			}
 		}
 		focus_tick();
-		if (s_list_mode && (menu_anim() || (s_page == PAGE_TEDIT && s_dirty)))
-			dirty = 1; // the options window is still scrolling (or the touch editor changed)
+		if (s_list_mode && (menu_anim() || s_dirty)) {
+			// the options window is still scrolling, or it changed without a button press (the touch editor, a controller
+			// that came or went; touching Done leaves the editor that way: after Done it stayed on the screen)
+			dirty = 1;
+			s_dirty = 0;
+			s_pad_redraw = 0;
+		}
 		if (!s_list_mode && under_ok) { // options closed: the list is drawn again in full
 			under_ok = 0;
 			dirty = 1;
@@ -3069,7 +3826,23 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				dirty = 1;
 			}
 		}
-		if (dirty) {
+		// nothing open over the list: the rows are strips (row_tex) and the canvas is drawn again in full only when the
+		// header, tabs or footer change; a cursor move redraws the header line, scrolling only the scroll bar
+		const int fast = !about && !msg[0] && !upd && !s_list_mode;
+		int full = dirty && !fast;
+		if (fast) {
+			theme();
+			const int key[7] = { s_theme_gen, s_gl_tab, s_gl_ntabs, g_set.list_filter, s_gl_nvis, n, o_ok };
+			if (!fast_ok || memcmp(key, fast_key, sizeof(key))) {
+				memcpy(fast_key, key, sizeof(key));
+				fast_ok = 1;
+				full = 1;
+			}
+		} else if (dirty) {
+			fast_ok = 0;
+			rstv_video_strips(NULL, 0, 0, 0);
+		}
+		if (full) {
 			dirty = 0;
 			const int h = SCREEN_H, w = SCREEN_W;
 			const int px = 0, py = 0;
@@ -3104,46 +3877,22 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				s_focus_cy0 = la;
 				s_focus_cy1 = lb;
 				const int i0 = (int)floorf(scr), i1 = (int)ceilf(scr + rows_f + 2.0f * lpad / GL_LINE);
-				for (int i = i0 < 0 ? 0 : i0; i < n && i <= i1; i++) {
+				for (int i = i0 < 0 ? 0 : i0; !fast && i < n && i <= i1; i++) {
 					const int ty = la + lpad + (int)floorf(((float)i - scr) * GL_LINE + 0.5f) + GL_LINE / 2 + 7;
 					gl_row(c, px, rw, ty, idx[i], i == sel ? (still ? 2 : 1) : 0, 0);
-					if (i == sel) { // titles longer than the cell scroll (only this row is redrawn each frame below)
-						if (mq_sel != idx[i])
-							mq_t = 0;
-						mq_sel = idx[i];
-						mq_y = ty;
-						mq_px = px;
-						mq_w = rw;
-						mq_tw = ui_text_width(1.0f, s_stv_list[idx[i]].title);
-					}
 				}
-				if (!n)
-					mq_sel = -1;
 				s_focus_cy0 = 0;
 				s_focus_cy1 = SCREEN_H;
-				for (int k = 0; k < fade; k++) { // fade bands: the background over the rows, opaque at the edge
+				for (int k = 0; !fast && k < fade; k++) { // fade bands: the background over the rows, opaque at the edge
 					const unsigned al = (unsigned)(255 - (k + 1) * 255 / (fade + 1));
 					ui_rect(c, 0, la + k, rw, 1, (bgr[la + k] & 0xFFFFFFu) | (al << 24));
 					ui_rect(c, 0, lb - 1 - k, rw, 1, (bgr[lb - 1 - k] & 0xFFFFFFu) | (al << 24));
 				}
 				ui_fill_rows(c, bgr, 0, 0, SCREEN_W, la); // rows that scrolled past the edges
 				ui_fill_rows(c, bgr, 0, lb, SCREEN_W, SCREEN_H - lb);
-				if (n) { // scroll bar (display only, owner)
-					const int tx = SCREEN_W - 14, ty0 = la + 8, th = lb - la - 16;
-					const float vis = rows_f < (float)n ? rows_f : (float)n;
-					int bh = (int)(th * vis / n), by = ty0 + (int)(th * scr / n);
-					if (bh < 16) bh = 16;
-					if (by + bh > ty0 + th) by = ty0 + th - bh;
-					rrect(c, tx, ty0, 5, th, 2, UI_RGBA(0xFF, 0xFF, 0xFF, 0x18));
-					rrect(c, tx, by, 5, bh, 2, COL_THUMB);
-				}
-				char title[96];
-				snprintf(title, sizeof(title), " (" RSTV_VERSION ") - SELECT GAME (%d/%d)", n ? sel + 1 : 0, n);
-				const int bw = draw_brand(c, px + 24, py + 36, 1.1f);
-				ui_text(c, px + 24 + bw, py + 36, COL_TEXT, 1.1f, title);
-				char have[40];
-				snprintf(have, sizeof(have), "%s %d", s_gl_filter_name[g_set.list_filter], s_gl_nvis);
-				ui_text(c, px + w - 24 - ui_text_width(0.85f, have), py + 34, COL_DIM, 0.85f, have);
+				if (!fast)
+					gl_scrollbar(c, n, scr, rows_f, la, lb, 0, 0);
+				gl_header(c, n, sel);
 				{ // tab row: current tab highlighted; on overflow, scrolled so the current tab stays visible
 					int tx = px + 16, first = 0, total = 0;
 					for (int t = 0; t < s_gl_ntabs; t++)
@@ -3202,20 +3951,103 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			}
 			if (s_list_mode && !about)
 				menu_paint(c, 1);
-				s_dirty = 0; // (the touch editor asks again when it changes)
+			s_dirty = 0; // (the touch editor asks again when it changes)
+			if (!fast) {
+				focus_end();
+				ui_commit(c);
+			}
+		}
+		if (fast) {
+			dirty = 0;
+			const int rw = SCREEN_W - 16;
+			const uint32_t *bgr = theme_rows(1);
+			int drawn = full;
+			if (!full && hdr_sel != sel) { // the position in the header
+				ui_fill_rows(c, bgr, 0, 0, SCREEN_W, TITLE_H - 8);
+				gl_header(c, n, sel);
+				drawn = 1;
+			}
+			static UiCanvas *bar_cv; // the scroll bar: a strip of its own (with the header in the canvas, one copy spanned both)
+			if (!bar_cv)
+				bar_cv = ui_canvas(-1, 0, 0, SCREEN_W - rw, lb - la);
+			if (bar_cv && (full || bar_scr != scr || bar_n != n)) {
+				ui_clear(bar_cv);
+				gl_scrollbar(bar_cv, n, scr, rows_f, la, lb, rw, la);
+				ui_commit(bar_cv);
+			}
+			hdr_sel = sel;
+			bar_scr = scr;
+			bar_n = n;
+			// the fade bands at the top and bottom of the rows: the background over them, opaque at the edge
+			static UiCanvas *fade_cv[2];
+			static int fade_gen = -1;
+			if (fade_gen != s_theme_gen) {
+				for (int e = 0; e < 2; e++) {
+					if (!fade_cv[e])
+						fade_cv[e] = ui_canvas(-1, 0, 0, rw, fade);
+					if (!fade_cv[e])
+						continue;
+					ui_clear(fade_cv[e]);
+					for (int k = 0; k < fade; k++) {
+						const unsigned al = (unsigned)(255 - (k + 1) * 255 / (fade + 1));
+						const int y = e ? fade - 1 - k : k;
+						ui_rect(fade_cv[e], 0, y, rw, 1, (bgr[e ? lb - 1 - k : la + k] & 0xFFFFFFu) | (al << 24));
+					}
+					ui_commit(fade_cv[e]);
+				}
+				fade_gen = s_theme_gen;
+			}
+			// rows on screen, the selected one with its focus (blinking while fully inside the rows area, else a
+			// steady outline in the row) and its scrolling title
+			s_row_frame++;
+			RstvStrip st[RSTV_NSTRIP];
+			int ns = 0;
+			focus_begin();
+			const int i0 = (int)floorf(scr), i1 = (int)ceilf(scr + rows_f + 2.0f * lpad / GL_LINE);
+			for (int i = i0 < 0 ? 0 : i0; i < n && i <= i1 && ns < RSTV_NSTRIP - 3; i++) {
+				const int ty = la + lpad + (int)floorf(((float)i - scr) * GL_LINE + 0.5f) + GL_LINE / 2 + 7;
+				int var = 0, off = 0;
+				if (i == sel) {
+					const int by = ty - 7 - (GL_LINE - 6) / 2;
+					const int inside = by - 2 >= la && by + GL_LINE - 6 + 2 <= lb;
+					var = inside ? 3 : 2;
+					if (inside) {
+						s_focus_cy0 = la;
+						s_focus_cy1 = lb;
+						focus_at(c, 12, by, rw - 24, GL_LINE - 6);
+						s_focus_cy0 = 0;
+						s_focus_cy1 = SCREEN_H;
+					}
+					if (mq_sel != idx[i]) {
+						mq_sel = idx[i];
+						mq_t = 0;
+						mq_tw = ui_text_width(1.0f, s_stv_list[idx[i]].title);
+					}
+					const int avail = rw - 72, over = mq_tw - avail, hold = 60;
+					if (over > 0) { // 1 s pause -> 60 px/s to the end -> 1 s pause -> from the start
+						const int tt = mq_t++ % (hold + over + hold);
+						off = tt < hold ? 0 : tt < hold + over ? tt - hold : over;
+					}
+				}
+				const struct GxTex *tx = row_tex(idx[i], var, off, rw);
+				if (tx)
+					st[ns++] = (RstvStrip){ tx, 0, ty - ROW_TY, rw, ROW_H };
+			}
+			if (!n)
+				mq_sel = -1;
+			for (int e = 0; e < 2; e++)
+				if (fade_cv[e] && ui_tex(fade_cv[e]))
+					st[ns++] = (RstvStrip){ ui_tex(fade_cv[e]), 0, e ? lb - fade : la, rw, fade };
+			if (bar_cv && ui_tex(bar_cv) && ns < RSTV_NSTRIP)
+				st[ns++] = (RstvStrip){ ui_tex(bar_cv), rw, la, SCREEN_W - rw, lb - la };
+			rstv_video_strips(st, ns, la, lb);
 			focus_end();
-			ui_commit(c);
-		} else if (!about && !msg[0] && !upd && !s_list_mode && mq_sel >= 0 && mq_tw > mq_w - 72) {
-			// the selected row's title scrolls when longer than the row (ADR-099): 1 s pause → 60 px/s to the end →
-			// 1 s pause → from the start. Only this row is drawn again
-			const int avail = mq_w - 72, over = mq_tw - avail, hold = 60;
-			const int cyc = hold + over + hold;
-			const int t = mq_t++ % cyc;
-			const int off = t < hold ? 0 : t < hold + over ? t - hold : over;
-			const int by = mq_y - 7 - (GL_LINE - 6) / 2;
-			ui_fill_rows(c, theme_rows(1), mq_px + 6, by - 2, mq_w - 12, GL_LINE + 4);
-			gl_row(c, mq_px, mq_w, mq_y, mq_sel, 1, off);
-			ui_commit(c);
+			// after a full redraw the other two textures still need the whole canvas: copied on frames with nothing
+			// else to do (the screen is still then), not on the next cursor move
+			if (drawn || sync_left > 0) {
+				ui_commit(c);
+				sync_left = full ? 2 : sync_left > 0 ? sync_left - 1 : 0;
+			}
 		}
 		rstv_video_present();
 	}

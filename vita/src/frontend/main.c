@@ -30,6 +30,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include "frontend/emu.h"
 #include "frontend/sampler.h"
 #include "frontend/update.h"
+#include "common/re_pad.h"
 #include "frontend/touch.h"
 #include "frontend/menu.h"
 #include "frontend/stv_list.h"
@@ -363,25 +364,31 @@ static int s_test_frames; // frames left of the TEST switch press from the menu
 int rstv_fastboot_until, rstv_fastboot_now;
 #endif
 int rstv_test_session;     // after the menu's TEST switch press: L = SERVICE (move), R = TEST (enter) in the BIOS test menu
-static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigned frame)
+// one player (re_pad: 1P and 2P each read their own controller with their own port settings: keys, stick, turbo,
+// combo keys, g_set.port, ADR-216). 1P sets *sys, 2P adds to it. The touch buttons, the test switches and the mahjong panel are 1P's
+static void map_player(int pl, const SceCtrlData *pad, uint8_t *pp, uint8_t *sys, unsigned frame)
 {
 	uint32_t b = pad->buttons;
 	uint8_t p = 0, s = 0;
+	// this player's buttons, stick, turbo and combo keys: those of the device it reads (they go with the device)
+	const rstv_port *pr = &g_set.port[re_pad_player_profile(pl)];
+	const int *km = pr->keymap;
 	if ((b & SCE_CTRL_SELECT) && (b & (SCE_CTRL_START | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER))) {
 		// system combo: buttons held with it are not sent to the game
-		*p1 = 0;
-		*sys = 0;
+		*pp = 0;
+		if (!pl)
+			*sys = 0;
 		return;
 	}
-	if (g_set.touch_keys) // ADR-214: the touch buttons press their Vita keys (in the game only)
+	if (!pl && g_set.touch_keys) // ADR-214: the touch buttons press their Vita keys (in the game only)
 		b |= rstv_touch_buttons();
 	{ // ADR-214 combo keys (as ReiREM): a key with a combo acts as its two keys pressed together, not its own mapping
 		uint32_t add = 0;
-		for (int k = 0; k < 6; k++)
-			if (g_set.combo[k] && (b & rstv_key_code(k))) {
+		for (int k = 0; k < RSTV_KEY_COUNT; k++)
+			if (pr->combo[k] && (b & rstv_key_code(k))) {
 				b &= ~rstv_key_code(k);
 				for (int j = 0; j < RSTV_KEY_COUNT; j++)
-					if (g_set.combo[k] & (1 << j))
+					if (pr->combo[k] & (1 << j))
 						add |= rstv_key_code(j);
 			}
 		b |= add;
@@ -391,20 +398,20 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 	if (b & SCE_CTRL_LEFT) p |= STV_IN_LEFT;
 	if (b & SCE_CTRL_RIGHT) p |= STV_IN_RIGHT;
 	// analog stick: tilting more than 48 from center 128 gives that direction (diagonals included)
-	if (g_set.stick == RSTV_STICK_LEFT || g_set.stick == RSTV_STICK_BOTH) {
+	if (pr->stick == RSTV_STICK_LEFT || pr->stick == RSTV_STICK_BOTH) {
 		if (pad->ly < 80) p |= STV_IN_UP;
 		if (pad->ly > 176) p |= STV_IN_DOWN;
 		if (pad->lx < 80) p |= STV_IN_LEFT;
 		if (pad->lx > 176) p |= STV_IN_RIGHT;
 	}
-	if (g_set.stick == RSTV_STICK_RIGHT || g_set.stick == RSTV_STICK_BOTH) {
+	if (pr->stick == RSTV_STICK_RIGHT || pr->stick == RSTV_STICK_BOTH) {
 		if (pad->ry < 80) p |= STV_IN_UP;
 		if (pad->ry > 176) p |= STV_IN_DOWN;
 		if (pad->rx < 80) p |= STV_IN_LEFT;
 		if (pad->rx > 176) p |= STV_IN_RIGHT;
 	}
-	if (rstv_input_rot) {
-		// ADR-190: the Vita is held turned (Vertical L / R): turn the screen directions back into the game's
+	if (rstv_input_rot && re_pad_port(pl) == 0 && !re_pad_is_tv()) {
+		// ADR-190: the Vita is held turned (its own controls only, not a controller) (Vertical L / R): turn the screen directions back into the game's
 		// (90: screen right = game up; 270: screen left = game up)
 		const int u = (p & STV_IN_UP) != 0, d = (p & STV_IN_DOWN) != 0, l = (p & STV_IN_LEFT) != 0, r = (p & STV_IN_RIGHT) != 0;
 		p &= (uint8_t)~(STV_IN_UP | STV_IN_DOWN | STV_IN_LEFT | STV_IN_RIGHT);
@@ -416,21 +423,26 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 	static const uint8_t stv_btn[4] = { STV_IN_B1, STV_IN_B2, STV_IN_B3, STV_IN_B4 };
 	// ADR-097·126 turbo (same as Reirem): while the turbo key (None = off) is held, the turbo button is pressed for the first half of each period
 	// (Turbo speed: 4/6/8 frames) and released for the second half. The turbo key's normal mapping is not used
-	const uint32_t tm = rstv_key_code(g_set.turbo_key);
+	const uint32_t tm = rstv_key_code(pr->turbo_key);
 	const uint32_t nb = b & ~tm;
-	if (tm && (b & tm) && g_set.turbo_btn >= 1 && g_set.turbo_btn <= 4) {
-		const unsigned per = (unsigned)rstv_turbo_period(g_set.turbo_speed);
+	if (tm && (b & tm) && pr->turbo_btn >= 1 && pr->turbo_btn <= 4) {
+		const unsigned per = (unsigned)rstv_turbo_period(pr->turbo_speed);
 		if (frame % per < per / 2)
-			p |= stv_btn[g_set.turbo_btn - 1];
+			p |= stv_btn[pr->turbo_btn - 1];
 	}
 	for (int k = 0; k < rstv_menu_buttons(); k++)
-		if (nb & rstv_key_code(g_set.keymap[RSTV_ACT_B1 + k]))
+		if (nb & rstv_key_code(km[RSTV_ACT_B1 + k]))
 			p |= stv_btn[k];
 	// coin and start also from assigned buttons (ADR-126, default SELECT, START)
-	if (nb & rstv_key_code(g_set.keymap[RSTV_ACT_COIN]))
-		s |= STV_SYS_COIN1;
-	if (nb & rstv_key_code(g_set.keymap[RSTV_ACT_START]))
-		s |= STV_SYS_START1;
+	if (nb & rstv_key_code(km[RSTV_ACT_COIN]))
+		s |= pl ? STV_SYS_COIN2 : STV_SYS_COIN1;
+	if (nb & rstv_key_code(km[RSTV_ACT_START]))
+		s |= pl ? STV_SYS_START2 : STV_SYS_START1;
+	if (pl) {
+		*pp = p;
+		*sys |= s;
+		return;
+	}
 	if (s_test_frames > 0) { // menu "Test mode (BIOS menu)"
 		s_test_frames--;
 		s |= STV_SYS_TEST;
@@ -441,7 +453,7 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 		if (b & SCE_CTRL_RTRIGGER)
 			s |= STV_SYS_TEST;
 	}
-	*p1 = p;
+	*pp = p;
 	*sys = s;
 	if (stv_io_type == STV_IO_MAHJONG) {
 		// mahjong panel (ADR-106, MAME stvmp): default = d-pad up/right/down/left A B C D, △ ○ × □ E F G H;
@@ -480,6 +492,14 @@ static void map_input(const SceCtrlData *pad, uint8_t *p1, uint8_t *sys, unsigne
 		StvIoSetMahjong(r);
 	}
 }
+static void map_input(uint8_t *p1, uint8_t *p2, uint8_t *sys, unsigned frame)
+{
+	SceCtrlData pad1, pad2;
+	re_pad_read(0, &pad1);
+	re_pad_read(1, &pad2);
+	map_player(0, &pad1, p1, sys, frame);
+	map_player(1, &pad2, p2, sys, frame);
+}
 
 // Start screen (ADR-094, Reirem list style): supported sets in roms. Cursor starts on the last picked game (game.txt); waits until one is picked.
 // Measurement tools skip it with the autostart file (pick_game). Starts directly if there is only one set. The picked set is kept in game.txt
@@ -507,7 +527,8 @@ static void fatal_screen(uint32_t abgr)
 		rstv_video_frame_end();
 		rstv_video_present();
 		SceCtrlData pad;
-		sceCtrlPeekBufferPositive(0, &pad, 1);
+		re_pad_poll();
+		re_pad_read_all(&pad);
 		if (pad.buttons & SCE_CTRL_START)
 			break;
 	}
@@ -634,10 +655,12 @@ static void c2_loop(const char *game, const char *jit_msg)
 	double osd_fps = 0.0;
 	for (;;) {
 		SceCtrlData pad;
-		sceCtrlPeekBufferPositive(0, &pad, 1);
+		re_pad_poll();
+		re_pad_read_all(&pad);
 		if (rstv_menu_should_open(pad.buttons)) {
 			for (int done = 0; !done;) {
-				sceCtrlPeekBufferPositive(0, &pad, 1);
+				re_pad_poll();
+				re_pad_read_all(&pad);
 				const rstv_menu_result r = rstv_menu_update(pad.buttons);
 				char sp[160];
 				const int slot = rstv_menu_slot();
@@ -674,15 +697,15 @@ static void c2_loop(const char *game, const char *jit_msg)
 				break;
 			continue;
 		}
-		uint8_t p1, sys;
-		map_input(&pad, &p1, &sys, frame);
+		uint8_t p1, p2, sys;
+		map_input(&p1, &p2, &sys, frame);
 		for (int a = 0; a < n_auto; a++)
 			if (frame + 1 >= auto_frame[a] && frame + 1 < auto_frame[a] + 6) {
 				sys |= auto_bits[a];
 				p1 |= auto_p1[a];
 			}
 		const uint64_t t0 = rstv_time_us();
-		c2_run_frame(p1, 0, sys);
+		c2_run_frame(p1, p2, sys);
 		int n;
 		while ((n = c2_audio(abuf, 2048)) > 0)
 			rstv_audio_push(abuf, n);
@@ -850,12 +873,16 @@ int main(int argc, char *argv[])
 	const int mhz_post_video = rstv_clock_measure_arm_mhz();
 	rstv_audio_init();
 	const int mhz_post_audio = rstv_clock_measure_arm_mhz();
-	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG); // left stick as lever (setting STICK)
+	re_pad_init(); // controllers and players (left stick as lever: setting STICK)
 
 
 	char game_buf[64], err[256];
 	rstv_touch_init(); // ADR-214
 	rstv_settings_load();
+	// input engine (setting): RePad = the Bluetooth controller plugin from the app, unless it already runs (ur0:tai, or
+	// another Re app); Native = whatever the system has
+	g_set.input_engine = re_pad_engine_init(g_set.input_engine, "ux0:app/RSTV00001/module/repad.skprx"); // (the kernel cannot open app0:)
+	RSTV_LOG("input engine: %s, RePad %s", re_pad_engine_name(g_set.input_engine), re_pad_plugin() ? "running" : "not running");
 	rstv_settings_apply_video();
 	const char *game = pick_game(game_buf, sizeof(game_buf));
 	if (!game)
@@ -1292,7 +1319,8 @@ next_game:
 	uint32_t prev_buttons = ~0u;
 	for (;;) {
 		SceCtrlData pad;
-		sceCtrlPeekBufferPositive(0, &pad, 1);
+		re_pad_poll();
+		re_pad_read_all(&pad);
 		if ((pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START)) ==
 			(SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START))
 			break;
@@ -1307,7 +1335,8 @@ next_game:
 			rstv_fps_hide(); // (it covered the menu, e.g. Done of the touch layout editor)
 			rstv_touch_overlay_update(1);
 			for (int done = 0; !done;) {
-				sceCtrlPeekBufferPositive(0, &pad, 1);
+				re_pad_poll();
+				re_pad_read_all(&pad);
 				const rstv_menu_result r = rstv_menu_update(pad.buttons);
 				char sp[160];
 				const int slot = rstv_menu_slot();
@@ -1373,8 +1402,8 @@ next_game:
 				break;
 			continue;
 		}
-		uint8_t p1, sys;
-		map_input(&pad, &p1, &sys, frame);
+		uint8_t p1, p2, sys;
+		map_input(&p1, &p2, &sys, frame);
 		// auto input (measurement): press for 6 frames on each "frame coin|start" line of ux0:data/restv/autoinput.txt
 		for (int a = 0; a < n_auto; a++)
 			if (frame + 1 >= auto_frame[a] && frame + 1 < auto_frame[a] + 6) {
@@ -1426,7 +1455,7 @@ next_game:
 				rstv_loading_done();
 		}
 #endif
-		rstv_emu_run_frame(p1, 0, sys);
+		rstv_emu_run_frame(p1, p2, sys);
 		for (int k = 0; k < n_poke; k++)
 			MappedMemoryWriteByteNocache(poke_addr[k], poke_val[k]);
 		rstv_act = 9;

@@ -9,6 +9,7 @@
 enum {
 	RSTV_KEY_CROSS, RSTV_KEY_CIRCLE, RSTV_KEY_SQUARE, RSTV_KEY_TRIANGLE,
 	RSTV_KEY_L, RSTV_KEY_R, RSTV_KEY_SELECT, RSTV_KEY_START,
+	RSTV_KEY_L2, RSTV_KEY_R2, RSTV_KEY_L3, RSTV_KEY_R3, // (a controller's; settings before them: keyver < 2, None was 8)
 	RSTV_KEY_COUNT
 };
 #define RSTV_KEY_NONE RSTV_KEY_COUNT
@@ -36,6 +37,18 @@ enum { RSTV_TURBO_FAST, RSTV_TURBO_MEDIUM, RSTV_TURBO_SLOW, RSTV_TURBO_SPEED_COU
 // colour themes (ADR-210, as ReSys12 / ReiREM; Blue is the ReST-V default)
 enum { RSTV_THEME_RED, RSTV_THEME_BLUE, RSTV_THEME_GREEN, RSTV_THEME_PURPLE, RSTV_THEME_ORANGE, RSTV_THEME_GRAPHITE, RSTV_THEME_COUNT };
 
+#define RSTV_PROFILES 13 // re_pad's RE_PAD_PROFILES: the keys belong to a device (Vita, each kind of controller)
+#define RSTV_PORTS 2 // players with their own controls (Port 1 = 1P, Port 2 = 2P)
+// one player's controls (Controls > Port N Controls; RetroArch style)
+typedef struct {
+	int keymap[RSTV_ACT_COUNT]; // RSTV_KEY_* (buttons 3 and 4 may be RSTV_KEY_NONE)
+	int stick;         // RSTV_STICK_* (analog stick used as lever)
+	int turbo_key;     // Vita button that triggers turbo, RSTV_KEY_NONE = off
+	int turbo_btn;     // game button to turbo, 1..4
+	int turbo_speed;   // RSTV_TURBO_*
+	int combo[RSTV_KEY_COUNT];      // ADR-214: combo keys: combo[RSTV_KEY_*] = bit mask (1 << RSTV_KEY_*) of two keys it presses, 0 = normal
+} rstv_port;
+
 typedef struct {
 	int fps;           // FPS display
 	int aspect;        // RSTV_ASPECT_*
@@ -45,15 +58,12 @@ typedef struct {
 	int border;        // RSTV_BORDER_*
 	int border_color;  // RSTV_BCOL_*
 	int rotate;        // RSTV_ROT_*
-	int keymap[RSTV_ACT_COUNT]; // RSTV_KEY_* (buttons 3 and 4 may be RSTV_KEY_NONE)
-	int stick;         // RSTV_STICK_* (ReST-V: analog stick used as lever)
-	int turbo_key;     // Vita button that triggers turbo, RSTV_KEY_NONE = off
-	int turbo_btn;     // game button to turbo, 1..4
-	int turbo_speed;   // RSTV_TURBO_*
+	rstv_port port[RSTV_PROFILES]; // controls profiles: one per device (re_pad_profile), not per player
+	int pad_src[RSTV_PORTS]; // RE_PAD_SRC_* of each player's controller (global only)
+	int input_engine;  // RE_PAD_ENGINE_* (global only): Native or the bundled RePad plugin
 	int confirm;       // RSTV_CONFIRM_*
 	int list_filter;   // RSTV_LIST_*
 	int theme;         // RSTV_THEME_* (global)
-	int combo[6];      // ADR-214: combo keys: combo[RSTV_KEY_*] = bit mask (1 << RSTV_KEY_*) of two keys it presses, 0 = normal
 	int touch_keys;    // ADR-214: the touch screen buttons press their keys
 	int touch_show;    // the touch buttons are drawn over the game
 } rstv_settings;
@@ -64,7 +74,8 @@ extern int rstv_input_rot;
 // frames per turbo period (press + release): Fast 4, Medium 6, Slow 8 (same as Reirem)
 static inline int rstv_turbo_period(int speed) { return speed == 0 ? 4 : speed == 1 ? 6 : 8; }
 void rstv_settings_defaults(void);
-void rstv_settings_default_keys(void);
+void rstv_settings_default_keys(void);     // every port and the touch buttons
+void rstv_settings_default_port(int port); // one port's buttons, stick, turbo and combo keys
 void rstv_settings_load(void);
 void rstv_settings_save(void);
 uint32_t rstv_key_code(int key);       // RSTV_KEY_* -> SCE_CTRL_* (0 for RSTV_KEY_NONE)

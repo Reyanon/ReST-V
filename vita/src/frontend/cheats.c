@@ -122,6 +122,23 @@ void rstv_cheats_change(int i, int dir)
 	s_val[i] = ((s_val[i] + dir) % n + n) % n;
 }
 
+int rstv_cheats_values(int i)
+{
+	return i >= 0 && i < s_n ? s_act[i].nvals + 1 : 0;
+}
+
+const char *rstv_cheats_label(int i, int k)
+{
+	if (i < 0 || i >= s_n || k < 0 || k > s_act[i].nvals)
+		return "";
+	return k ? s_act[i].labels[k - 1] : "Off";
+}
+
+int rstv_cheats_current(int i)
+{
+	return i >= 0 && i < s_n ? s_val[i] : 0;
+}
+
 void rstv_cheats_frame(void)
 {
 	for (int i = 0; i < s_n; i++) {

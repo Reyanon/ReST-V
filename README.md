@@ -69,9 +69,12 @@ screen are simplified when that buys speed.
 - Board I/O, external palette and the protection chips of the System C2 sets.
 
 **Frontend**
-- Game list with System C / System C2 / ST-V tabs, a Playable / All / Favorites filter, smooth scrolling and a blue
-  RetroArch-like theme.
-- Save states (10 slots plus quick save), button mapping with turbo, analog stick as lever, cheats from cheat files.
+- Game list with System C / System C2 / ST-V tabs, a Playable / All / Favorites filter, smooth scrolling and six color
+  themes. *Select game* goes back to the list without restarting the app.
+- Two players: the Vita's own controls and external controllers (DualShock 3 / 4, DualSense, Switch Pro and others),
+  with keys bound by pressing them, per device. Turbo, combo keys and on-screen touch buttons.
+- Save states (10 slots plus quick save, written in the background), cheats from cheat files.
+- Update check from the GitHub releases, at start and from the options.
 - Display options: aspect ratio, screen rotation (vertical games such as Shienryu turn upright by themselves),
   filter, scanlines, border color or artwork.
 - PS button: opens and closes the menu; a double press goes to the home screen.
@@ -369,7 +372,7 @@ Files written by the emulator:
 | Page up / down | Left / Right |
 | Add / remove favorite | Square |
 | Filter: Playable / All / Favorites | SELECT |
-| Options (Display, Controls, Refresh ROM list) | START or PS |
+| Options (Display, Controls, Refresh ROM list, Check for updates) | START or PS |
 | About | Triangle |
 | Home screen | PS twice |
 
@@ -388,8 +391,8 @@ Options opened from the game list edit the global settings.
 | Exit | L + R + START |
 
 The in-game menu provides: Resume, Reset, Press TEST switch (BIOS menu), Save states (10 slots), Cheats (games that have a
-cheat file), Display (frame rate counter, aspect ratio, rotation, filter, scanlines, border), Controls (button mapping,
-turbo, analog stick), per-game settings and game selection. The menu opens again where SELECT + START or PS closed
+cheat file), Display (frame rate counter, aspect ratio, rotation, filter, scanlines, border, theme), Controls (players
+and devices, button mapping, turbo, combo keys, touch buttons), per-game settings and game selection. The menu opens again where SELECT + START or PS closed
 it. On an option with three or more values, the confirm button opens a window with all of them.
 
 **PS button.** The PS button belongs to ReST-V while it runs: one press opens or closes the menu (not while a game is
@@ -403,6 +406,29 @@ the directions turned to match.
 **Press TEST switch (BIOS menu).** Each use presses the board's TEST switch once: the first press opens the ST-V test
 menu (settings, bookkeeping, input and memory tests), the next one leaves it. In the test menu L is the SERVICE button
 (move the cursor) and R is the TEST button (enter).
+
+**Controls.** Each player (*1P Controller*, *2P Controller*; 2P shows when two or more devices are connected) has a
+*Device*: Auto, the Vita, or a controller. The buttons, the analog stick, turbo and combo keys belong to the device, so a
+DualShock 4 and the Vita each keep their own layout. On a button row, confirm and then press the button to use (the
+d-pad, PS or 5 seconds without a press cancels); *Set all controls* goes through every button in turn; Square sets a row
+to None where a row can be empty. L2 / R2 / L3 / R3 of a controller are keys of their own.
+
+**Input engine.** Controls > *Input engine* picks how controllers are read:
+- *Native* (default): the Vita's own controls and the controllers the system supports. Use this unless you need one of
+  the two below.
+- *RePad*: for Bluetooth pads the Vita does not support by itself, such as a Nintendo Switch Pro Controller or a
+  DualSense, and pads that pair as one of these. RePad is a small kernel plugin that comes with the app (`module/repad.skprx`) and is
+  loaded by it; pair the pad in Settings > Devices > Bluetooth Devices. It also makes a controller 2P on a handheld
+  Vita.
+- *VitaControl*: shown when the VitaControl plugin is installed. It is enough for one player (the controller acts as
+  the Vita's own controls), but it cannot give a second player.
+
+**Combo keys.** In Controls > *Combo keys*, a key presses two keys together, picked in two steps (first key, then
+second). Any of Square, Triangle, Cross, Circle, L, R, L2, R2, L3 and R3 can be a combo key or part of one.
+
+**Touch buttons.** Controls > *Touch controls* > *Edit touch layout*: drag on an empty spot to make a button, drag it
+to move it, drag an edge or corner to resize it, tap it to give it a key, a d-pad direction or a pair of keys (Combo),
+to duplicate it or to delete it. The buttons are drawn over the game unless *Show touch buttons* is off.
 
 **Turbo.** In Controls > Turbo, pick one *Turbo key* and the game button it fires (*Turbo button*), plus the speed
 (15, 10 or 7.5 presses per second). While the turbo key is held, that game button fires repeatedly.
@@ -458,6 +484,7 @@ recompiler and the HLE routines with the same hashes.
 src/core/      Yabause / YabaSanshiro subset: SH-2, SCU, VDP1/VDP2, SCSP, 68000, SMPC + ST-V I/O, EEPROM, ROM loader
 src/c2/        Sega System C / C2 core: 315-5313 VDP, YM3438 (ymfm), SN76489, uPD7759, protection
 vita/          PS Vita port: frontend, GPU renderer (sceGxm), platform code, LiveArea assets
+vita/repad/    RePad, the Bluetooth controller kernel plugin shipped in the VPK (MIT)
 tools/         Build scripts, desktop harness, game table generators, hash and audio checks
 ```
 
@@ -474,7 +501,8 @@ tools/         Build scripts, desktop harness, game table generators, hash and a
 
 **License.** ReST-V is distributed under the [GNU General Public License, version 3](LICENSE).
 - The Yabause / YabaSanshiro / Kronos code and the ReST-V code are GPL-2.0-or-later.
-- The MAME parts and ymfm are BSD-3-Clause, Musashi is MIT, JUnzip is public domain.
+- The MAME parts and ymfm are BSD-3-Clause, Musashi and RePad (`vita/repad`) are MIT, JUnzip is public domain,
+  mbedTLS (update check) is Apache-2.0.
 - vitaShaRK, linked into the Vita build, is LGPL-3.0, so the combined program and the release packages
   are distributed under GPL-3.0.
 

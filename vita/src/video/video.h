@@ -36,6 +36,12 @@ void rstv_video_menu(const char *const *lines, int n, int sel);
 // alpha blended. t NULL removes that layer
 void rstv_video_layer(int slot, struct GxTex *t, int x, int y, int w, int h);
 
+// strips drawn right over slot 0 (the game list rows: drawn once each, moved by the GPU while the list scrolls; ReiREM's
+// way): the top-left w x h of texture t at (x, y), cut to rows y0..y1 of the screen. n 0 removes them
+#define RSTV_NSTRIP 24
+typedef struct { const struct GxTex *t; int x, y, w, h; } RstvStrip;
+void rstv_video_strips(const RstvStrip *s, int n, int y0, int y1);
+
 // screen size: 0 = 4:3 (fit height), 1 = integer scale (pixel exact), 2 = full screen. filter: 0 = sharp (point), 1 = smooth (bilinear)
 void rstv_video_set_mode(int scale, int filter);
 // ADR-190: the game picture turned clockwise by 0, 90, 180 or 270 degrees
