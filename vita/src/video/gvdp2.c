@@ -29,6 +29,7 @@
 #include "stv.h"
 
 #include "platform/log.h"
+#include "platform/cpu3.h"
 #include "video/video.h"
 #include "video/gx.h"
 #include "video/nbgq.h"
@@ -4667,7 +4668,7 @@ int gvdp2_init(void)
 		s_cmp_sema = sceKernelCreateSema("rstv_shc", 0, 0, 1 << 20, NULL);
 		// ADR-185: on CPU3, not CPU1: there the spinning sound thread starved the compiler (11 ms -> 300-600 ms) while it
 		// held locks the prep thread's GPU submit needed (submit stalls of 35-330 ms when a new variant was queued)
-		int cpu = 0x80000;
+		int cpu = rstv_cpu3_mask(SCE_KERNEL_CPU_MASK_USER_2); // (ADR-218: CPU2 when CPU3 is closed; the submit no longer waits on it)
 #ifdef RSTV_DEBUG_TOOLS
 		{ FILE *ff = fopen("ux0:data/restv/shccpu1", "rb"); if (ff) { fclose(ff); cpu = SCE_KERNEL_CPU_MASK_USER_1; } } // A/B test
 #endif

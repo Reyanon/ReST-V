@@ -50,8 +50,9 @@ static void *thread_entry(void *p)
 	StartInfo *si = (StartInfo *)p;
 #ifdef __vita__
 	extern int rstv_rax_thread_cpu;
+	extern int rstv_cpu3_usable(void); // (vita/src/platform/cpu3.c, ADR-218)
 	int mask = (si->id == YAB_THREAD_SCSP) ? SCE_KERNEL_CPU_MASK_USER_1 :
-		(si->id == YAB_THREAD_SCSPDSP) ? 0x80000 :                             // ADR-158: CPU3 (no SDK constant)
+		(si->id == YAB_THREAD_SCSPDSP) ? (rstv_cpu3_usable() ? 0x80000 : SCE_KERNEL_CPU_MASK_USER_2) : // ADR-158 / 218: CPU3, or CPU2 (dspcpu2)
 		(si->id == YAB_THREAD_RAX) ? (rstv_rax_thread_cpu == 3 ? 0x80000 : rstv_rax_thread_cpu == 4 ?
 			SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_1 : rstv_rax_thread_cpu == 5 ?
 			SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2 : rstv_rax_thread_cpu == 6 ?

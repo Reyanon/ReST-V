@@ -314,6 +314,8 @@ Requirements:
 - The runtime shader compiler `ur0:data/external/libshacccg.suprx`. ReST-V compiles its GPU shaders on the
   device, and games cannot be drawn without it. If it is missing, extract it with
   [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) or copy it from another homebrew setup guide.
+- No overclock or core unlock plugin. The app sets 444 MHz by itself and opens the Vita's fourth CPU core on its own
+  where it can; where it cannot, it runs on the three cores that are always open.
 
 **Install the VPK**
 

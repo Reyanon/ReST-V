@@ -57,6 +57,7 @@ add_executable(${PROJECT_NAME}
   src/video/rbgq.c
   src/video/v1gpu.c
   src/platform/clock.c
+  src/platform/cpu3.c
   src/platform/jit.c
   src/platform/log.c
 )
@@ -91,7 +92,8 @@ endif()
 add_executable(restv_kctrl kmod/restv_kctrl.c)
 set_target_properties(restv_kctrl PROPERTIES LINK_FLAGS "-nostdlib")
 target_compile_options(restv_kctrl PRIVATE -fno-builtin)
-target_link_libraries(restv_kctrl SceCtrlForDriver_stub SceThreadmgrForDriver_stub SceIofilemgrForDriver_stub SceSysmemForDriver_stub)
+target_link_libraries(restv_kctrl SceCtrlForDriver_stub SceThreadmgrForDriver_stub SceIofilemgrForDriver_stub SceSysmemForDriver_stub
+  taihenForKernel_stub taihenModuleUtils_stub) # (ADR-218: the CPU3 unlock hook)
 # (vita_create_self splits its flags on spaces, so the export config path cannot be passed through it)
 add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
   COMMAND vita-elf-create -e "${CMAKE_SOURCE_DIR}/kmod/exports.yml" $<TARGET_FILE:restv_kctrl> "${CMAKE_BINARY_DIR}/restv_kctrl.velf"
@@ -100,7 +102,7 @@ add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/restv_kctrl.skprx"
   VERBATIM)
 add_custom_target(kctrl_skprx ALL DEPENDS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx")
 set(RSTV_KSTUB_DIR "${CMAKE_BINARY_DIR}/kctrl_stubs")
-set(RSTV_KSTUB "${RSTV_KSTUB_DIR}/librestv_kctrl_v7_stub_weak.a")
+set(RSTV_KSTUB "${RSTV_KSTUB_DIR}/librestv_kctrl_v8_stub_weak.a")
 add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/kctrl.yml"
   COMMAND vita-elf-export kernel $<TARGET_FILE:restv_kctrl> "${CMAKE_SOURCE_DIR}/kmod/exports.yml" "${CMAKE_BINARY_DIR}/kctrl.yml"
   DEPENDS restv_kctrl "${CMAKE_SOURCE_DIR}/kmod/exports.yml"

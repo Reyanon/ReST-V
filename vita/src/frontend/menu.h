@@ -111,6 +111,8 @@ typedef enum {
 void rstv_menu_init(const char *set, const char *title, int buttons); // after the game is known (buttons = number of game buttons)
 int rstv_menu_buttons(void); // button count of the current game (2-4)
 void rstv_kctrl_init(int restarted); // kernel helper for the PS button (may restart the app once after boot)
+void rstv_kctrl_cpu3(int hook);      // ADR-218: open CPU3 (hook 1) or take over an earlier run's unlock (0)
+void rstv_kctrl_cpu3_release(void);  // give the unlock back (before exit / relaunch)
 int rstv_menu_should_open(uint32_t buttons);              // 1 at the moment SELECT+START or PS is pressed
 rstv_menu_result rstv_menu_update(uint32_t buttons);
 void rstv_menu_draw(void);  // redraws only when changed

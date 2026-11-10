@@ -37,6 +37,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include <psp2/appmgr.h>
 #include "rstv_vdp1rec.h"
 #include "platform/clock.h"
+#include "platform/cpu3.h"
 #include "platform/jit.h"
 #include "platform/log.h"
 #include "platform/timer.h"
@@ -76,6 +77,7 @@ static size_t s_st_n;
 static char s_st_path[160];
 static volatile int s_st_pending;
 static SceUID s_writer_wake = -1;
+static int s_writer_ok; // the writer thread runs (ADR-218: else saves are written on the spot, never left pending)
 // ADR-090: the exit request file (ux0:data/restv/exit) is also checked by this thread. The main loop called sceIoGetstat every 120 frames
 // and stalled 0.5-1.8 s when that overlapped a card write (g2 f5820·f6060, underruns 85·320)
 static volatile int s_exit_req;
@@ -156,9 +158,12 @@ static void writer_start(void)
 		return;
 	started = 1;
 	s_writer_wake = sceKernelCreateSema("rstv_writer", 0, 0, 1, NULL);
-	SceUID t = sceKernelCreateThread("rstv_writer", async_writer_thread, 120, 0x4000, 0, 0x80000, NULL); // CPU3 (ADR-147)
-	if (t >= 0)
-		sceKernelStartThread(t, 0, NULL);
+	SceUID t = sceKernelCreateThread("rstv_writer", async_writer_thread, 120, 0x4000, 0, rstv_cpu3_mask(0), NULL); // CPU3 (ADR-147;
+	// ADR-218: any open core when CPU3 is closed: refused there, the thread was never made, save states never written and
+	// the next save waited for ever)
+	s_writer_ok = t >= 0 && sceKernelStartThread(t, 0, NULL) >= 0;
+	if (!s_writer_ok)
+		RSTV_LOG("writer: no thread (%08x): saves are written at once", (unsigned)t);
 }
 // ADR-212: a save state the writer thread has not finished yet (before a load, another save, a game switch, exit)
 static void state_write_wait(void)
@@ -169,6 +174,9 @@ static void state_write_wait(void)
 static int state_save_async(const char *path)
 {
 	state_write_wait();
+	writer_start();
+	if (!s_writer_ok)
+		return rstv_state_save(path); // (ADR-218)
 	char *b = NULL;
 	size_t n = 0;
 	if (rstv_state_save_mem(&b, &n) != 0)
@@ -188,6 +196,11 @@ static void eeprom_save_async(const char *path)
 	if (s_ee_pending)
 		return; // previous save still pending: try next time
 	writer_start();
+	if (!s_writer_ok) { // (ADR-218: no thread to hand it to)
+		eeprom_save(path);
+		eeprom_clear_dirty();
+		return;
+	}
 	snprintf(s_ee_path, sizeof(s_ee_path), "%s", path);
 	s_ee_n = eeprom_size() < (int)sizeof(s_ee_buf) ? eeprom_size() : (int)sizeof(s_ee_buf);
 	memcpy(s_ee_buf, eeprom_data(), (size_t)s_ee_n);
@@ -831,7 +844,7 @@ static int power_tick_thread(SceSize args, void *argp)
 int main(int argc, char *argv[])
 {
 	{
-		SceUID pt = sceKernelCreateThread("rstv_power", power_tick_thread, 191, 0x1000, 0, 0x80000, NULL); // CPU3, low priority
+		SceUID pt = sceKernelCreateThread("rstv_power", power_tick_thread, 191, 0x1000, 0, rstv_cpu3_mask(0), NULL); // CPU3, low priority (ADR-218)
 		if (pt >= 0)
 			sceKernelStartThread(pt, 0, NULL);
 	}
@@ -847,6 +860,21 @@ int main(int argc, char *argv[])
 		for (int i = 0; i < argc; i++)
 			restarted |= argv[i] && !strcmp(argv[i], "kctrl");
 		rstv_kctrl_init(restarted);
+	}
+	{ // ADR-218 (as ReSys12): CPU3 opened by the kernel helper where its code is known, unless a plugin or an earlier run
+	  // already has, or ux0:data/restv/nocpu3 turns that off (the way out if the hook misbehaves). Threads meant for CPU3
+	  // go to the open cores when it stays closed (rstv_cpu3_mask)
+		const int open = rstv_cpu3_usable(), off = file_exists(DATA_DIR "/nocpu3");
+		if (!off)
+			rstv_kctrl_cpu3(!open);
+		else
+			RSTV_LOG("cpu3: unlock off (nocpu3)");
+		if (!open && !off) {
+			rstv_cpu3_recheck();
+			if (!rstv_cpu3_usable())
+				rstv_kctrl_cpu3_release(); // (hooked and still closed: nothing left in the system)
+		}
+		RSTV_LOG("cpu3 %s", rstv_cpu3_usable() ? "open" : "closed");
 	}
 	if (file_exists(DATA_DIR "/coretest"))
 		rstv_core_test(); // before any other thread exists
@@ -980,7 +1008,8 @@ next_game:
 	rstv_scsp_lag = !file_exists(DATA_DIR "/nosndlag");
 	{ // ADR-158: SCSP DSP on CPU3, one batch behind the slots (ux0:data/restv/nodspthr = on the sound thread)
 		extern int rstv_scsp_dsp_thread;
-		rstv_scsp_dsp_thread = !file_exists(DATA_DIR "/nodspthr");
+		// ADR-218: only with CPU3 open (else on the sound thread as before; ux0:data/restv/dspcpu2 = a thread on CPU2)
+		rstv_scsp_dsp_thread = !file_exists(DATA_DIR "/nodspthr") && (rstv_cpu3_usable() || file_exists(DATA_DIR "/dspcpu2"));
 	}
 	// run the 9 decilines before HBlankIN as one SH-2 slice (1/5 the calls). Disabled if ux0:data/restv/nomerge exists
 	extern int rstv_deciline_merge;
@@ -1835,6 +1864,7 @@ out:
 	rstv_audio_fini();
 	rstv_video_shutdown();
 	rstv_log_shutdown();
+	rstv_kctrl_cpu3_release(); // (ADR-218)
 	if (s_quit_mode == 2 || s_exit_next) { // System C / C2 menu "Select game" / measuring tools: relaunch the app
 		static char *const av[] = { "list", NULL }; // (back to the list: no update check, ADR-209)
 		sceAppMgrLoadExec("app0:eboot.bin", s_quit_mode == 2 ? av : NULL, NULL);

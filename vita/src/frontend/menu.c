@@ -14,6 +14,7 @@
 #include <taihen.h>
 
 #include "restv_kctrl.h"
+#include "platform/cpu3.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1193,6 +1194,7 @@ static int s_keep_place, s_pop, s_pop_sel; // menu closed with SELECT+START (kee
 #define RSTV_KCTRL_LOADED 0x8002D013u // taiLoadStartKernelModule: already loaded (device)
 static int s_kctrl = -1;    // kernel helper usable (module/restv_kctrl.skprx): 1 yes, -1 no
 static int s_ps_locked;     // the system's PS button handling locked by the app
+static int s_cpu3_hooked;   // ADR-218: the kernel helper's CPU3 unlock is this run's to give back
 static unsigned s_ps_one, s_ps_two; // helper counts already acted on (single, double presses)
 static uint64_t s_ps_home_t; // when a double press sent the app home (lock taken again a while later)
 static void ps_lock(int on)
@@ -1214,7 +1216,7 @@ static void ps_lock(int on)
 void rstv_kctrl_init(int restarted)
 {
 	const SceUID m = taiLoadStartKernelModule("ux0:app/RSTV00001/module/restv_kctrl.skprx", 0, NULL, 0); // (the kernel cannot open app0:)
-	// (the module name has a version, restv_kctrl_v7: a module of an older build may still be loaded until reboot)
+	// (the module name has a version, restv_kctrl_v8: a module of an older build may still be loaded until reboot)
 	if (m >= 0 && !restarted) {
 		static char *const av[] = { "kctrl", NULL };
 		sceAppMgrLoadExec("app0:eboot.bin", av, NULL);
@@ -1226,6 +1228,30 @@ void rstv_kctrl_init(int restarted)
 	}
 }
 int rstv_kctrl_ready(void) { return s_kctrl > 0; } // (ADR-209: the update installs through it)
+// ADR-218: CPU3 for the app's threads, by the kernel helper where the code is the known one. hook 0 (already open): only
+// looks whether the open one is this helper's, left by a run that ended without its release, and takes it over
+void rstv_kctrl_cpu3(int hook)
+{
+	if (s_kctrl <= 0) {
+		RSTV_LOG("cpu3: unlock not tried (no kernel helper)");
+		return;
+	}
+	unsigned int info[4] = { 0, 0, 0, 0 };
+	const int r = rstvKCtrlCpu3(hook ? 1 : -1, info);
+	s_cpu3_hooked = info[3] == 1;
+	RSTV_LOG("cpu3: unlock %d (%s; NID %08x, code %08x %08x)", r,
+		!hook ? (s_cpu3_hooked ? "already open, ours taken over" : "already open, not ours") : r == 1 ? "hooked" :
+		r == 2 ? "not the known code" : r == 0 ? "not hooked" : "failed", info[0], info[1], info[2]);
+	(void)r;
+}
+// the CPU3 unlock is system wide: given back before the app exits or relaunches itself
+void rstv_kctrl_cpu3_release(void)
+{
+	if (s_kctrl > 0 && s_cpu3_hooked) {
+		rstvKCtrlCpu3(0, NULL);
+		s_cpu3_hooked = 0;
+	}
+}
 // call every frame anywhere: 1 once per single PS press, when PS is let go (owner: PS + START takes a screenshot, the
 // menu must not cover it: START while PS is held drops that press); a double press goes home
 static int s_ps_pending; // a single press counted, PS still held
@@ -3031,7 +3057,7 @@ static int loading_prep_thread(SceSize args, void *argp)
 }
 void rstv_loading_prepare(void)
 {
-	s_ld_thr = sceKernelCreateThread("rstv_ldprep", loading_prep_thread, 0x10000100 + 20, 0x10000, 0, 0x80000, NULL); // CPU3
+	s_ld_thr = sceKernelCreateThread("rstv_ldprep", loading_prep_thread, 0x10000100 + 20, 0x10000, 0, rstv_cpu3_mask(0), NULL); // CPU3 (ADR-218)
 	if (s_ld_thr >= 0 && sceKernelStartThread(s_ld_thr, 0, NULL) < 0) {
 		sceKernelDeleteThread(s_ld_thr);
 		s_ld_thr = -1;
@@ -3578,6 +3604,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				}
 				sceIoRemove(DATA_DIR "/exit");
 				RSTV_LOG("exit: request in the game list");
+				rstv_kctrl_cpu3_release();
 				if (xc == 'n') // "next": relaunch (autostart picks the game)
 					sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
 				sceKernelExitProcess(0);

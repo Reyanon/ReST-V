@@ -1,4 +1,4 @@
-restv_kctrl_v7:
+restv_kctrl_v8:
   attributes: 0
   version:
     major: 1
@@ -7,9 +7,10 @@ restv_kctrl_v7:
     start: module_start
     stop: module_stop
   modules:
-    RstvKCtrlV7:
+    RstvKCtrlV8:
       syscall: true
       functions:
         - rstvKCtrlPsState
         - rstvKCtrlGoHome
         - rstvKCtrlInstallOnExit
+        - rstvKCtrlCpu3

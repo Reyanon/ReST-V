@@ -12,6 +12,7 @@
 #include <png.h>
 
 #include "platform/log.h"
+#include "platform/cpu3.h"
 #include "video/gx.h"
 
 #define NUM_TEX 3
@@ -588,7 +589,7 @@ static int preload_thread(SceSize args, void *argp)
 }
 void rstv_video_preload(void)
 {
-	s_pre_thr = sceKernelCreateThread("rstv_preload", preload_thread, 0x10000100 + 20, 0x40000, 0, 0x80000, NULL); // CPU3
+	s_pre_thr = sceKernelCreateThread("rstv_preload", preload_thread, 0x10000100 + 20, 0x40000, 0, rstv_cpu3_mask(0), NULL); // CPU3 (ADR-218)
 	if (s_pre_thr >= 0 && sceKernelStartThread(s_pre_thr, 0, NULL) < 0) {
 		sceKernelDeleteThread(s_pre_thr);
 		s_pre_thr = -1;

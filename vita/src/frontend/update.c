@@ -33,6 +33,7 @@
 #include "platform/log.h"
 #include "rstv_version.h"
 #include "restv_kctrl.h"
+#include "platform/cpu3.h"
 extern int rstv_kctrl_ready(void);
 
 #define DATA_DIR "ux0:data/restv"
@@ -537,7 +538,7 @@ void rstv_update_check_start(void)
 		}
 		fclose(tf);
 	}
-	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, 0x80000, NULL);
+	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, rstv_cpu3_mask(0), NULL);
 	if (t >= 0) {
 		s_state = RSTV_UPD_CHECKING;
 		sceKernelStartThread(t, 0, NULL);
@@ -553,7 +554,7 @@ void rstv_update_check_now(void)
 	s_manual = 1;
 	s_ready = 0;
 	s_state = RSTV_UPD_CHECKING;
-	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, 0x80000, NULL);
+	const SceUID t = sceKernelCreateThread("rstv_update", check_thread, 0x10000100 + 30, 0x10000, 0, rstv_cpu3_mask(0), NULL);
 	if (t < 0 || sceKernelStartThread(t, 0, NULL) < 0)
 		s_state = RSTV_UPD_FAILED;
 }
@@ -710,6 +711,8 @@ const char *rstv_update_install(void (*progress)(const char *stage, int percent)
 	RSTV_LOG("update: %s unpacked, the kernel helper installs it after exit", s_tag);
 	rstv_log_flush();
 	rstvKCtrlInstallOnExit();
+	extern void rstv_kctrl_cpu3_release(void);
+	rstv_kctrl_cpu3_release(); // (ADR-218)
 	for (int i = 5; i > 0; i--) { // (percent -2: the stage text alone)
 		char t[96];
 		snprintf(t, sizeof(t), "ReST-V closes in %d s to install %s. Start it again then.", i, s_tag);
