@@ -212,6 +212,11 @@ UiCanvas *ui_canvas(int slot, int x, int y, int w, int h)
 	c->w = w;
 	c->h = h;
 	c->px = (uint32_t *)calloc((size_t)w * h, 4);
+	if (!c->px) { // (out of memory: an empty canvas, drawing on it does nothing instead of writing through NULL)
+		RSTV_LOG("ui: canvas slot %d %dx%d: no memory", slot, w, h);
+		c->w = c->h = 0;
+		h = 0;
+	}
 	c->cy0 = 0;
 	c->cy1 = h;
 	for (int i = 0; i < NBUF; i++) {

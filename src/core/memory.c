@@ -417,10 +417,19 @@ static void rstv_qlogr(u32 addr, u32 val, int size)
 #define RSTV_QLOG(a, v)
 #define RSTV_QLOGR(a, v, n)
 #endif
+#if !defined(__vita__)
+/* harness (Ari64 master check): a store the interpreter makes again that differs from what is in RAM */
+extern int ari_chk_cmp;
+extern void ari_chk_store_diff(u32 addr, int size, u32 old, u32 val);
+#define ARI_CHK_STORE(a, sz, old, v) do { if (ari_chk_cmp && (u32)(old) != (u32)(v)) ari_chk_store_diff((a), (sz), (old), (v)); } while (0)
+#else
+#define ARI_CHK_STORE(a, sz, old, v) do { } while (0)
+#endif
 static void FASTCALL HighWramMemoryWriteByte(u32 addr, u8 val)
 {
    RSTV_QLOGR(addr, val, 1);
    if (rstv_tier_wnotify) rstv_tier_notify(addr, 1); /* ADR-044 */
+   ARI_CHK_STORE(addr, 1, T2ReadByte(HighWram, addr & 0xFFFFF), val);
    T2WriteByte(HighWram, addr & 0xFFFFF, val);
 }
 
@@ -430,6 +439,7 @@ static void FASTCALL HighWramMemoryWriteWord(u32 addr, u16 val)
 {
    RSTV_QLOGR(addr, val, 2);
    if (rstv_tier_wnotify) rstv_tier_notify(addr, 2); /* ADR-044 */
+   ARI_CHK_STORE(addr, 2, T2ReadWord(HighWram, addr & 0xFFFFF), val);
    T2WriteWord(HighWram, addr & 0xFFFFF, val);
 }
 
@@ -440,6 +450,7 @@ static void FASTCALL HighWramMemoryWriteLong(u32 addr, u32 val)
    RSTV_QLOG(addr, val);
    RSTV_QLOGR(addr, val, 4);
    if (rstv_tier_wnotify) rstv_tier_notify(addr, 4); /* ADR-044 */
+   ARI_CHK_STORE(addr, 4, T2ReadLong(HighWram, addr & 0xFFFFF), val);
    T2WriteLong(HighWram, addr & 0xFFFFF, val);
 }
 

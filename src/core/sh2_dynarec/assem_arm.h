@@ -33,13 +33,17 @@
 // Note: FP is set to &dynarec_local when executing generated code.
 // Thus the local variables are actually global and not on the stack.
 
-extern u8 sh2_dynarec_target[16777216];
 extern u32 memory_map[1048576]; // 32-bit
 
-//#define BASE_ADDR 0x6000000 // Code generator target address
-#define BASE_ADDR ((u32)&sh2_dynarec_target) // Code generator target address
-#define TARGET_SIZE_2 24 // 2^24 = 16 megabytes
-//#define TARGET_SIZE_2 25 // 2^25 = 32 megabytes
+// ReST-V (ADR-222): the code buffer is a variable. Vita: the VM block of rstv_jit (rstv_jit_code_alloc), cache sync
+// through it; elsewhere (ARM harness) a mapping at 0x90000000, so pointers have the top bit set as on the Vita
+extern u8 *ari_code_base;
+#define BASE_ADDR ((u32)ari_code_base)
+#define TARGET_SIZE_2 23 // 8 MB of the Vita's 16 MB code region; devmiyax is not in the same process then (ADR-229)
+#ifdef __vita__
+#define __clear_cache ari_clear_cache
+void ari_clear_cache(void *start, void *end);
+#endif
 
 #ifdef ANDROID
 #define __clear_cache clear_cache

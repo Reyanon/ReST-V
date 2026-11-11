@@ -36,6 +36,7 @@ set(RSTV_ARM_MHZ 444 CACHE STRING "ARM clock to request at startup")
 
 # Emu core (same defines as the PC harness). Vita includes the SH-2 ARMv7 recompiler (ADR-010)
 option(RSTV_DYNAREC "SH-2 dynamic recompiler" ON)
+option(RSTV_ARI64 "Ari64 SH-2 recompiler for the sets listed in emu.c (ADR-228)" ON)
 include(${RSTV_ROOT}/src/core/core.cmake)
 
 add_executable(${PROJECT_NAME}
@@ -46,11 +47,14 @@ add_executable(${PROJECT_NAME}
   src/frontend/cheats.c
   src/frontend/update.c
   src/frontend/touch.c
+  src/frontend/ime.c
+  src/frontend/avsnap.c
   src/common/re_pad.c
   src/frontend/emu.c
   src/frontend/audio.c
   src/frontend/resample.c
   src/video/gx.c
+  src/video/neon.c
   src/video/video_gxm.c
   src/video/gvdp2.c
   src/video/nbgq.c
@@ -148,6 +152,7 @@ target_link_libraries(${PROJECT_NAME}
   SceIme_stub
   SceAudio_stub
   SceSysmodule_stub
+  SceAvPlayer_stub
   ScePgf_stub
   SceCtrl_stub
   SceTouch_stub

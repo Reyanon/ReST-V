@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <psp2/io/stat.h>
 
 #include "cdbase.h"
 #include "cs0.h"
@@ -23,7 +24,10 @@
 #include "video/video.h"
 
 // ---- core list ----
-#ifdef RSTV_DYNAREC
+#if defined(RSTV_DYNAREC) && defined(RSTV_ARI64)
+extern SH2Interface_struct SH2Dyn, SH2Dynarec;
+SH2Interface_struct *SH2CoreList[] = { &SH2Interpreter, &SH2Dyn, &SH2Dynarec, NULL };
+#elif defined(RSTV_DYNAREC)
 extern SH2Interface_struct SH2Dyn;
 SH2Interface_struct *SH2CoreList[] = { &SH2Interpreter, &SH2Dyn, NULL };
 #else
@@ -113,6 +117,28 @@ void YuiSwapBuffers(void)
 	rstv_video_frame_end();
 }
 
+// ADR-228: Ari64 only for the sets where it was measured faster and checked (the rest keep devmiyax, which already
+// runs them at 60 fps): ux0:data/restv/ari64 = every set (test), noari64 = none
+int rstv_emu_uses_ari64(const char *romset)
+{
+#if defined(RSTV_DYNAREC) && defined(RSTV_ARI64)
+	static const char *const ari_sets[] = { "dfeverg", "thunt" }; // (cotton2 / cottonbm back on devmiyax: Ari64 compile stutter, ADR-229)
+	SceIoStat st;
+	int ari = 0;
+	for (unsigned k = 0; k < sizeof(ari_sets) / sizeof(ari_sets[0]); k++)
+		if (!strcmp(romset, ari_sets[k]))
+			ari = 1;
+	if (sceIoGetstat("ux0:data/restv/ari64", &st) >= 0)
+		ari = 1;
+	if (sceIoGetstat("ux0:data/restv/noari64", &st) >= 0)
+		ari = 0;
+	return ari;
+#else
+	(void)romset;
+	return 0;
+#endif
+}
+
 int rstv_emu_init(const char *rom_dir, const char *romset, int use_dynarec, char *err, int errlen)
 {
 	yabauseinit_struct yinit;
@@ -122,6 +148,30 @@ int rstv_emu_init(const char *rom_dir, const char *romset, int use_dynarec, char
 #ifdef RSTV_DYNAREC
 	if (use_dynarec)
 		yinit.sh2coretype = 3; // SH2CORE_DYNAMIC (devmiyax)
+#ifdef RSTV_ARI64
+	{ // ADR-222 trial: ux0:data/restv/ari64 = the Ari64 recompiler instead
+		SceIoStat st;
+		int ari = rstv_emu_uses_ari64(romset);
+		{ // (not enough code memory left for Ari64 in this process: devmiyax; main.c restarts the app first, ADR-229)
+			extern unsigned char *ari_code_base;
+			extern size_t rstv_jit_code_avail(void);
+			if (ari && !ari_code_base && rstv_jit_code_avail() < (8u << 20))
+				ari = 0;
+		}
+		if (use_dynarec && ari)
+			yinit.sh2coretype = 2;
+		extern int ari_chkm_on; // (diag: the master block check, see sh2_dynarec.c ari_chk_master)
+		ari_chkm_on = sceIoGetstat("ux0:data/restv/arichkm", &st) >= 0;
+		extern int ari_nolit;
+		ari_nolit = sceIoGetstat("ux0:data/restv/arinolit", &st) >= 0;
+		extern int ari_slaveint;
+		ari_slaveint = sceIoGetstat("ux0:data/restv/arislaveint", &st) >= 0;
+		extern int ari_chks_on;
+		ari_chks_on = sceIoGetstat("ux0:data/restv/arichks", &st) >= 0;
+		extern int ari_noidle_s;
+		ari_noidle_s = sceIoGetstat("ux0:data/restv/arinosidle", &st) >= 0;
+	}
+#endif
 #else
 	(void)use_dynarec;
 #endif
@@ -161,7 +211,7 @@ void rstv_emu_shutdown(void)
 	rstv_rax_quiesce();
 }
 
-void rstv_emu_run_frame(uint8_t p1, uint8_t p2, uint8_t system)
+void rstv_emu_run_frame(uint16_t p1, uint16_t p2, uint8_t system)
 {
 	extern void rstv_v1watch_frame(void);
 	StvIoSetInputs(p1, p2, system);

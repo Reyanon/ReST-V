@@ -42,7 +42,9 @@ typedef struct GxParam {
 
 enum { GX_RGBA8, GX_L8 };
 #define GX_CDRAM 0x100 // add to fmt to place the texture in CDRAM (video memory)
-enum { GX_BLEND_NONE, GX_BLEND_ALPHA, GX_BLEND_PREMUL }; // PREMUL: premultiplied alpha (src + dst * (1 - a))
+#define GX_NOCLEAR 0x200 // add to fmt: no CPU clear (ADR-220: a 2048x512 plane took ~20 ms to clear in GPU memory; the
+                          // owner draws every texel it reads first)
+enum { GX_BLEND_NONE, GX_BLEND_ALPHA, GX_BLEND_PREMUL, GX_BLEND_ADD }; // PREMUL: premultiplied alpha (src + dst * (1 - a)); ADD: src + dst
 
 int gx_init(int vsync);
 void gx_shutdown(void);
@@ -72,6 +74,8 @@ void gx_frame_begin(void);
 void gx_begin(GxTex *target);  // NULL = back buffer of the screen (960x544)
 void gx_end(void);
 void gx_swap(void);
+void gx_dialog_update(void); // (a system dialog over the frame: between gx_end and gx_swap)
+void gx_dump_front(const char *path); // (debug builds: the last shown frame as a ppm)
 void gx_finish(void);
 // serialize per scene when main and worker threads share GXM (ADR-029)
 void gx_lock(void);

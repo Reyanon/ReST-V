@@ -459,10 +459,27 @@ void re_pad_poll(void)
 			r = sceCtrlPeekBufferPositive(0, d, 1); // (the handheld's own L / R; plugins that add a controller to port 0)
 		else
 			r = sceCtrlPeekBufferPositiveExt2(i, d, 1);
+#ifdef RSTV_DEBUG_TOOLS
+		{ // (test: frontend's padtest replaces this port's raw read, before the controller buttons are folded)
+			extern int rstv_padtest(int port, SceCtrlData *d);
+			if (rstv_padtest(i, d))
+				r = 1;
+		}
+#endif
 		if (r < 0)
 			clear(d);
 		else if (i || s_tv)
 			d->buttons = fold(d->buttons);
+		else if (d->buttons & (SCE_CTRL_L3 | SCE_CTRL_R3)) {
+			// (the handheld's port 0: a controller a plugin adds there gives its stick clicks as L3 / R3; the Vita has none.
+			// As their own keys, as on the other ports. L2 / R2 there are the Vita's L / R bits and cannot be told apart)
+			const uint32_t lr = d->buttons & (SCE_CTRL_L3 | SCE_CTRL_R3);
+			d->buttons &= ~lr;
+			if (lr & SCE_CTRL_L3)
+				d->buttons |= RE_PAD_L3;
+			if (lr & SCE_CTRL_R3)
+				d->buttons |= RE_PAD_R3;
+		}
 	}
 }
 

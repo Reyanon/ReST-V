@@ -350,6 +350,27 @@ const StvGameInfo *STVFindGame(const char *romset)
 	return g ? &g->info : NULL;
 }
 
+// ADR-219: sets whose button wiring is not MAME's "stv" (MAME stv.cpp GAME lines: input stv6b / batmanfr). The others
+// are "stv" (4 buttons) or have their own panel (mahjong, hopper, critcrsh: STV_IO_*)
+static const struct { const char *set; int layout, buttons; } s_btn_sets[] = {
+	{ "astrass", STV_BTN_6B, 6 }, { "elandore", STV_BTN_6B, 6 }, { "ffreveng", STV_BTN_6B, 6 },
+	{ "ffrevng10", STV_BTN_6B, 6 }, { "gaxeduel", STV_BTN_6B, 6 }, { "groovef", STV_BTN_6B, 6 },
+	{ "suikoenb", STV_BTN_6B, 6 }, { "batmanfr", STV_BTN_BATMAN, 3 },
+};
+static int btn_set(const char *romset)
+{
+	for (int i = 0; romset && i < (int)(sizeof(s_btn_sets) / sizeof(s_btn_sets[0])); i++)
+		if (!strcmp(romset, s_btn_sets[i].set))
+			return i;
+	return -1;
+}
+int STVGameButtons(const char *romset)
+{
+	const StvGame *g = find_game(romset);
+	const int i = btn_set(romset);
+	return i >= 0 ? s_btn_sets[i].buttons : g && g->info.buttons ? (int)g->info.buttons : 4;
+}
+
 #include "rstv_zip.h"
 
 // ---- loading ---------------------------------------------------------------
@@ -584,6 +605,10 @@ int STVLoad(const char *rom_dir, const char *romset, char *err, int errlen)
 		prot_init(g->key5881);
 	eeprom_start(have_nv ? nv : NULL);
 	StvIoSetType(g->io);
+	{
+		const int b = btn_set(romset);
+		StvIoSetButtons(b >= 0 ? s_btn_sets[b].layout : STV_BTN_STD);
+	}
 	stv_current_game = &g->info;
 	rax_load(rom_dir, g);
 	{

@@ -62,7 +62,10 @@ static void vdp2_stats_frame(void)
 #include "yui.h"
 
 // ---- core lists (defined by the frontend) ----
-#ifdef RSTV_DYNAREC
+#if defined(RSTV_DYNAREC) && defined(RSTV_ARI64)
+extern SH2Interface_struct SH2Dyn, SH2Dynarec;
+SH2Interface_struct *SH2CoreList[] = { &SH2Interpreter, &SH2Dyn, &SH2Dynarec, NULL };
+#elif defined(RSTV_DYNAREC)
 extern SH2Interface_struct SH2Dyn;
 SH2Interface_struct *SH2CoreList[] = { &SH2Interpreter, &SH2Dyn, NULL };
 #else
@@ -298,6 +301,8 @@ int main(int argc, char **argv)
 				rstv_hle_on = 0;
 			{ extern int rstv_hle_redetect; if (getenv("RSTV_NOREDETECT")) rstv_hle_redetect = 0; } // ADR-198 A/B
 			{ extern int rstv_lzb_off; if (getenv("RSTV_NOLZB")) rstv_lzb_off = 1; }
+			{ extern int rstv_cpy8_on; const char *e = getenv("RSTV_HLE220"); if (e) rstv_cpy8_on = atoi(e); } // ADR-231 A/B: 1 CPY8, 2 FILL32C, 4 DIVLS
+			{ extern int rstv_divls_cyc; if (getenv("RSTV_DIVCYC")) rstv_divls_cyc = atoi(getenv("RSTV_DIVCYC")); }
 			extern int rstv_hle_stub_on; // ADR-081: native-call blocks (off with the HLE checker, which runs in Execute)
 			if (getenv("RSTV_NOHLESTUB") || getenv("RSTV_HLECHK"))
 				rstv_hle_stub_on = 0;
@@ -334,6 +339,10 @@ int main(int argc, char **argv)
 #ifdef RSTV_DYNAREC
 	if (use_dynarec)
 		yinit.sh2coretype = 3; // SH2CORE_DYNAMIC (devmiyax)
+#ifdef RSTV_ARI64
+	if (getenv("RSTV_ARI64"))
+		yinit.sh2coretype = 2; // ADR-222: Ari64 recompiler (slice executor)
+#endif
 #else
 	(void)use_dynarec;
 #endif
@@ -1042,7 +1051,16 @@ int main(int argc, char **argv)
 			}
 		printf("dsp last_step %d nonzero %d\n", scsp_dsp.last_step, nz);
 	}
+	{ // routines run natively (found by their code or listed per game): pc / kind
+		extern unsigned rstv_hle_runs;
+		printf("hle %d routines, %u runs:", rstv_hle_n, rstv_hle_runs);
+		for (int k = 0; k < rstv_hle_n; k++)
+			printf(" %08x/%d", (unsigned)rstv_hle[k].pc, rstv_hle[k].kind);
+		printf("\n");
+	}
 	double dt = now_s() - t0;
+	{ extern unsigned rstv_cw_same, rstv_cw_diff; extern unsigned rstv_dirty_n; // (devmiyax: writes to compiled code)
+		printf("codewrites same %u diff %u\n", rstv_cw_same, rstv_cw_diff); }
 	printf("done %d frames in %.2fs (%.1f fps)\n", frames, dt, frames / dt);
 	YabauseDeInit();
 	return 0;

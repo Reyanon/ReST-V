@@ -818,7 +818,12 @@ extern "C" {
   u8 rstv_memGetByte(u32); u16 rstv_memGetWord(u32); u32 rstv_memGetLong(u32);
   void rstv_memSetByte(u32, u8); void rstv_memSetWord(u32, u16); void rstv_memSetLong(u32, u32);
 }
+#if !defined(__vita__)
+extern "C" { u16 rstv_code_shadow[0x80000]; } // (harness diag: words as compiled, see SH2DynWriteNotify)
+#define RSTV_MARK_CODE(a) (rstv_code_chunk[((a) & 0xFFFFF) >> 5] = 1,   ((a) & 0x0FF00000) == 0x06000000 ? (void)(rstv_code_shadow[((a) & 0xFFFFF) >> 1] = T2ReadWord(HighWram, (a) & 0xFFFFE)) : (void)0)
+#else
 #define RSTV_MARK_CODE(a) (rstv_code_chunk[((a) & 0xFFFFF) >> 5] = 1)
+#endif
 // ADR-081: native-call blocks. A hook PC whose native routine has run once gets a block that calls rstv_hle_stub_c and goes
 // on through rstv_chain, so chained calls reach the routine without the dispatcher (two Execute round trips a call).
 // If the routine refuses, the block returns to Execute with rstv_hle_bypass_pc set, which runs the original code from a
@@ -869,6 +874,8 @@ extern "C" { unsigned rstv_dyn_cyc[2]; extern volatile int rstv_act; }
 // sampler labels for the compiler (ADR-043 measurement): 25 fetch+parent, 26 emit, 27 compile other, 28 sync
 #define RSTV_ACT(x) (rstv_act = (x))
 extern "C" { unsigned rstv_dyn_exec, rstv_dyn_compile; extern volatile unsigned rstv_act_pc; unsigned rstv_comp_us[3]; }
+unsigned rstv_dirty_n, rstv_dirty_first; // (diag: blocks removed by writes to their code, first address)
+unsigned rstv_evict_n;
 extern "C" { unsigned rstv_dyn_blk_bytes, rstv_dyn_blk_n, rstv_dyn_blk_max; }
 extern "C" { void PageFlipCont(void); int rstv_dyn_cont = 1; unsigned rstv_dyn_cont_n; }
 #define PAGEFLIPCONT_SIZE 20
@@ -1082,7 +1089,8 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
     static int on = -1;
     if (on < 0) { const char *e = getenv("RSTV_COMPLOG"); on = e ? atoi(e) : 0; }
     extern u32 rstv_harness_frame;
-    if (on && rstv_harness_frame >= (u32)on && rstv_harness_frame < (u32)on + 120)
+    static int len = -1; if (len < 0) { const char *e = getenv("RSTV_COMPLOGN"); len = e ? atoi(e) : 120; }
+    if (on && rstv_harness_frame >= (u32)on && rstv_harness_frame < (u32)on + (u32)len)
       fprintf(stderr, "comp f%u %08x\n", rstv_harness_frame, pc);
   }
 #endif
@@ -1096,18 +1104,19 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   }else{
     blockCount = LastMakeBlock;
     LastMakeBlock++;
-    LastMakeBlock &= (nblocks_-1);
+    if (LastMakeBlock >= nblocks_) LastMakeBlock = 0; // (ADR-230: not a power of 2 any more)
 #if defined(RSTV)
     if (rstv_block_in_use(&g_CompleBlock[blockCount])) {
       blockCount = LastMakeBlock;
       LastMakeBlock++;
-      LastMakeBlock &= (nblocks_-1);
+      if (LastMakeBlock >= nblocks_) LastMakeBlock = 0;
     }
 #endif
   }
   
   if (g_CompleBlock[blockCount].b_addr != 0x00) {
 #if defined(RSTV)
+    { extern unsigned rstv_evict_n; rstv_evict_n++; } // (diag: a live block replaced, the ring is full)
     rstv_link_gen++; // ADR-048: this block is replaced
 #endif
     
@@ -2861,6 +2870,75 @@ static int rstv_cpy16_check(u32 pc)
   return x | m << 4 | n << 8 | c << 12;
 }
 
+extern "C" int rstv_cpy8_on, rstv_divls_cyc;
+int rstv_cpy8_on = 0; // ADR-231: bits 1 CPY8, 2 FILL32C, 4 DIVLS; off (cotton2 slowed to 18 fps after its start with them; v0.1.529 had none). Vita flag hle220 / harness: on
+int rstv_divls_cyc = 82; // as the recompiler counts the routine (ARM harness: 82 alone kept the audio hash; RSTV_DIVCYC)
+// ADR-220: byte copy loop head (any game; cottonbm's boss: 06013730 took 70-90% of the master's frame):
+//   mov.b @Rm+,Rx / add #1,Rc / mov.b Rx,@Rn / cmp/ge Rr,Rc / bf/s (loop) / add #1,Rn
+// registers x | m << 4 | n << 8 | c << 12 | r << 16, -1 if not that code
+static int rstv_cpy8_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 12 > 0x100000 || (pc & 1))
+    return -1;
+  u16 w[6];
+  for (int i = 0; i < 6; i++)
+    w[i] = T2ReadWord(HighWram, a + i * 2);
+  const int x = (w[0] >> 8) & 15, m = (w[0] >> 4) & 15, c = (w[1] >> 8) & 15, n = (w[2] >> 8) & 15, r = (w[3] >> 4) & 15;
+  if ((w[0] & 0xF00F) != 0x6004 || (w[1] & 0xF0FF) != 0x7001 || (w[2] & 0xF00F) != 0x2000 || ((w[2] >> 4) & 15) != x ||
+      (w[3] & 0xF00F) != 0x3003 || ((w[3] >> 8) & 15) != c || w[4] != 0x8FFA || w[5] != (0x7001 | (n << 8)))
+    return -1;
+  const int regs[5] = { x, m, c, n, r };
+  for (int i = 0; i < 5; i++)
+    for (int j = i + 1; j < 5; j++)
+      if (regs[i] == regs[j])
+        return -1;
+  return x | m << 4 | n << 8 | c << 12 | r << 16;
+}
+
+// ADR-220: counted 32-bit fill loop head (any game; cottonbm's boss: 0601033C, 20-30% of some frames):
+//   mov.l Rv,@Rn / add #1,Rc / add #4,Rn / cmp/ge Rr,Rc / bf (loop)
+// registers v | n << 4 | c << 8 | r << 12, -1 if not that code
+static int rstv_fill32c_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 10 > 0x100000 || (pc & 1))
+    return -1;
+  u16 w[5];
+  for (int i = 0; i < 5; i++)
+    w[i] = T2ReadWord(HighWram, a + i * 2);
+  const int n = (w[0] >> 8) & 15, v = (w[0] >> 4) & 15, c = (w[1] >> 8) & 15, r = (w[3] >> 4) & 15;
+  if ((w[0] & 0xF00F) != 0x2002 || (w[1] & 0xF0FF) != 0x7001 || w[2] != (0x7004 | (n << 8)) || (w[3] & 0xF00F) != 0x3003 ||
+      ((w[3] >> 8) & 15) != c || w[4] != 0x8BFA)
+    return -1;
+  if (v == n || v == c || v == r || n == c || n == r || c == r)
+    return -1;
+  return v | n << 4 | c << 8 | r << 12;
+}
+
+// ADR-220: the SHC signed division routine (__divls: r0 = r1 / r0, r2 / r3 kept; cottonbm calls it in fill loops for
+// every 8 words). Non-zero divisor path only (zero: the original code stores its error code)
+static int rstv_divls_check(u32 pc)
+{
+  const u32 a = pc & 0xFFFFF;
+  if ((pc & 0x0FF00000) != 0x06000000 || a + 79 * 2 > 0x100000 || (pc & 1))
+    return 0;
+  static const u16 head[9] = { 0x2008, 0x2F26, 0x0000, 0x2F36, 0xE200, 0x2127, 0x333A, 0x312A, 0x2307 };
+  static const u16 tail[6] = { 0x4124, 0x312E, 0x6013, 0x63F6, 0x000B, 0x62F6 };
+  for (int i = 0; i < 9; i++) {
+    const u16 w = T2ReadWord(HighWram, a + i * 2);
+    if (i == 2 ? (w & 0xFF00) != 0x8900 : w != head[i])
+      return 0;
+  }
+  for (int i = 0; i < 32; i++)
+    if (T2ReadWord(HighWram, a + 18 + i * 4) != 0x4124 || T2ReadWord(HighWram, a + 20 + i * 4) != 0x3304)
+      return 0;
+  for (int i = 0; i < 6; i++)
+    if (T2ReadWord(HighWram, a + 146 + i * 2) != tail[i])
+      return 0;
+  return 1;
+}
+
 // ADR-189: the cache purge by lines in its two forms (any game): 1 = do-while (fhboxers), 2 = while (pblbeach), 0 = no.
 // mov.l @(lit), r3 / r2 with the literals 1FFFFFF0 and 40000000, then the exact loop. Checked on every call (15 words)
 static int rstv_purge_check(u32 pc)
@@ -3008,19 +3086,22 @@ static int rstv_hle_detect(u32 pc, int lzb_only = 0)
   else if (w0 == 0x6372) kind = rstv_bss_check(pc) ? RSTV_HLE_BSSCLR : 0;
   else if (w0 == 0x6362) kind = rstv_bss2_check(pc) ? RSTV_HLE_BSSCLR2 : 0;
   else if (w0 == 0x62f2) kind = rstv_delay_check(pc) ? RSTV_HLE_DELAY : 0;
-  else if ((w0 & 0xF00F) == 0x2008) kind = rstv_delayr_check(pc) >= 0 ? RSTV_HLE_DELAYR : 0;
+  else if ((w0 & 0xF00F) == 0x2008) kind = rstv_delayr_check(pc) >= 0 ? RSTV_HLE_DELAYR :
+    w0 == 0x2008 && (rstv_cpy8_on & 4) && rstv_divls_check(pc) ? RSTV_HLE_DIVLS : 0; // (ADR-220)
   else if ((w0 & 0xF0FF) == 0x70FF) kind = rstv_delayr2_check(pc) >= 0 ? RSTV_HLE_DELAYR2 : 0;
   else if (w0 == 0x3450) kind = rstv_hle_match(pc, &rstv_mm2_sig) ? RSTV_HLE_MEMMOVE2 : 0;
   else if (w0 == 0x6644) kind = rstv_lzb_at(pc) == 0 ? RSTV_HLE_LZB : 0; // ADR-198: entry
   else if (w0 == 0x4710 && rstv_lzb_at(pc) == 1) kind = RSTV_HLE_LZB;     // ADR-198: its loop head (a slice went on)
   else if ((w0 & 0xF0FF) == 0x4010) kind = rstv_delaydt_check(pc) >= 0 ? RSTV_HLE_DELAYDT : 0;
   else if ((w0 & 0xF00F) == 0x6005) kind = rstv_cpy16_check(pc) >= 0 ? RSTV_HLE_CPY16 : 0;
+  else if ((w0 & 0xF00F) == 0x2002 && (rstv_cpy8_on & 2)) kind = rstv_fill32c_check(pc) >= 0 ? RSTV_HLE_FILL32C : 0; // ADR-220
+  else if ((w0 & 0xF00F) == 0x6004 && (rstv_cpy8_on & 1)) kind = rstv_cpy8_check(pc) >= 0 ? RSTV_HLE_CPY8 : 0; // ADR-220
   else if ((w0 & 0xFF00) == 0xD300) kind = rstv_purge_check(pc) ? RSTV_HLE_PURGE : 0;
   if (!kind)
     return 0;
   if (kind != RSTV_HLE_LZ && kind != RSTV_HLE_BSSCLR && kind != RSTV_HLE_BSSCLR2 && kind != RSTV_HLE_DELAY && kind != RSTV_HLE_DELAYR && kind != RSTV_HLE_DELAYR2 &&
       kind != RSTV_HLE_MEMMOVE2 && kind != RSTV_HLE_DELAYDT && kind != RSTV_HLE_CPY16 && kind != RSTV_HLE_PURGE && kind != RSTV_HLE_LZB &&
-      !rstv_hle_match(pc, &rstv_hle_sig[kind]))
+      kind != RSTV_HLE_CPY8 && kind != RSTV_HLE_FILL32C && kind != RSTV_HLE_DIVLS && !rstv_hle_match(pc, &rstv_hle_sig[kind]))
     return 0;
   for (int k = 0; k < rstv_hle_n; k++) // (found before: detected again after a recompile)
     if (rstv_hle[k].pc == pc && rstv_hle[k].kind == kind)
@@ -5257,8 +5338,9 @@ int DynarecSh2::RstvHle(int kind)
     if (kind < 32 && !(((unsigned)mask >> kind) & 1))
       return 0;
     if (log)
-      printf("hle f%d k%d pc %08x r4 %08x r5 %08x r6 %08x r7 %08x pr %08x\n", (int)yabsys.frame_count, kind, GET_PC(),
-        GetGenRegPtr()[4], GetGenRegPtr()[5], GetGenRegPtr()[6], GetGenRegPtr()[7], GET_PR());
+      printf("hle f%d k%d pc %08x r4 %08x r5 %08x r6 %08x r7 %08x pr %08x r13 %08x r14 %08x\n", (int)yabsys.frame_count, kind,
+        GET_PC(), GetGenRegPtr()[4], GetGenRegPtr()[5], GetGenRegPtr()[6], GetGenRegPtr()[7], GET_PR(), GetGenRegPtr()[13],
+        GetGenRegPtr()[14]);
   }
 #endif
   const u32 pc = GET_PC();
@@ -5824,6 +5906,126 @@ int DynarecSh2::RstvHle(int kind)
       SET_PC(pc);
     }
     m_pDynaSh2->SysReg[4] += (u32)(n * 5) - (n == todo ? 2u : 0u);
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_DIVLS) {
+    // ADR-220: the routine's own steps (div0s, subc, 32 x rotcl / div1, addc) in C: r0, r1, T, M, Q as the code leaves
+    // them, r2 / r3 pushed and popped (the stack words written), 80 cycles
+    if (!rstv_divls_check(pc))
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const u32 d = R[0];
+    // (a slice that ends inside the routine is left to the code: it stops between its blocks there, interrupts too)
+    if (d == 0 || m_pDynaSh2->SysReg[4] + (u32)rstv_divls_cyc >= m_pDynaSh2->exitcount)
+      return 0;
+    u32 r1 = R[1], r3;
+    u32 T, M, Q;
+    Q = r1 >> 31; M = 0; T = Q ^ M;               // div0s r2(=0), r1
+    r3 = T ? 0xFFFFFFFFu : 0u;                    // subc r3, r3 (T unchanged)
+    { const u32 t1 = r1; r1 = t1 - T; T = t1 < r1; } // subc r2(=0), r1
+    Q = r3 >> 31; M = d >> 31; T = Q ^ M;         // div0s r0, r3
+    for (int i = 0; i < 32; i++) {
+      { const u32 nt = r1 >> 31; r1 = (r1 << 1) | T; T = nt; } // rotcl r1
+      // div1 r0, r3
+      const u32 oq = Q;
+      Q = r3 >> 31;
+      r3 = (r3 << 1) | T;
+      const u32 t0 = r3;
+      u32 t1;
+      if (oq == M) { r3 -= d; t1 = r3 > t0; } else { r3 += d; t1 = r3 < t0; }
+      if (oq == 0) Q = M == 0 ? (Q ? (t1 == 0) : t1) : (Q ? t1 : (t1 == 0));
+      else Q = M == 0 ? (Q ? (t1 == 0) : t1) : (Q ? t1 : (t1 == 0));
+      T = Q == M;
+    }
+    { const u32 nt = r1 >> 31; r1 = (r1 << 1) | T; T = nt; } // rotcl r1
+    { const u32 t0 = r1; r1 = t0 + T; T = r1 < t0; }          // addc r2(=0), r1
+    const u32 sp = R[15];
+    u32 wc = 0;
+    MappedMemoryWriteLong(sp - 4, R[2], &wc); // mov.l r2, @-r15 / mov.l r3, @-r15
+    MappedMemoryWriteLong(sp - 8, R[3], &wc);
+    R[1] = r1;
+    R[0] = r1;
+    SET_SR((GET_SR() & ~0x301u) | (M << 9) | (Q << 8) | T);
+    SET_PC(GET_PR());
+    m_pDynaSh2->SysReg[4] += (u32)rstv_divls_cyc;
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_FILL32C) {
+    // ADR-220: as many iterations as the block loop would run in the slice (7 cycles each, 5 for the last)
+    const int rg = rstv_fill32c_check(pc);
+    if (rg < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const int rv = rg & 15, rn = (rg >> 4) & 15, rc = (rg >> 8) & 15, rr = (rg >> 12) & 15;
+    const s64 d = (s64)(s32)R[rr] - (s64)(s32)R[rc];
+    const u64 todo = d <= 1 ? 1 : (u64)d;
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+    const u64 can = left > 0 ? ((u64)left + 6) / 7 : 1;
+    const u32 n = (u32)(todo < can ? todo : can);
+    if (n > 0x20000 || (R[rn] & 3) || rstv_coin_mailbox_latch)
+      return 0;
+    RstvHleSide dst;
+    if (!rstv_hle_side(&dst, R[rn], n * 4) || !dst.m)
+      return 0;
+    const u32 v = R[rv];
+    for (u32 i = 0; i < n * 4; i += 4) {
+      rstv_hle_wr(&dst, i, (u8)(v >> 24));
+      rstv_hle_wr(&dst, i + 1, (u8)(v >> 16));
+      rstv_hle_wr(&dst, i + 2, (u8)(v >> 8));
+      rstv_hle_wr(&dst, i + 3, (u8)v);
+    }
+    rstv_hle_notify(R[rn], n * 4);
+    R[rn] += n * 4;
+    R[rc] += n;
+    if (n == todo) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(pc + 10);
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(pc);
+    }
+    m_pDynaSh2->SysReg[4] += n * 7 - (n == todo ? 2u : 0u);
+    rstv_hle_runs++;
+    return 1;
+  }
+  if (kind == RSTV_HLE_CPY8) {
+    // ADR-220: as many iterations as the block loop would run in the slice (7 cycles each, 6 for the last), byte by byte
+    // in order (overlap as the SH-2 sees it). Only when both sides have a host pointer
+    const int rg = rstv_cpy8_check(pc);
+    if (rg < 0)
+      return 0;
+    u32 *R = GetGenRegPtr();
+    const int rx = rg & 15, rm = (rg >> 4) & 15, rn = (rg >> 8) & 15, rc = (rg >> 12) & 15, rr = (rg >> 16) & 15;
+    const s64 d = (s64)(s32)R[rr] - (s64)(s32)R[rc]; // (c is counted up first, then compared)
+    const u64 todo = d <= 1 ? 1 : (u64)d;
+    const s32 left = (s32)(m_pDynaSh2->exitcount - m_pDynaSh2->SysReg[4]);
+    const u64 can = left > 0 ? ((u64)left + 6) / 7 : 1;
+    const u32 n = (u32)(todo < can ? todo : can);
+    if (n > 0x40000 || rstv_coin_mailbox_latch)
+      return 0;
+    RstvHleSide src, dst;
+    if (!rstv_hle_side(&src, R[rm], n, 1) || !src.m || !rstv_hle_side(&dst, R[rn], n) || !dst.m)
+      return 0;
+    u8 b = 0;
+    for (u32 i = 0; i < n; i++) {
+      b = rstv_hle_rd(&src, i);
+      rstv_hle_wr(&dst, i, b);
+    }
+    rstv_hle_notify(R[rn], n);
+    R[rx] = (u32)(s32)(s8)b;
+    R[rm] += n;
+    R[rn] += n;
+    R[rc] += n;
+    if (n == todo) {
+      SET_SR(GET_SR() | 1u);
+      SET_PC(pc + 12);
+    } else {
+      SET_SR(GET_SR() & ~1u);
+      SET_PC(pc);
+    }
+    m_pDynaSh2->SysReg[4] += n * 7 - (n == todo ? 1u : 0u);
     rstv_hle_runs++;
     return 1;
   }

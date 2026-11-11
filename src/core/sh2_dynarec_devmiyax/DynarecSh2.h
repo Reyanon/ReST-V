@@ -139,7 +139,10 @@ typedef map<u32, CompileStaticsNode> MapCompileStatics;
 // about 430 bytes of ARM code, so the 4KB slots held a quarter as many blocks: going back to a scene recompiled hundreds of
 // blocks in one frame (30-45ms). A longer block now ends early and goes on through rstv_chain.
 // The block header offset (MAXBLOCKSIZE) is also in rstv_memfast_arm.s (rstv_chain, rstv_chain_ic)
-const int NUMOFBLOCKS = 1024*8;
+// ADR-230: 11264 slots (11.7 MB of the 16 MB code region, with the slave's 2.1 MB and the DSP / SCU code): cotton2's boss
+// save runs 8332 distinct blocks, just over 8192, so the round-robin ring kept evicting live blocks (11368 extra
+// compiles in 6500 frames; 7 of its 16 frames over 25 ms were those recompiles)
+const int NUMOFBLOCKS = 1024*11;
 const int MAXBLOCKSIZE = 1024;
 #else
 const int NUMOFBLOCKS = 1024*4;
@@ -371,6 +374,7 @@ public:
     if (LookupParentTable[addr].size() == 0) return;
     for (auto it = LookupParentTable[addr].begin(); it != LookupParentTable[addr].end(); it++) {
       if (LookupTable[*it] != NULL) {
+        { extern unsigned rstv_dirty_n, rstv_dirty_first; if (!rstv_dirty_n++) rstv_dirty_first = (addr << 1) | 0x06000000; } // (diag)
         for (u32 i = adress_mask(LookupTable[*it]->b_addr) ; i <= adress_mask(LookupTable[*it]->e_addr); i++ ) {
           if (i != addr) {
             LookupParentTable[i].remove(*it);

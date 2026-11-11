@@ -18,6 +18,9 @@ extern "C" {
 #define STV_IN_UP    0x20
 #define STV_IN_RIGHT 0x40
 #define STV_IN_LEFT  0x80
+// buttons 5 and 6 (the 6-button panel only; above the port byte)
+#define STV_IN_B5    0x100
+#define STV_IN_B6    0x200
 
 // System port (PORT-C) bits
 #define STV_SYS_COIN1   0x01
@@ -38,8 +41,13 @@ enum { STV_IO_STD, STV_IO_HOPPER, STV_IO_MAHJONG };
 void StvIoSetMahjong(const u8 rows[5]);
 extern int stv_io_type;
 void StvIoSetType(int type);
-// Pressed-bit masks (1 = pressed)
-void StvIoSetInputs(u8 p1, u8 p2, u8 system);
+// ADR-219: player button wiring (MAME stv.cpp input ports). STD = "stv": buttons 1-4 on PORT-A / PORT-B bits 0-3.
+// 6B = "stv6b": buttons 1-3 there, buttons 4-6 on PORT-F (1P bits 0-2, 2P bits 4-6), bit 3 unused.
+// BATMAN = "batmanfr": buttons 1-3 on bits 1-3, bit 0 unused
+enum { STV_BTN_STD, STV_BTN_6B, STV_BTN_BATMAN };
+void StvIoSetButtons(int layout);
+// Pressed-bit masks (1 = pressed; STV_IN_*, buttons 5 and 6 included)
+void StvIoSetInputs(u16 p1, u16 p2, u8 system);
 
 u8 FASTCALL StvIoReadByte(u32 addr);
 u16 FASTCALL StvIoReadWord(u32 addr);

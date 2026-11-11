@@ -394,6 +394,12 @@ void SH2DynAddCycle(SH2_struct *context, u32 value) {
 // ADR-136: a write drops the code it hits in every block cache (master's, and the slave's when it has its own)
 #define RSTV_CB_INVAL(tbl, idx) do { for (int k_ = 0; k_ < 2; k_++) { CompileBlocks *b_ = CompileBlocks::at(k_); if (!b_) continue;     Block *&e_ = b_->tbl[idx]; if (e_) { e_ = NULL; rstv_link_gen++; } } } while (0)
 #define RSTV_CB_DIRTY(a) do { for (int k_ = 0; k_ < 2; k_++) { CompileBlocks *b_ = CompileBlocks::at(k_); if (b_) b_->setDirty(a); } } while (0)
+#if !defined(__vita__)
+extern "C" { unsigned rstv_cw_same, rstv_cw_diff; extern u16 rstv_code_shadow[0x80000]; }
+#define RSTV_CWCHK(a, eq) do { if (CompileBlocks::getInstance()->LookupParentTable[adress_mask(a)].size()) { if (eq) rstv_cw_same++; else rstv_cw_diff++; } } while (0)
+#else
+#define RSTV_CWCHK(a, eq) do { } while (0)
+#endif
 void SH2DynWriteNotify(u32 start, u32 length){
   CompileBlocks * block = CompileBlocks::getInstance();
   
@@ -410,6 +416,23 @@ void SH2DynWriteNotify(u32 start, u32 length){
     break;
     // High Memory
   case 0x06000000:
+#if defined(__vita__)
+    if (length >= 1024) { // diag (Cotton stutter, measuring only): DMA destination, length, content checksum, code hit
+      extern void rstv_log_printf(const char *fmt, ...);
+      u32 cs = 0, hit = 0;
+      for (u32 a = start; a < start + length; a += 2) {
+        cs = cs * 31 + T2ReadWord(HighWram, a & 0xFFFFF);
+        if (block->LookupParentTable[adress_mask(a)].size()) hit++;
+      }
+      rstv_log_printf("dmanotify f%u dst %08x len %u csum %08x codewords %u", (unsigned)yabsys.frame_count, start, length, cs, hit);
+    }
+#endif
+#if !defined(__vita__)
+    { extern u16 rstv_code_shadow[0x80000]; // (harness diag: notified writes over compiled code, same words or not)
+      for (u32 a2 = start; a2 < start + length; a2 += 2)
+        if (block->LookupParentTable[adress_mask(a2)].size())
+          RSTV_CWCHK(a2, rstv_code_shadow[(a2 & 0xFFFFF) >> 1] == T2ReadWord(HighWram, a2 & 0xFFFFE)); }
+#endif
     for( u32 addr = start; addr< start+length; addr+=2 )
 #if defined(SET_DIRTY)
     RSTV_CB_DIRTY(addr);
@@ -536,6 +559,7 @@ void memSetByte(u32 addr , u8 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
+    RSTV_CWCHK(addr, T2ReadByte(HighWram, addr & 0xFFFFF) == (u8)data); // (harness diag: a write to compiled code, same value or not)
     RSTV_CB_DIRTY(addr);
 #else
     RSTV_CB_INVAL(LookupTable, (addr&0x000FFFFF)>>1);
@@ -583,6 +607,7 @@ void memSetWord(u32 addr, u16 data )
   // High Memory
    case 0x06000000:  {
 #if defined(SET_DIRTY)
+     RSTV_CWCHK(addr, T2ReadWord(HighWram, addr & 0xFFFFF) == (u16)data); // (harness diag: a write to compiled code, same value or not)
      RSTV_CB_DIRTY(addr);
 #else
      RSTV_CB_INVAL(LookupTable, (addr & 0x000FFFFF) >> 1);
@@ -631,6 +656,7 @@ void memSetLong(u32 addr , u32 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
+    RSTV_CWCHK(addr, T2ReadLong(HighWram, addr & 0xFFFFF) == (u32)data); // (harness diag: a write to compiled code, same value or not)
     RSTV_CB_DIRTY(addr);
     RSTV_CB_DIRTY(addr+2);
 #else

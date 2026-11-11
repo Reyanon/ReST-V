@@ -15,6 +15,11 @@ if(RSTV_DYNAREC)
     sh2_dynarec_devmiyax/DynarecSh2.cpp sh2_dynarec_devmiyax/DynarecSh2CInterface.cpp
     sh2_dynarec_devmiyax/dynalib_arm.s sh2_dynarec_devmiyax/rstv_memfast_arm.s)
 endif()
+# ADR-222: Ari64 SH-2 recompiler as a slice executor (SH-2 core id 2), on trial next to devmiyax
+option(RSTV_ARI64 "Ari64 SH-2 recompiler (ARM, trial)" OFF)
+if(RSTV_ARI64)
+  list(APPEND RSTV_CORE_SOURCES sh2_dynarec/sh2_dynarec.c sh2_dynarec/linkage_arm.s)
+endif()
 list(TRANSFORM RSTV_CORE_SOURCES PREPEND ${RSTV_CORE_DIR}/)
 
 add_library(rstv_core STATIC ${RSTV_CORE_SOURCES})
@@ -24,6 +29,11 @@ target_compile_definitions(rstv_core PUBLIC HAVE_CONFIG_H=1 HAVE_MUSASHI=1 HAVE_
   NO_CLI=1 RSTV=1 VERSION="ReST-V" stricmp=strcasecmp)
 if(RSTV_DYNAREC)
   target_compile_definitions(rstv_core PUBLIC DYNAREC_DEVMIYAX=1 RSTV_DYNAREC=1)
+endif()
+if(RSTV_ARI64)
+  target_compile_definitions(rstv_core PUBLIC RSTV_ARI64=1)
+  # the generated code and linkage_arm.s call C functions with ARM bl (no interworking): no Thumb code in the core
+  target_compile_options(rstv_core PRIVATE -marm)
 endif()
 target_compile_options(rstv_core PRIVATE -w $<$<COMPILE_LANGUAGE:C>:-fpermissive>)
 

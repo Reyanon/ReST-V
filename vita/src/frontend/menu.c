@@ -6,6 +6,7 @@
 #include <psp2/ctrl.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/io/dirent.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/kernel/threadmgr.h>
@@ -20,11 +21,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "frontend/cheats.h"
 #include "frontend/update.h"
 #include "common/re_pad.h"
 #include "frontend/touch.h"
+#include "frontend/ime.h"
+#include "frontend/avsnap.h"
 #include "frontend/stv_list.h"
 #include "frontend/ui.h"
 #include "stv.h"
@@ -40,6 +44,7 @@ static char s_devtext[RE_PAD_SRC_COUNT][40];
 #define SETTINGS_PATH DATA_DIR "/settings.cfg"
 #define OLD_SETTINGS_PATH DATA_DIR "/settings.txt" // (pre-ADR-126 format: "key value", migrated once on first read)
 #define FAV_PATH DATA_DIR "/favorites.cfg"
+#define GAME_CFG_DIR DATA_DIR "/cfg/" // the games' own files (<set>_game.cfg), as ReBOX (owner, 2026-11-11)
 #define MENU_OPEN_COMBO (SCE_CTRL_SELECT | SCE_CTRL_START)
 
 #define SCREEN_W 960
@@ -364,9 +369,12 @@ static const uint32_t *theme_rows(int bands)
 // ================================ settings ================================
 rstv_settings g_set;
 
-static const char *const s_keymap_keys[RSTV_ACT_COUNT] = { "key_b1", "key_b2", "key_b3", "key_b4", "key_coin", "key_start" };
-static const char *const s_keymap2_keys[RSTV_ACT_COUNT] = { "key2_b1", "key2_b2", "key2_b3", "key2_b4", "key2_coin",
-	"key2_start" };
+static const char *const s_keymap_keys[RSTV_ACT_COUNT] = { "key_b1", "key_b2", "key_b3", "key_b4", "key_b5", "key_b6",
+	"key_coin", "key_start" };
+static const char *const s_keymap2_keys[RSTV_ACT_COUNT] = { "key2_b1", "key2_b2", "key2_b3", "key2_b4", "key2_b5", "key2_b6",
+	"key2_coin", "key2_start" };
+// buttons 3-6 can be None (games with fewer buttons)
+static int act_can_none(int act) { return act >= RSTV_ACT_B3 && act <= RSTV_ACT_B6; }
 
 void rstv_settings_default_port(int port)
 {
@@ -377,13 +385,23 @@ void rstv_settings_default_port(int port)
 	p->keymap[RSTV_ACT_B2] = RSTV_KEY_CIRCLE;
 	p->keymap[RSTV_ACT_B3] = RSTV_KEY_SQUARE;
 	p->keymap[RSTV_ACT_B4] = RSTV_KEY_TRIANGLE;
+	p->keymap[RSTV_ACT_B5] = RSTV_KEY_L; // ADR-219: 6-button games (L / R are free in the others)
+	p->keymap[RSTV_ACT_B6] = RSTV_KEY_R;
 	p->keymap[RSTV_ACT_COIN] = RSTV_KEY_SELECT;
 	p->keymap[RSTV_ACT_START] = RSTV_KEY_START;
 	p->stick = RSTV_STICK_BOTH;
+	rstv_stick_preset(p, 0, 1); // (as before: both sticks are the lever too)
+	rstv_stick_preset(p, 1, 1);
 	p->turbo_key = RSTV_KEY_NONE;
 	p->turbo_btn = 1;
 	p->turbo_speed = RSTV_TURBO_FAST;
 	memset(p->combo, 0, sizeof(p->combo));
+}
+
+void rstv_stick_preset(rstv_port *p, int st, int dpad)
+{
+	for (int d = 0; d < RSTV_SDIR_COUNT; d++)
+		p->smap[st][d] = dpad ? RSTV_STGT_UP + d : RSTV_STGT_NONE;
 }
 
 void rstv_settings_default_keys(void)
@@ -406,6 +424,9 @@ void rstv_settings_defaults(void)
 	g_set.border_color = RSTV_BCOL_MAROON; // (ADR-210: ReSys12's display defaults)
 	g_set.confirm = RSTV_CONFIRM_CROSS;
 	g_set.list_filter = RSTV_LIST_PLAYABLE;
+	g_set.list_group = RSTV_GROUP_BOARD;
+	g_set.list_snap = 1;
+	g_set.fast_boot = 0; // (ADR-241: the boot as on the board unless chosen)
 	g_set.theme = RSTV_THEME_BLUE;
 	g_set.pad_src[0] = g_set.pad_src[1] = RE_PAD_SRC_AUTO;
 	g_set.input_engine = RE_PAD_ENGINE_NATIVE;
@@ -448,7 +469,18 @@ void rstv_settings_apply_video(void)
 	// rstv_video_set_mode: 0 = 4:3, 1 = integer, 2 = full / 0 = sharp, 1 = smooth
 	const int scale = g_set.aspect == RSTV_ASPECT_FULL ? 2 : g_set.aspect == RSTV_ASPECT_INT ? 1 : 0;
 	rstv_video_set_mode(scale, g_set.filter == RSTV_FILTER_SMOOTH);
-	rstv_video_set_style(g_set.scan_type, g_set.scan_strength, g_set.border, g_set.border_color);
+	int border = g_set.border;
+#ifdef RSTV_DEBUG_TOOLS
+	{ // test: ux0:data/restv/bordertest = a Border value shown instead of the setting (not saved)
+		FILE *bf = fopen(DATA_DIR "/bordertest", "r");
+		if (bf) {
+			if (fscanf(bf, "%d", &border) != 1 || border < 0 || border >= RSTV_BORDER_COUNT)
+				border = g_set.border;
+			fclose(bf);
+		}
+	}
+#endif
+	rstv_video_set_style(g_set.scan_type, g_set.scan_strength, border, g_set.border_color);
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -515,7 +547,12 @@ static int read_port(const char *key, int val)
 		p = &g_set.port[1];
 		key += 3;
 	}
-	if (!strcmp(key, "stick")) p->stick = clampi(val, 0, RSTV_STICK_COUNT - 1);
+	if (!strcmp(key, "stick")) { // (files before ADR-235: which sticks are the lever)
+		p->stick = clampi(val, 0, RSTV_STICK_COUNT - 1);
+		rstv_stick_preset(p, 0, p->stick == RSTV_STICK_LEFT || p->stick == RSTV_STICK_BOTH);
+		rstv_stick_preset(p, 1, p->stick == RSTV_STICK_RIGHT || p->stick == RSTV_STICK_BOTH);
+	} else if (!strncmp(key, "smap", 4) && key[4] >= '0' && key[4] <= '7' && !key[5]) // smap<stick*4+dir>
+		p->smap[(key[4] - '0') / RSTV_SDIR_COUNT][(key[4] - '0') % RSTV_SDIR_COUNT] = clampi(val, 0, RSTV_STGT_COUNT - 1);
 	else if (!strcmp(key, "turbo_key")) p->turbo_key = key_val(val, RSTV_KEY_NONE);
 	else if (!strcmp(key, "turbo_btn")) p->turbo_btn = clampi(val, 1, RSTV_GAME_BUTTONS);
 	else if (!strcmp(key, "turbo_speed")) p->turbo_speed = clampi(val, 0, RSTV_TURBO_SPEED_COUNT - 1);
@@ -525,7 +562,7 @@ static int read_port(const char *key, int val)
 				p->combo[k] = combo_ok(val) ? val : 0;
 	} else {
 		for (int a = 0; a < RSTV_ACT_COUNT; a++) {
-			const int v = key_val(val, (a == RSTV_ACT_B3 || a == RSTV_ACT_B4) ? RSTV_KEY_NONE : RSTV_KEY_COUNT - 1);
+			const int v = key_val(val, act_can_none(a) ? RSTV_KEY_NONE : RSTV_KEY_COUNT - 1);
 			if (!strcmp(key, s_keymap_keys[a])) {
 				p->keymap[a] = v;
 				return 1;
@@ -577,8 +614,10 @@ static void write_part(FILE *f, const game_part *g)
 		snprintf(pre, sizeof(pre), "%s.", re_pad_profile_key(i));
 		for (int a = 0; a < RSTV_ACT_COUNT; a++)
 			fprintf(f, "%s%s=%d\n", pre, s_keymap_keys[a], p->keymap[a]);
-		fprintf(f, "%sstick=%d\n%sturbo_key=%d\n%sturbo_btn=%d\n%sturbo_speed=%d\n", pre, p->stick, pre, p->turbo_key, pre,
-			p->turbo_btn, pre, p->turbo_speed);
+		fprintf(f, "%sturbo_key=%d\n%sturbo_btn=%d\n%sturbo_speed=%d\n", pre, p->turbo_key, pre, p->turbo_btn, pre,
+			p->turbo_speed);
+		for (int k = 0; k < 2 * RSTV_SDIR_COUNT; k++) // ADR-235 (no "stick=": it would set them again on reading)
+			fprintf(f, "%ssmap%d=%d\n", pre, k, p->smap[k / RSTV_SDIR_COUNT][k % RSTV_SDIR_COUNT]);
 		for (int k = 0; k < RSTV_KEY_COUNT; k++)
 			if (s_combo_keys[k])
 				fprintf(f, "%scombo_%s=%d\n", pre, s_combo_keys[k], p->combo[k]);
@@ -617,7 +656,12 @@ static int load_old_settings(void)
 		if (!strcmp(k, "scale")) g_set.aspect = v == 1 ? RSTV_ASPECT_INT : v == 2 ? RSTV_ASPECT_FULL : RSTV_ASPECT_4_3;
 		else if (!strcmp(k, "filter")) g_set.filter = v ? RSTV_FILTER_SMOOTH : RSTV_FILTER_SHARP;
 		else if (!strcmp(k, "fps")) g_set.fps = v != 0;
-		else if (!strcmp(k, "stick2")) g_set.port[0].stick = clampi(v, 0, RSTV_STICK_COUNT - 1);
+		else if (!strcmp(k, "stick2")) {
+			rstv_port *p0 = &g_set.port[0];
+			p0->stick = clampi(v, 0, RSTV_STICK_COUNT - 1);
+			rstv_stick_preset(p0, 0, p0->stick == RSTV_STICK_LEFT || p0->stick == RSTV_STICK_BOTH);
+			rstv_stick_preset(p0, 1, p0->stick == RSTV_STICK_RIGHT || p0->stick == RSTV_STICK_BOTH);
+		}
 		else if (!strcmp(k, "confirm")) g_set.confirm = v != 0;
 		else if (!strcmp(k, "list_all")) g_set.list_filter = v ? RSTV_LIST_ALL : RSTV_LIST_PLAYABLE;
 		else if (!strcmp(k, "turbo_btn")) tbtn = v;
@@ -683,8 +727,36 @@ void rstv_fav_toggle(const char *set)
 	fclose(f);
 }
 
+// the games' files (<set>_game.cfg), once in the data folder itself, to cfg/ (settings.cfg, favorites.cfg, touch.cfg stay)
+static void settings_move_game_files(void)
+{
+	static int done;
+	if (done)
+		return;
+	done = 1;
+	sceIoMkdir(DATA_DIR "/cfg", 0777);
+	const SceUID d = sceIoDopen(DATA_DIR);
+	if (d < 0)
+		return;
+	SceIoDirent de;
+	for (;;) {
+		memset(&de, 0, sizeof(de));
+		if (sceIoDread(d, &de) <= 0)
+			break;
+		const size_t l = strlen(de.d_name);
+		if (l < 10 || strcmp(de.d_name + l - 9, "_game.cfg") || SCE_S_ISDIR(de.d_stat.st_mode)) // (only <set>_game.cfg)
+			continue;
+		char from[160], to[160];
+		snprintf(from, sizeof(from), DATA_DIR "/%s", de.d_name);
+		snprintf(to, sizeof(to), GAME_CFG_DIR "%s", de.d_name);
+		sceIoRename(from, to);
+	}
+	sceIoDclose(d);
+}
+
 void rstv_settings_load(void)
 {
+	settings_move_game_files();
 	rstv_settings_defaults();
 	fav_load();
 	FILE *f = fopen(SETTINGS_PATH, "r");
@@ -697,6 +769,9 @@ void rstv_settings_load(void)
 				continue;
 			else if (!strcmp(key, "menu_confirm")) g_set.confirm = clampi(val, 0, RSTV_CONFIRM_COUNT - 1);
 			else if (!strcmp(key, "list_filter")) g_set.list_filter = clampi(val, 0, RSTV_LIST_FILTER_COUNT - 1);
+			else if (!strcmp(key, "list_group")) g_set.list_group = clampi(val, 0, RSTV_GROUP_COUNT - 1);
+			else if (!strcmp(key, "list_snap")) g_set.list_snap = val != 0;
+			else if (!strcmp(key, "fast_boot")) g_set.fast_boot = val != 0;
 			else if (!strcmp(key, "theme")) g_set.theme = clampi(val, 0, RSTV_THEME_COUNT - 1);
 			else if (!strcmp(key, "pad_p1")) g_set.pad_src[0] = clampi(val, 0, RE_PAD_SRC_COUNT - 1);
 			else if (!strcmp(key, "pad_p2")) g_set.pad_src[1] = clampi(val, 0, RE_PAD_SRC_COUNT - 1);
@@ -713,7 +788,7 @@ void rstv_settings_load(void)
 	RSTV_LOG("settings: fps %d aspect %d filter %d scan %d/%d border %d/%d keys %d %d %d %d coin %d start %d turbo %d/%d",
 		g_set.fps, g_set.aspect, g_set.filter, g_set.scan_type, g_set.scan_strength, g_set.border, g_set.border_color,
 		g_set.port[0].keymap[0], g_set.port[0].keymap[1], g_set.port[0].keymap[2], g_set.port[0].keymap[3],
-		g_set.port[0].keymap[4], g_set.port[0].keymap[5], g_set.port[0].turbo_key, g_set.port[0].turbo_btn);
+		g_set.port[0].keymap[RSTV_ACT_COIN], g_set.port[0].keymap[RSTV_ACT_START], g_set.port[0].turbo_key, g_set.port[0].turbo_btn);
 }
 
 void rstv_settings_load_game(const char *set)
@@ -725,7 +800,7 @@ void rstv_settings_load_game(const char *set)
 	} else
 		part_get(&s_global);
 	char p[96];
-	snprintf(p, sizeof(p), DATA_DIR "/%s_game.cfg", s_game);
+	snprintf(p, sizeof(p), GAME_CFG_DIR "%s_game.cfg", s_game);
 	FILE *f = fopen(p, "r");
 	s_keyver = 0;
 	if (!f)
@@ -750,7 +825,9 @@ void rstv_settings_save(void)
 	if (!s_game_on)
 		part_get(&s_global);
 	write_part(f, &s_global);
-	fprintf(f, "menu_confirm=%d\nlist_filter=%d\ntheme=%d\n", g_set.confirm, g_set.list_filter, g_set.theme);
+	fprintf(f, "menu_confirm=%d\nlist_filter=%d\nlist_group=%d\nlist_snap=%d\nfast_boot=%d\ntheme=%d\n", g_set.confirm,
+		g_set.list_filter, g_set.list_group, g_set.list_snap, g_set.fast_boot,
+		g_set.theme);
 	fprintf(f, "pad_p1=%d\npad_p2=%d\ninput_engine=%d\n", g_set.pad_src[0], g_set.pad_src[1], g_set.input_engine);
 	fclose(f);
 	if (s_game[0] && s_game_on)
@@ -773,7 +850,7 @@ int rstv_settings_save_game(void)
 	if (!s_game[0])
 		return 0;
 	char p[96];
-	snprintf(p, sizeof(p), DATA_DIR "/%s_game.cfg", s_game);
+	snprintf(p, sizeof(p), GAME_CFG_DIR "%s_game.cfg", s_game);
 	FILE *f = fopen(p, "w");
 	if (!f) {
 		RSTV_LOG("settings: game save failed %s", p);
@@ -792,7 +869,7 @@ int rstv_settings_delete_game(void)
 	if (!s_game[0] || !s_game_on)
 		return 0;
 	char p[96];
-	snprintf(p, sizeof(p), DATA_DIR "/%s_game.cfg", s_game);
+	snprintf(p, sizeof(p), GAME_CFG_DIR "%s_game.cfg", s_game);
 	if (sceIoRemove(p) < 0) {
 		RSTV_LOG("settings: game delete failed %s", p);
 		return 0;
@@ -807,13 +884,14 @@ int rstv_settings_delete_game(void)
 static char s_set[32], s_title[96];
 static UiCanvas *s_cv, *s_osd_cv, *s_fps_cv;
 enum { PAGE_MAIN, PAGE_STATES, PAGE_DISPLAY, PAGE_CONTROLS, PAGE_ABOUT, PAGE_CHEATS, PAGE_TURBO, PAGE_TOUCH, PAGE_TEDIT,
-	PAGE_COMBO, PAGE_PORT };
+	PAGE_COMBO, PAGE_PORT, PAGE_STICK };
 static int s_page; // (defined with the other menu state below)
-#define CTRL_PAGE (s_page == PAGE_CONTROLS || s_page == PAGE_TURBO || s_page == PAGE_TOUCH || s_page == PAGE_PORT) // (+ sub pages)
+#define CTRL_PAGE (s_page == PAGE_CONTROLS || s_page == PAGE_TURBO || s_page == PAGE_TOUCH || s_page == PAGE_PORT || 	s_page == PAGE_STICK) // (+ sub pages)
 // rows in groups (a gap before M_STATES, M_DISPLAY and M_ABOUT): game, states / cheats, settings, about / leave
 // M_REFRESH (read the ROM folder again) only in the game list options (owner: not in the in-game menu)
 enum { M_RESUME, M_RESET, M_TEST, M_STATES, M_CHEATS, M_DISPLAY, M_CONTROLS, M_GAME_SAVE, M_GAME_DEL, M_ABOUT, M_SELECT_GAME, M_EXIT, M_BACK,
-	M_REFRESH, M_UPDATE, M_COUNT };
+	M_REFRESH, M_UPDATE, M_GROUP, M_SNAP, M_FASTBOOT, M_COUNT };
+static const char *const s_group_name[RSTV_GROUP_COUNT] = { "Board", "Year", "Maker", "All" };
 #define GROUP_GAP 10
 // game list options (START in the list): no game. Only Display / Controls / Back, global settings only
 static int s_list_mode;
@@ -825,6 +903,9 @@ static int main_list(int *k)
 	if (s_list_mode) {
 		k[n++] = M_DISPLAY;
 		k[n++] = M_CONTROLS;
+		k[n++] = M_GROUP;
+		k[n++] = M_SNAP;
+		k[n++] = M_FASTBOOT;
 		k[n++] = M_REFRESH;
 		k[n++] = M_UPDATE; // (owner: under Refresh ROM list)
 		k[n++] = M_BACK;
@@ -854,7 +935,11 @@ enum { D_FPS, D_ASPECT, D_ROTATE, D_FILTER, D_SCAN, D_SCAN_STR, D_BORDER, D_BORD
 // A key row: left / right step through the keys, confirm waits for the button to press (key binding).
 // Turbo page: turbo key, turbo button, turbo speed, back (the port's). Touch page: on, show, edit, clear, back
 enum { CK_ACT, CK_TURBO_KEY, CK_TURBO_BTN, CK_TURBO_SPEED, CK_TURBO, CK_STICK, CK_CONFIRM, CK_DEFAULTS, CK_BACK, CK_TOUCH,
-	CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_COMBO, CK_PORT1, CK_PORT2, CK_DEVICE, CK_BIND_ALL, CK_RESET_PORT, CK_ENGINE };
+	CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_COMBO, CK_PORT1, CK_PORT2, CK_DEVICE, CK_BIND_ALL, CK_RESET_PORT, CK_ENGINE,
+	CK_SMAP_SET, CK_SMAP_DIR };
+// Analog sticks page (ADR-235, from ReBOX): per stick its row and the four directions; act = the row (stick = act / STICK_ROWS)
+#define STICK_ROWS (1 + RSTV_SDIR_COUNT)
+#define STICK_PAGE_ROWS (2 * STICK_ROWS + 1)
 static const int s_ctrl_list[] = { CK_PORT1, CK_PORT2, CK_ENGINE, CK_TOUCH, CK_CONFIRM, CK_DEFAULTS, CK_BACK };
 static const int s_port_head[] = { CK_DEVICE, CK_STICK, CK_BIND_ALL };            // (before the buttons)
 static const int s_port_tail[] = { CK_TURBO, CK_COMBO, CK_RESET_PORT, CK_BACK }; // (after coin, start)
@@ -911,7 +996,7 @@ static int ctrl_list(int *k)
 static int port_none(void) { return re_pad_port(s_kp) < 0; }
 static int ctrl_rows(void)
 {
-	return s_page == PAGE_TURBO ? 4 : s_page == PAGE_TOUCH ? 5 : s_page == PAGE_PORT ? (port_none() ? 2 :
+	return s_page == PAGE_TURBO ? 4 : s_page == PAGE_TOUCH ? 5 : s_page == PAGE_STICK ? STICK_PAGE_ROWS : s_page == PAGE_PORT ? (port_none() ? 2 :
 		NOF(s_port_head) + ctrl_buttons() + 2 + NOF(s_port_tail)) : ctrl_list(NULL);
 }
 static int ctrl_kind(int i, int *act)
@@ -920,6 +1005,10 @@ static int ctrl_kind(int i, int *act)
 	*act = -1;
 	if (s_page == PAGE_TURBO)
 		return i < 3 ? CK_TURBO_KEY + i : CK_BACK;
+	if (s_page == PAGE_STICK) {
+		*act = i;
+		return i >= 2 * STICK_ROWS ? CK_BACK : i % STICK_ROWS ? CK_SMAP_DIR : CK_SMAP_SET;
+	}
 	if (s_page == PAGE_TOUCH) {
 		static const int k[5] = { CK_T_ON, CK_T_SHOW, CK_T_EDIT, CK_T_CLEAR, CK_BACK };
 		return i >= 0 && i < 5 ? k[i] : CK_BACK;
@@ -983,9 +1072,39 @@ static void row_set_key(int kind, int act, int key)
 }
 static const char *act_name(int act);
 static const char *row_key_name(int kind, int act) { return kind == CK_ACT ? act_name(act) : "Turbo key"; }
+// ---- duplicate keys (as ReSys12): one Vita key that drives two different things in the running game. func = what the
+// key presses (RSTV_ACT_*, or the turbo key, a combo key: those keys lose their own mapping in the game)
+enum { KF_TURBO = 16, KF_COMBO = 32 };
+typedef struct { int key, func; } KeyUse;
+static int ctrl_buttons(void);
+static int key_uses(KeyUse *u)
+{
+	const rstv_port *p = prt();
+	int n = 0;
+	for (int a = 0; a < RSTV_ACT_COUNT; a++)
+		if ((a >= RSTV_ACT_COIN || a < ctrl_buttons()) && p->keymap[a] < RSTV_KEY_COUNT)
+			u[n++] = (KeyUse){ p->keymap[a], a };
+	if (p->turbo_key < RSTV_KEY_COUNT)
+		u[n++] = (KeyUse){ p->turbo_key, KF_TURBO };
+	for (int k = 0; k < RSTV_KEY_COUNT; k++)
+		if (p->combo[k])
+			u[n++] = (KeyUse){ k, KF_COMBO + k };
+	return n;
+}
+// 1 if key also presses something else than func
+static int key_clash(int key, int func)
+{
+	KeyUse u[RSTV_ACT_COUNT + 1 + RSTV_KEY_COUNT];
+	const int n = key >= 0 && key < RSTV_KEY_COUNT ? key_uses(u) : 0;
+	for (int j = 0; j < n; j++)
+		if (u[j].key == key && u[j].func != func)
+			return 1;
+	return 0;
+}
 static const char *act_name(int act)
 {
-	static const char *const n[RSTV_ACT_COUNT] = { "Button 1", "Button 2", "Button 3", "Button 4", "Coin", "Start" };
+	static const char *const n[RSTV_ACT_COUNT] = { "Button 1", "Button 2", "Button 3", "Button 4", "Button 5", "Button 6", "Coin",
+		"Start" };
 	return n[act];
 }
 int rstv_menu_buttons(void) { return s_nbuttons; }
@@ -1003,7 +1122,9 @@ static const char *row_help(int kind)
 	case CK_CONFIRM: return "The button that confirms in the menus (the other one goes back)";
 	case CK_DEFAULTS: return "Every player's buttons, analog stick, turbo and combo keys back to the defaults";
 	case CK_DEVICE: return "The device this player reads. Auto: the Vita for 1P, then the controllers in order";
-	case CK_STICK: return "The analog stick that works as the d-pad too";
+	case CK_STICK: return "What each direction of the left and right analog sticks presses";
+	case CK_SMAP_SET: return "The whole stick: D-pad or Off. Each direction below on its own";
+	case CK_SMAP_DIR: return "What this direction presses: a lever direction, a game button, coin or start";
 	case CK_BIND_ALL: return "Press each button in turn, from Button 1 to Start";
 	case CK_ACT: return "Confirm, then press the button to use. Left / Right: step through the buttons. Square: None (where it can be)";
 	case CK_TURBO: return "A key that repeats a game button while it is held";
@@ -1040,6 +1161,9 @@ static const char *page_row_help(void)
 		case M_BACK: return "Close the options";
 		case M_REFRESH: return "Read the ROM folder again (ROMs copied while the app runs)";
 		case M_UPDATE: return "Look for a newer version of the app on GitHub and install it";
+		case M_GROUP: return "The game list's tabs: by board, by year, by maker, or all games in one tab";
+		case M_SNAP: return "A second on a game shows its preview: snap/<set>.mp4 (with sound), .png or .jpg";
+		case M_FASTBOOT: return "The BIOS boot screens run unseen at full speed: the game shows in a few seconds";
 		}
 		return NULL;
 	case PAGE_DISPLAY:
@@ -1324,6 +1448,7 @@ static int page_items(void)
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
 	case PAGE_TOUCH:
+	case PAGE_STICK:
 	case PAGE_PORT: return ctrl_rows();
 	case PAGE_TEDIT: return 1;
 	case PAGE_COMBO: return COMBO_ROWS;
@@ -1353,8 +1478,8 @@ static void page_back(void)
 		s_sel = 2; // (Edit touch layout)
 		return;
 	}
-	if (s_page == PAGE_TURBO || s_page == PAGE_COMBO) {
-		const int kind = s_page == PAGE_TURBO ? CK_TURBO : CK_COMBO;
+	if (s_page == PAGE_TURBO || s_page == PAGE_COMBO || s_page == PAGE_STICK) {
+		const int kind = s_page == PAGE_TURBO ? CK_TURBO : s_page == PAGE_STICK ? CK_STICK : CK_COMBO;
 		s_page = PAGE_PORT;
 		s_sel = port_row_of(kind);
 		s_reset_armed = 0;
@@ -1399,10 +1524,25 @@ static const char *const aspect[] = { "4:3", "Full screen", "Integer" };
 static const char *const filter[] = { "Smooth", "Sharp" };
 static const char *const scan[] = { "Off", "CRT soft", "CRT sharp", "Every 2 px", "Every 3 px", "Every 4 px" };
 static const char *const scan_str[] = { "Light", "Medium", "Heavy" };
-static const char *const border[] = { "Black", "Artwork", "Color" };
+static const char *const border[] = { "Black", "Artwork", "Color", "Marquee" };
 static const char *const rotate[] = { "Auto", "Off", "Vertical L", "Vertical R" };
-static const char *const border_col[] = { "Navy", "Gray", "Maroon", "Green", "Purple", "Brick" };
-static const char *const stick[] = { "Off", "Left", "Right", "Both" };
+static const char *const border_col[] = { "Navy", "Gray", "Maroon", "Green", "Purple", "Brick", "Black", "Charcoal",
+	"Silver", "White", "Blue", "Sky", "Teal", "Olive", "Forest", "Brown", "Orange", "Gold", "Red", "Wine", "Pink", "Indigo" };
+// ADR-235: what a stick direction presses, the direction rows' names, a whole stick's state
+static const char *const s_stgt_name[RSTV_STGT_COUNT] = { "None", "Up", "Down", "Left", "Right", "Button 1", "Button 2",
+	"Button 3", "Button 4", "Button 5", "Button 6", "Coin", "Start" };
+static const char *const s_sdir_name[RSTV_SDIR_COUNT] = { "    Up", "    Down", "    Left", "    Right" };
+static const char *const s_sdir_title[2][RSTV_SDIR_COUNT] = { { "Left stick Up", "Left stick Down", "Left stick Left",
+	"Left stick Right" }, { "Right stick Up", "Right stick Down", "Right stick Left", "Right stick Right" } };
+static const char *stick_state(int st)
+{
+	int dpad = 1, none = 1;
+	for (int d = 0; d < RSTV_SDIR_COUNT; d++) {
+		dpad &= prt()->smap[st][d] == RSTV_STGT_UP + d;
+		none &= prt()->smap[st][d] == RSTV_STGT_NONE;
+	}
+	return dpad ? "D-pad" : none ? "Off" : "Custom";
+}
 static const char *const turbo_speed[] = { "Fast (15/s)", "Medium (10/s)", "Slow (7.5/s)" };
 
 static void change(int dir);
@@ -1430,6 +1570,13 @@ static int item_choices(const char **out, int *cur, const char **title)
 	*cur = 0;
 	*title = "";
 	s_choice_keys = 0;
+	if (s_page == PAGE_MAIN && main_kind(s_sel) == M_GROUP) {
+		for (int i = 0; i < RSTV_GROUP_COUNT; i++)
+			out[i] = s_group_name[i];
+		*cur = g_set.list_group;
+		*title = "Group games by";
+		return RSTV_GROUP_COUNT;
+	}
 	if (s_page == PAGE_DISPLAY) {
 		static const char *const t[] = { "", "Screen", "Rotate", "Filter", "Scanlines", "Scanline strength", "Border", "Border color",
 			"Theme" };
@@ -1453,7 +1600,7 @@ static int item_choices(const char **out, int *cur, const char **title)
 		const int k = ctrl_kind(s_sel, &act);
 		static char btn[8][12];
 		if (k == CK_ACT || k == CK_TURBO_KEY) {
-			const int with_none = k == CK_TURBO_KEY || act == RSTV_ACT_B3 || act == RSTV_ACT_B4;
+			const int with_none = k == CK_TURBO_KEY || act_can_none(act);
 			n = RSTV_KEY_COUNT + with_none;
 			for (int i = 0; i < n; i++)
 				out[i] = rstv_key_name(i);
@@ -1490,12 +1637,12 @@ static int item_choices(const char **out, int *cur, const char **title)
 				out[i] = turbo_speed[i];
 			*cur = prt()->turbo_speed;
 			*title = "Turbo speed";
-		} else if (k == CK_STICK) {
-			n = RSTV_STICK_COUNT;
+		} else if (k == CK_SMAP_DIR) {
+			n = RSTV_STGT_COUNT;
 			for (int i = 0; i < n; i++)
-				out[i] = stick[i];
-			*cur = prt()->stick;
-			*title = "Analog stick";
+				out[i] = s_stgt_name[i];
+			*cur = prt()->smap[act / STICK_ROWS][act % STICK_ROWS - 1];
+			*title = s_sdir_title[act / STICK_ROWS][act % STICK_ROWS - 1];
 		}
 	} else if (s_page == PAGE_STATES && s_sel == S_SLOT) {
 		static char slot[STATE_SLOTS][24];
@@ -1588,6 +1735,14 @@ static int engine_list(int *e)
 static void change(int dir)
 {
 	switch (s_page) {
+	case PAGE_MAIN:
+		if (main_kind(s_sel) == M_GROUP)
+			g_set.list_group = wrap(g_set.list_group + dir, RSTV_GROUP_COUNT);
+		else if (main_kind(s_sel) == M_SNAP)
+			g_set.list_snap = !g_set.list_snap;
+		else if (main_kind(s_sel) == M_FASTBOOT)
+			g_set.fast_boot = !g_set.fast_boot;
+		break;
 	case PAGE_DISPLAY:
 		switch (s_sel) {
 		case D_FPS: g_set.fps = !g_set.fps; break;
@@ -1605,12 +1760,12 @@ static void change(int dir)
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
 	case PAGE_TOUCH:
+	case PAGE_STICK:
 	case PAGE_PORT: {
 		int act;
 		const int k = ctrl_kind(s_sel, &act);
-		if (k == CK_ACT) // buttons 3 and 4 can also be None
-			prt()->keymap[act] = wrap(prt()->keymap[act] + dir,
-				(act == RSTV_ACT_B3 || act == RSTV_ACT_B4) ? RSTV_KEY_COUNT + 1 : RSTV_KEY_COUNT);
+		if (k == CK_ACT) // buttons 3-6 can also be None
+			prt()->keymap[act] = wrap(prt()->keymap[act] + dir, act_can_none(act) ? RSTV_KEY_COUNT + 1 : RSTV_KEY_COUNT);
 		else if (k == CK_ENGINE)
 			engine_pick(re_pad_engine_step(g_set.input_engine, dir)); // (VitaControl only when a list names it)
 		else if (k == CK_DEVICE) // (through the sources there are now)
@@ -1623,8 +1778,12 @@ static void change(int dir)
 			prt()->turbo_btn = wrap(prt()->turbo_btn - 1 + dir, ctrl_buttons()) + 1;
 		else if (k == CK_TURBO_SPEED)
 			prt()->turbo_speed = wrap(prt()->turbo_speed + dir, RSTV_TURBO_SPEED_COUNT);
-		else if (k == CK_STICK)
-			prt()->stick = wrap(prt()->stick + dir, RSTV_STICK_COUNT);
+		else if (k == CK_SMAP_SET) // (D-pad / Off; a custom stick goes to the d-pad first)
+			rstv_stick_preset(prt(), act / STICK_ROWS, strcmp(stick_state(act / STICK_ROWS), "D-pad"));
+		else if (k == CK_SMAP_DIR) {
+			int *v = &prt()->smap[act / STICK_ROWS][act % STICK_ROWS - 1];
+			*v = wrap(*v + dir, RSTV_STGT_COUNT);
+		}
 		else if (k == CK_CONFIRM)
 			g_set.confirm = wrap(g_set.confirm + dir, RSTV_CONFIRM_COUNT);
 		else if (k == CK_T_ON)
@@ -1978,6 +2137,8 @@ static rstv_menu_result confirm(void)
 		case M_SELECT_GAME: return RSTV_MENU_SELECT_GAME;
 		case M_REFRESH: return RSTV_MENU_REFRESH;
 		case M_UPDATE: return RSTV_MENU_UPDATE;
+		case M_SNAP:
+		case M_FASTBOOT: change(+1); break;
 		case M_EXIT: return RSTV_MENU_EXIT;
 		case M_BACK: return RSTV_MENU_CLOSE;
 		}
@@ -1989,6 +2150,7 @@ static rstv_menu_result confirm(void)
 	case PAGE_CONTROLS:
 	case PAGE_TURBO:
 	case PAGE_TOUCH:
+	case PAGE_STICK:
 	case PAGE_PORT: {
 		int act;
 		const int k = ctrl_kind(s_sel, &act);
@@ -2027,7 +2189,11 @@ static rstv_menu_result confirm(void)
 		else if (k == CK_COMBO) go_page(PAGE_COMBO);
 		else if (k == CK_BACK) back_out();
 		else if (k == CK_TURBO) go_page(PAGE_TURBO);
-		else if (k == CK_DEFAULTS) rstv_settings_default_keys();
+		else if (k == CK_STICK) go_page(PAGE_STICK);
+		else if (k == CK_DEFAULTS) {
+			rstv_settings_default_keys();
+			rstv_osd_show("Controls restored to defaults (every player)");
+		}
 		else change(+1);
 		break;
 	}
@@ -2056,6 +2222,183 @@ static rstv_menu_result confirm(void)
 	return RSTV_MENU_STAY;
 }
 
+static float s_mscr, s_mtgt; // menu rows scroll (px): drawn, target
+// the options' touch: the last paint's panel, rows (text baselines) and choice window; s_mdrag: the rows scrolled by a
+// drag (the selected row may leave the screen until a button); s_mvel: the rows' flick (px a frame)
+#define MT_ROWS 128
+static int s_mt_px, s_mt_py, s_mt_h, s_mt_ra, s_mt_rb, s_mt_lh, s_mt_n, s_mt_ty[MT_ROWS];
+static int s_mt_wx, s_mt_wy, s_mt_ww, s_mt_wh, s_mt_plh, s_mt_nc;
+static int s_mdrag;
+static float s_mvel;
+static float flick_boost(float v);
+// the touch light in the game list and the menus (ADR-237, from ReBOX): a soft light and a thin ring of the theme's
+// colour under the finger, fading slowly when it leaves. Light added to the picture from two small textures scaled by
+// the video output: nothing is drawn again on the canvases
+#define FX_GLOW 64
+#define FX_RING 128
+#define FX_HOLD 10 // frames
+#define FX_FADE 20
+static void *s_fx_glow, *s_fx_ring;
+// a texture of light: f = strength by distance from the centre (0-1), white = how far towards white, by distance too
+static void fx_fill(void *tex, int size, uint32_t rgb, float (*f)(float), float (*white)(float))
+{
+	int stride;
+	uint32_t *px = rstv_video_fx_pixels(tex, &stride);
+	const unsigned r = rgb & 0xFF, g = rgb >> 8 & 0xFF, b = rgb >> 16 & 0xFF;
+	for (int y0 = 0; y0 < size; y0++)
+		for (int x0 = 0; x0 < size; x0++) {
+			const float dx = (x0 + 0.5f) / (size / 2) - 1.0f, dy = (y0 + 0.5f) / (size / 2) - 1.0f, d = sqrtf(dx * dx + dy * dy);
+			const float a = d < 1.0f ? f(d) : 0.0f, w = white(d);
+			const float cr = r + (255 - r) * w, cg = g + (255 - g) * w, cb = b + (255 - b) * w;
+			px[(size_t)y0 * stride + x0] = (uint32_t)(cr * a) | (uint32_t)(cg * a) << 8 | (uint32_t)(cb * a) << 16 |
+				(uint32_t)(255 * a) << 24; // (premultiplied: the corners add nothing)
+		}
+}
+static float fx_glow_f(float d) // (no edge: a blur, brightest in the middle)
+{
+	const float a = 1.0f - d * d;
+	return a * a * a;
+}
+static float fx_glow_w(float d) { return d < 0.5f ? 0.55f * (1.0f - 2.0f * d) : 0.0f; }
+static float fx_ring_f(float d) // (a thin line, soft on both sides, and a faint trail inside it)
+{
+	float a = 1.0f - fabsf(d - 0.9f) / 0.07f;
+	a = a < 0.0f ? 0.0f : a * a * (3.0f - 2.0f * a);
+	const float tr = d < 0.9f ? 0.16f * d * d * d : 0.0f;
+	return a > tr ? a : tr;
+}
+static float fx_ring_w(float d) { (void)d; return 0.35f; }
+static void fx_make(void)
+{
+	static int gen = -1;
+	theme();
+	if (gen == s_theme_gen)
+		return;
+	if (!s_fx_glow)
+		s_fx_glow = rstv_video_fx_tex(FX_GLOW);
+	if (!s_fx_ring)
+		s_fx_ring = rstv_video_fx_tex(FX_RING);
+	if (!s_fx_glow || !s_fx_ring)
+		return;
+	gen = s_theme_gen;
+	fx_fill(s_fx_glow, FX_GLOW, COL_SEL, fx_glow_f, fx_glow_w);
+	fx_fill(s_fx_ring, FX_RING, COL_SEL, fx_ring_f, fx_ring_w);
+}
+static float ease_out(float t) { return t * (2.0f - t); }
+// once a frame, with the touches now
+static void touch_fx(int tn, int x, int y)
+{
+	static int down, age, fade;
+	static float fx, fy;
+	fx_make();
+	if (tn) {
+		if (!down)
+			age = 0;
+		down = 1;
+		fade = 0;
+		fx = (float)x;
+		fy = (float)y;
+		if (age < FX_HOLD)
+			age++;
+		const float e = ease_out((float)age / FX_HOLD);
+		rstv_video_touch_fx(0, s_fx_glow, fx, fy, 24.0f + 14.0f * e, 0.3f + 0.3f * e);
+		rstv_video_touch_fx(1, s_fx_ring, fx, fy, 19.0f + 10.0f * e, 0.45f * e);
+		return;
+	}
+	if (down) {
+		down = 0;
+		fade = 1;
+	}
+	if (!fade)
+		return;
+	const float e = ease_out((float)age / FX_HOLD), l = 1.0f - (float)fade / FX_FADE; // (as it was, only fainter)
+	rstv_video_touch_fx(0, s_fx_glow, fx, fy, 24.0f + 14.0f * e, (0.3f + 0.3f * e) * l);
+	rstv_video_touch_fx(1, s_fx_ring, fx, fy, 19.0f + 10.0f * e, 0.45f * e * l);
+	fade = fade < FX_FADE ? fade + 1 : 0;
+}
+
+// the options' touch (from ReBOX, ADR-234): a tap on a row selects it, on the selected row confirms it; on a value of
+// the choice window picks it; outside the panel (or the choice window) = back. A drag scrolls a long page, a flick
+// glides on. Returns the SCE_CTRL bits the tap stands for
+static uint32_t menu_touch(int o_ok)
+{
+	static int down, x0, y0, last, moved, stopped;
+	int tx[6], ty[6];
+	const int tn = rstv_touch_read(tx, ty);
+	const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
+	if (tn) {
+		if (!down) {
+			down = 1;
+			x0 = tx[0];
+			y0 = last = ty[0];
+			moved = 0;
+			stopped = s_mvel != 0.0f; // (a touch that stops the rows is not a tap)
+			s_mvel = 0;
+		} else {
+			if (abs(ty[0] - y0) > 12 || abs(tx[0] - x0) > 12)
+				moved = 1;
+			if (moved && !s_pop && s_page != PAGE_ABOUT && x0 >= s_mt_px && x0 < s_mt_px + PANEL_W && y0 >= s_mt_ra &&
+				y0 < s_mt_rb) {
+				const float d = (float)(ty[0] - last);
+				s_mtgt -= d;
+				s_mscr = s_mtgt;
+				s_mvel = s_mvel * 0.5f - d * 0.5f;
+				s_mdrag = 1;
+				s_dirty = 1;
+			}
+			last = ty[0];
+		}
+		return 0;
+	}
+	if (!down) {
+		if (s_mvel != 0.0f) { // after a flick the rows go on, slowing down
+			s_mtgt += s_mvel;
+			s_mscr = s_mtgt;
+			s_mvel *= 0.95f;
+			if (fabsf(s_mvel) < 0.6f)
+				s_mvel = 0;
+			s_dirty = 1;
+		}
+		return 0;
+	}
+	down = 0;
+	if (moved) {
+		s_mvel = flick_boost(s_mvel / LINE_H) * LINE_H;
+		return 0;
+	}
+	if (stopped)
+		return 0;
+	s_dirty = 1;
+	if (s_pop) { // the choice window: a value picks it, outside closes
+		if (x0 < s_mt_wx || x0 >= s_mt_wx + s_mt_ww || y0 < s_mt_wy || y0 >= s_mt_wy + s_mt_wh)
+			return back;
+		const int i = s_mt_plh > 0 ? (y0 - (s_mt_wy + 60)) / s_mt_plh : -1;
+		if (y0 >= s_mt_wy + 60 && i >= 0 && i < s_mt_nc) {
+			s_pop_sel = i;
+			return ok;
+		}
+		return 0;
+	}
+	if (x0 < s_mt_px || x0 >= s_mt_px + PANEL_W || y0 < s_mt_py || y0 >= s_mt_py + s_mt_h)
+		return back; // (outside the panel: back, as the back button)
+	if (s_page == PAGE_ABOUT)
+		return back;
+	if (y0 < s_mt_ra || y0 >= s_mt_rb)
+		return 0;
+	for (int i = 0; i < s_mt_n && i < MT_ROWS; i++) {
+		const int top = s_mt_ty[i] - 7 - s_mt_lh / 2;
+		if (y0 >= top && y0 < top + s_mt_lh) {
+			s_mdrag = 0;
+			if (i == s_sel)
+				return ok; // (the selected row again: as the confirm button)
+			s_sel = i;
+			s_reset_armed = 0;
+			return 0;
+		}
+	}
+	return 0;
+}
+
 rstv_menu_result rstv_menu_update(uint32_t buttons)
 {
 	const int ps_closed = ps_poll();
@@ -2065,12 +2408,22 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 	uint32_t pressed = key_repeat(buttons, buttons & ~s_prev_buttons, &rep_count);
 	s_prev_buttons = buttons;
 	if (pressed)
+		s_mdrag = 0; // (the buttons bring the selected row back on screen)
+	if (s_page != PAGE_TEDIT && !s_bind && !s_vc_ask)
+		pressed |= menu_touch(g_set.confirm == RSTV_CONFIRM_CIRCLE);
+	if (!s_list_mode) { // (the list's loop has its own: one tick a frame)
+		int fxx[6], fxy[6];
+		const int fxn = rstv_touch_read(fxx, fxy);
+		touch_fx(fxn, fxx[0], fxy[0]);
+	}
+	if (pressed)
 		s_dirty = 1;
 	if (re_pad_changed()) { // a controller came or went: the Port pages and the Device list show them, the whole panel again
 		s_dirty = 1;
 		s_drawn_h = 0;
 		s_pad_redraw = 1; // (the game list options draw again only when told)
-		if (!re_pad_player_shown(s_kp) && (s_page == PAGE_PORT || s_page == PAGE_TURBO || s_page == PAGE_COMBO)) {
+		if (!re_pad_player_shown(s_kp) && (s_page == PAGE_PORT || s_page == PAGE_TURBO || s_page == PAGE_COMBO ||
+			s_page == PAGE_STICK)) {
 			// the device of this port went away (its row is gone): back to Controls
 			s_pop = s_bind = 0;
 			go_page(PAGE_CONTROLS);
@@ -2209,7 +2562,7 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 		if ((pressed & SCE_CTRL_SQUARE) && CTRL_PAGE && !ps_closed) { // a key row that can be none: Square sets None
 			int act, cur;
 			const int k = ctrl_kind(s_sel, &act);
-			if (row_key(k, act, &cur) && (k == CK_TURBO_KEY || act == RSTV_ACT_B3 || act == RSTV_ACT_B4)) {
+			if (row_key(k, act, &cur) && (k == CK_TURBO_KEY || act_can_none(act))) {
 				row_set_key(k, act, RSTV_KEY_NONE);
 				s_dirty = 1;
 				return RSTV_MENU_STAY;
@@ -2388,15 +2741,22 @@ static int combo_width(int mask) // (draw_combo's width without drawing)
 	return w + (n > 1 ? ui_text_width(1.0f, "+") + 10 : 0);
 }
 
-static void item_key(UiCanvas *c, int px, int ty, int i, int sel, const char *name, int key)
+// clash: the key also does something else in this game (warning colour and "! duplicate", as ReSys12)
+static void item_key_w(UiCanvas *c, int px, int ty, int i, int sel, const char *name, int key, int clash)
 {
-	const uint32_t col = (i == sel) ? COL_SEL : COL_TEXT;
+	const uint32_t col = clash ? COL_WARN : (i == sel) ? COL_SEL : COL_TEXT;
 	item(c, px, ty, i, sel, name, NULL);
 	int x = px + VALUE_X;
 	ui_text(c, x, ty, col, 1.0f, "<");
 	x += ui_text_width(1.0f, "< ");
 	x += draw_key(c, x, ty - 7, ty, key, col);
-	ui_text(c, x + 6, ty, col, 1.0f, ">");
+	x += 6 + ui_text(c, x + 6, ty, col, 1.0f, ">");
+	if (clash)
+		ui_text(c, x + 8, ty, COL_WARN, 1.0f, "! duplicate");
+}
+static void item_key(UiCanvas *c, int px, int ty, int i, int sel, const char *name, int key)
+{
+	item_key_w(c, px, ty, i, sel, name, key, 0);
 }
 
 // one line of text (size 0.8): symbol chars (0x10-0x13) drawn as button icons
@@ -2424,10 +2784,73 @@ static void text_keys(UiCanvas *c, int x, int ty, uint32_t col, const char *s)
 		run[k++] = (char)ch;
 	}
 }
+// the width text_keys would take for s
+static int keys_width(const char *s)
+{
+	char run[128];
+	int k = 0, w = 0;
+	for (const char *p = s;; p++) {
+		const unsigned char ch = (unsigned char)*p;
+		if ((ch >= 0x10 && ch <= 0x13) || !ch || k == (int)sizeof(run) - 1) {
+			run[k] = 0;
+			if (k)
+				w += ui_text_width(0.8f, run);
+			k = 0;
+			if (!ch)
+				break;
+			if (ch >= 0x10 && ch <= 0x13) {
+				w += 22;
+				continue;
+			}
+		}
+		run[k++] = (char)ch;
+	}
+	return w;
+}
+// footer pill button (from ReBOX): dark glass, a faint top sheen and a thin light outline
+static void foot_button(UiCanvas *c, int x, int y, int w, int h)
+{
+	rrect(c, x, y, w, h, h / 2, UI_RGBA(0, 0, 0, 0x48));
+	rrect(c, x + 1, y + 1, w - 2, h / 2 - 1, h / 2 - 1, UI_RGBA(0xFF, 0xFF, 0xFF, 0x0C));
+	rrect_outline(c, x, y, w, h, h / 2, 1, UI_RGBA(0xFF, 0xFF, 0xFF, 0x38));
+}
+// a flick carries further the faster it was (rows per frame)
+static float flick_boost(float v)
+{
+	const float a = fabsf(v);
+	return v * (1.0f + (a > 1.5f ? 1.5f : a) * 1.2f);
+}
+// touch targets of the game list, recorded when it is drawn: footer pills, tabs
+#define GL_FT_MAX 8
+static int s_ft_n, s_ft_x0[GL_FT_MAX], s_ft_x1[GL_FT_MAX];
+static uint32_t s_ft_key[GL_FT_MAX];
+#define GL_FT_ABOUT 0x40000000u // (the footer's About: touch only, no pad key)
+#define GL_GEAR_CX (SCREEN_W - 32)
+#define GL_GEAR_CY (SCREEN_H - LIST_FOOT_H / 2)
+#define GL_GEAR_R 13
+// a gear (the options button): 8 teeth on a ring, a hole in the middle, 4x4 samples a pixel
+static void gear(UiCanvas *c, float cx, float cy, float r, uint32_t rgb)
+{
+	const float body = r * 0.72f, hole = r * 0.32f;
+	for (int py = (int)(cy - r) - 1; py <= (int)(cy + r) + 1; py++)
+		for (int px = (int)(cx - r) - 1; px <= (int)(cx + r) + 1; px++) {
+			int hits = 0;
+			for (int s = 0; s < 16; s++) {
+				const float dx = px + 0.125f + 0.25f * (s & 3) - cx, dy = py + 0.125f + 0.25f * (s >> 2) - cy;
+				const float d = sqrtf(dx * dx + dy * dy);
+				if (d < hole || d > r)
+					continue;
+				hits += d <= body || cosf(8.0f * atan2f(dy, dx)) > 0.25f;
+			}
+			if (hits)
+				ui_rect(c, px, py, 1, 1, (rgb & 0x00FFFFFFu) | ((uint32_t)(hits * 255 / 16) << 24));
+		}
+}
+#define GL_TAB_MAX 64 // (= MAX_TABS)
+static int s_tab_x0[GL_TAB_MAX], s_tab_x1[GL_TAB_MAX];
 
 // Draw the menu panel to the canvas (caller uploads). overlay = over the game list (dim without clearing the canvas, then the panel)
 static int s_paint_x0, s_paint_y0, s_paint_x1, s_paint_y1;
-static float s_mscr, s_mtgt; // menu rows scroll (px): drawn, target
 static const uint32_t *s_under; // game list options: the dimmed list under the window (NULL: just drawn in full)
 static int menu_anim(void) { return s_mscr != s_mtgt || s_help_scroll; } // (the menu is still moving: draw again)
 static void tedit_paint(UiCanvas *c);
@@ -2461,7 +2884,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 		const int sy = s_sel * lh + gap_at[s_sel < n ? s_sel : 0];
 		if (s_page == PAGE_ABOUT)
 			s_mtgt = 0;
-		else {
+		else if (!s_mdrag) {
 			if (sy - lh < s_mtgt)
 				s_mtgt = (float)(sy - lh);
 			if (sy + 2 * lh > s_mtgt + view)
@@ -2520,6 +2943,10 @@ static void menu_paint(UiCanvas *c, int overlay)
 	case PAGE_TURBO:
 		title = s_kp ? "2P TURBO" : "1P TURBO";
 		foot = "Hold the turbo key: the turbo button repeats";
+		break;
+	case PAGE_STICK:
+		title = s_kp ? "2P ANALOG STICKS" : "1P ANALOG STICKS";
+		foot = "Each direction of a stick presses what it is given";
 		break;
 	case PAGE_COMBO:
 		title = s_kp ? "2P COMBO KEYS" : "1P COMBO KEYS";
@@ -2601,6 +3028,17 @@ static void menu_paint(UiCanvas *c, int overlay)
 	ui_clip_y(c, ra, rb);
 	s_focus_cy0 = ra;
 	s_focus_cy1 = rb;
+	// (for the touch: the panel, its rows and their text baselines as drawn now)
+	s_mt_px = px;
+	s_mt_py = py;
+	s_mt_h = h;
+	s_mt_ra = ra;
+	s_mt_rb = rb;
+	s_mt_lh = lh;
+	s_mt_n = n;
+	s_mt_nc = 0;
+	for (int i = 0; i < n && i < MT_ROWS; i++)
+		s_mt_ty[i] = ra + i * lh + gap_at[i] - scr + lh / 2 + 7;
 	for (int i = 0; i < n; i++) {
 		const int ty = ra + i * lh + gap_at[i] - scr + lh / 2 + 7;
 		if (ty + lh < ra || ty - lh > rb)
@@ -2609,7 +3047,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 		case PAGE_MAIN: {
 			static const char *const names[M_COUNT] = { "Resume game", "Reset game", "Press TEST switch (BIOS menu)", "Save / Load state  >",
 				"Cheats  >", "Display  >", "Controls  >", "Save game settings", "Delete game settings", "About  >", "Select game", "Exit",
-				"Back", "Refresh ROM list", "Check for updates" };
+				"Back", "Refresh ROM list", "Check for updates", "Group games by", "Snap", "Fast boot" };
 			const int k = main_kind(i);
 			const char *name = names[k];
 			char rbuf[64];
@@ -2617,7 +3055,8 @@ static void menu_paint(UiCanvas *c, int overlay)
 				snprintf(rbuf, sizeof(rbuf), "Reset game - press %s again", o_ok ? "Circle" : "Cross");
 				name = rbuf;
 			}
-			item(c, px, ty, i, s_sel, name, NULL);
+			item(c, px, ty, i, s_sel, name, k == M_GROUP ? s_group_name[g_set.list_group] :
+				k == M_SNAP ? (g_set.list_snap ? VAL_ON : VAL_OFF) : k == M_FASTBOOT ? (g_set.fast_boot ? VAL_ON : VAL_OFF) : NULL);
 			break;
 		}
 		case PAGE_DISPLAY: {
@@ -2641,13 +3080,14 @@ static void menu_paint(UiCanvas *c, int overlay)
 		case PAGE_CONTROLS:
 		case PAGE_TURBO:
 		case PAGE_TOUCH:
+		case PAGE_STICK:
 		case PAGE_PORT: {
 			int act, cur;
 			const int k = ctrl_kind(i, &act);
 			if (s_bind && i == s_sel && row_key(k, act, &cur))
 				item(c, px, ty, i, s_sel, row_key_name(k, act), "Press a button...");
 			else if (k == CK_ACT)
-				item_key(c, px, ty, i, s_sel, act_name(act), prt()->keymap[act]);
+				item_key_w(c, px, ty, i, s_sel, act_name(act), prt()->keymap[act], key_clash(prt()->keymap[act], act));
 			else if (k == CK_PORT1 || k == CK_PORT2) {
 				char pbuf[48], lbuf[24];
 				snprintf(lbuf, sizeof(lbuf), "%dP Controller  >", k == CK_PORT2 ? 2 : 1);
@@ -2676,7 +3116,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 			} else if (k == CK_T_CLEAR)
 				item(c, px, ty, i, s_sel, s_reset_armed && i == s_sel ? "Clear touch layout - press again" : "Clear touch layout", NULL);
 			else if (k == CK_TURBO_KEY)
-				item_key(c, px, ty, i, s_sel, "Turbo key", prt()->turbo_key);
+				item_key_w(c, px, ty, i, s_sel, "Turbo key", prt()->turbo_key, key_clash(prt()->turbo_key, KF_TURBO));
 			else if (k == CK_TURBO_BTN) {
 				char bbuf[16];
 				snprintf(bbuf, sizeof(bbuf), "Button %d", prt()->turbo_btn);
@@ -2686,7 +3126,12 @@ static void menu_paint(UiCanvas *c, int overlay)
 			else if (k == CK_TURBO)
 				item(c, px, ty, i, s_sel, "Turbo  >", NULL);
 			else if (k == CK_STICK)
-				item(c, px, ty, i, s_sel, "Analog stick to d-pad", stick[prt()->stick]);
+				item(c, px, ty, i, s_sel, "Analog sticks  >", NULL);
+			else if (k == CK_SMAP_SET)
+				item(c, px, ty, i, s_sel, act / STICK_ROWS ? "Right stick" : "Left stick", stick_state(act / STICK_ROWS));
+			else if (k == CK_SMAP_DIR)
+				item(c, px, ty, i, s_sel, s_sdir_name[act % STICK_ROWS - 1],
+					s_stgt_name[prt()->smap[act / STICK_ROWS][act % STICK_ROWS - 1]]);
 			else if (k == CK_CONFIRM)
 				item_key(c, px, ty, i, s_sel, "Menu confirm button", o_ok ? RSTV_KEY_CIRCLE : RSTV_KEY_CROSS);
 			else
@@ -2811,6 +3256,12 @@ static void menu_paint(UiCanvas *c, int overlay)
 			const int ww = 380, wh = 64 + nc * plh + 12, wx = (SCREEN_W - ww) / 2, wy = (SCREEN_H - wh) / 2;
 			if (wy - 8 < s_paint_y0) s_paint_y0 = wy - 8;
 			if (wy + wh + 16 > s_paint_y1) s_paint_y1 = wy + wh + 16;
+			s_mt_wx = wx;
+			s_mt_wy = wy;
+			s_mt_ww = ww;
+			s_mt_wh = wh;
+			s_mt_plh = plh;
+			s_mt_nc = nc;
 			ui_rect(c, px, py, PANEL_W, h, UI_RGBA(0x00, 0x00, 0x00, 0x80)); // dim the panel under it
 			window_box(c, wx, wy, ww, wh, COL_SEL, COL_PANEL);
 			ui_text(c, wx + 24, wy + 38, COL_TEXT, 1.0f, title);
@@ -3281,16 +3732,43 @@ void rstv_fps_hide(void)
 // ================================ start screen game select ================================
 // ADR-096·126 (same look and behavior as Reirem rei_game_select): all MAME ST-V and System C/C2 games (stv_list.h). Tab = board, switched with L/R.
 // SELECT = filter (Playable: games with ROMs / All: everything, games without ROMs gray, picking one shows a notice / Favorites). □ = favorite on/off (★ mark),
-// START = options (Display, Controls, global settings), △ = About. Bright if ROMs exist even when not yet supported (ADR-106, picking shows a notice)
+// START = options (Display, Controls, global settings), △ = search (ADR-232; About on the footer). Bright if ROMs exist even when not yet supported (ADR-106, picking shows a notice)
 #define COL_GREY     (theme()->grey)
 #define COL_GREY_SEL (theme()->grey_sel)
 static int s_gl_present[RSTV_LIST_N], s_gl_supported[RSTV_LIST_N];
 static int gl_playable(int i) { return s_gl_present[i]; }
 static const char *const s_gl_filter_name[RSTV_LIST_FILTER_COUNT] = { "Playable", "All", "Favorites" };
 
-// games visible under the current filter
+// the list's search (triangle, from ReBOX): ROM name or title containing the text, any case; its games in one tab of
+// their own (ADR-232)
+static char s_search[32];
+static char s_search_tab[48];
+static int contains_nocase(const char *h, const char *n)
+{
+	const size_t ln = strlen(n);
+	for (; h && *h; h++)
+		if (!strncasecmp(h, n, ln))
+			return 1;
+	return 0;
+}
+// the game's tab: its board, or the search results' one
+static const char *gl_tab_name(int i)
+{
+	if (s_search[0])
+		return s_search_tab;
+	switch (g_set.list_group) { // ADR-233
+	case RSTV_GROUP_YEAR: return s_stv_list[i].year ? s_stv_list[i].year : "Unknown";
+	case RSTV_GROUP_MAKER: return s_stv_list[i].maker ? s_stv_list[i].maker : "Unknown";
+	case RSTV_GROUP_ALL: return "All games";
+	default: return s_stv_list[i].board;
+	}
+}
+
+// games visible under the current filter (and the search)
 static int gl_visible(int i)
 {
+	if (s_search[0] && !contains_nocase(s_stv_list[i].set, s_search) && !contains_nocase(s_stv_list[i].title, s_search))
+		return 0;
 	if (g_set.list_filter == RSTV_LIST_ALL)
 		return 1;
 	if (g_set.list_filter == RSTV_LIST_FAVORITES)
@@ -3298,7 +3776,7 @@ static int gl_visible(int i)
 	return gl_playable(i);
 }
 
-#define MAX_TABS 8
+#define MAX_TABS 64
 static const char *s_gl_tabs[MAX_TABS];
 static int s_gl_ntabs, s_gl_tab, s_gl_nvis;
 
@@ -3313,25 +3791,40 @@ static int gl_build(int *idx, int want, int *sel)
 			continue;
 		s_gl_nvis++;
 		int t = 0;
-		while (t < s_gl_ntabs && strcmp(s_gl_tabs[t], s_stv_list[i].board))
+		while (t < s_gl_ntabs && strcmp(s_gl_tabs[t], gl_tab_name(i)))
 			t++;
 		if (t == s_gl_ntabs && s_gl_ntabs < MAX_TABS)
-			s_gl_tabs[s_gl_ntabs++] = s_stv_list[i].board;
+			s_gl_tabs[s_gl_ntabs++] = gl_tab_name(i);
 	}
+	if (g_set.list_group == RSTV_GROUP_YEAR || g_set.list_group == RSTV_GROUP_MAKER) // (tabs in order)
+		for (int a = 1; a < s_gl_ntabs; a++)
+			for (int b = a; b > 0 && strcasecmp(s_gl_tabs[b - 1], s_gl_tabs[b]) > 0; b--) {
+				const char *t = s_gl_tabs[b];
+				s_gl_tabs[b] = s_gl_tabs[b - 1];
+				s_gl_tabs[b - 1] = t;
+			}
 	s_gl_tab = 0;
-	const char *tb = want >= 0 && gl_visible(want) ? s_stv_list[want].board : cur;
+	const char *tb = want >= 0 && gl_visible(want) ? gl_tab_name(want) : cur;
 	for (int t = 0; tb && t < s_gl_ntabs; t++)
 		if (!strcmp(s_gl_tabs[t], tb))
 			s_gl_tab = t;
 	int n = 0;
 	*sel = 0;
 	for (int i = 0; i < RSTV_LIST_N && s_gl_ntabs; i++) {
-		if (!gl_visible(i) || strcmp(s_stv_list[i].board, s_gl_tabs[s_gl_tab]))
+		if (!gl_visible(i) || strcmp(gl_tab_name(i), s_gl_tabs[s_gl_tab]))
 			continue;
-		if (i == want)
-			*sel = n;
 		idx[n++] = i;
 	}
+	if (g_set.list_group != RSTV_GROUP_BOARD || s_search[0]) // (games of several boards: A-Z by title)
+		for (int a = 1; a < n; a++)
+			for (int b = a; b > 0 && strcasecmp(s_stv_list[idx[b - 1]].title, s_stv_list[idx[b]].title) > 0; b--) {
+				const int t = idx[b];
+				idx[b] = idx[b - 1];
+				idx[b - 1] = t;
+			}
+	for (int k = 0; k < n; k++)
+		if (idx[k] == want)
+			*sel = k;
 	return n;
 }
 
@@ -3437,7 +3930,10 @@ static void gl_scrollbar(UiCanvas *c, int n, float scr, float rows_f, int la, in
 static void gl_header(UiCanvas *c, int n, int sel)
 {
 	char title[96];
-	snprintf(title, sizeof(title), " (" RSTV_VERSION ") - SELECT GAME (%d/%d)", n ? sel + 1 : 0, n);
+	if (s_search[0])
+		snprintf(title, sizeof(title), " (" RSTV_VERSION ") - Search : %s (%d/%d)", s_search, n ? sel + 1 : 0, n);
+	else
+		snprintf(title, sizeof(title), " (" RSTV_VERSION ") - SELECT GAME (%d/%d)", n ? sel + 1 : 0, n);
 	const int bw = draw_brand(c, 24, 36, 1.1f);
 	ui_text(c, 24 + bw, 36, COL_TEXT, 1.1f, title);
 	char have[40];
@@ -3567,7 +4063,14 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 	static int upd_offered; // (once per run, ADR-209)
 	static int upd_asked;   // ADR-213: "Check for updates" running: its answer is shown
 	uint64_t rep = 0;
+	int group0 = g_set.list_group; // (the grouping the tabs were built with)
+	int pv_game = -1, pv_t = 0; // ADR-239 the preview: the game the cursor rests on, frames since
+	float pv_hide = 0.0f;
 	float scr = -1, tgt = 0; // list scroll (rows): drawn position easing to the target
+	// touch: finger down, start point, last y, moved past the tap slop, started on the list; drag = the list was
+	// moved by touch (the cursor need not stay in view), vel = glide after a flick (rows per frame)
+	int t_down = 0, t_x0 = 0, t_y0 = 0, t_last = 0, t_moved = 0, t_list = 0, t_stop = 0, drag = 0;
+	float vel = 0;
 	static uint32_t *under; // the dimmed list under the options window
 	int under_ok = 0, under_gen = 0;
 	int mq_sel = -1, mq_t = 0, mq_tw = 0; // scrolling title of the selected row (marquee)
@@ -3667,6 +4170,88 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			dirty = 1;
 		const int o_ok = g_set.confirm == RSTV_CONFIRM_CIRCLE;
 		const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
+		if (pressed) { // buttons take over from the finger: no glide, the cursor kept in view again
+			drag = 0;
+			vel = 0;
+		}
+		{ // touch (from ReBOX): tap a tab, a row (the cursor row starts it, the star toggles favorite), a footer
+		  // pill; drag the list, a flick glides on
+			int tx[6], ty[6];
+			const int tall = rstv_touch_read(tx, ty);
+			touch_fx(tall, tx[0], ty[0]); // (the light under the finger, over the options too)
+			const int tn = (!upd && !s_list_mode && !about) ? tall : 0;
+			const int la = TITLE_H + 40, lb = SCREEN_H - LIST_FOOT_H;
+			if (tn > 0) {
+				if (!t_down) {
+					t_down = 1;
+					t_x0 = tx[0];
+					t_y0 = t_last = ty[0];
+					t_moved = 0;
+					t_list = !msg[0] && ty[0] >= la && ty[0] < lb;
+					t_stop = vel != 0; // (a touch during a glide only stops it)
+					vel = 0;
+				} else if (t_list) {
+					if (!t_moved && (abs(ty[0] - t_y0) > 12 || abs(tx[0] - t_x0) > 12))
+						t_moved = 1;
+					if (t_moved) {
+						const float d = (float)(ty[0] - t_last) / GL_LINE;
+						tgt -= d;
+						scr = tgt; // (the rows follow the finger)
+						vel = vel * 0.5f - d * 0.5f;
+						drag = 1;
+						dirty = 1;
+					}
+					t_last = ty[0];
+				}
+			} else if (t_down) {
+				t_down = 0;
+				if (t_moved)
+					vel = flick_boost(vel);
+				else if (t_stop)
+					; // (it only stopped the list)
+				else if (msg[0])
+					pressed |= ok; // (closes the notice)
+				else if ((t_x0 - GL_GEAR_CX) * (t_x0 - GL_GEAR_CX) + (t_y0 - GL_GEAR_CY) * (t_y0 - GL_GEAR_CY) < 30 * 30)
+					pressed |= SCE_CTRL_START; // the gear: options
+				else if (t_y0 < TITLE_H) { // the filter's name at the top right
+					if (t_x0 > SCREEN_W - 200)
+						pressed |= SCE_CTRL_SELECT;
+				} else if (t_y0 >= lb) { // footer pill
+					for (int k = 0; k < s_ft_n; k++)
+						if (t_x0 >= s_ft_x0[k] && t_x0 < s_ft_x1[k])
+							pressed |= s_ft_key[k];
+				} else if (t_y0 >= TITLE_H && t_y0 < la) { // tab
+					for (int t = 0; t < s_gl_ntabs && t < GL_TAB_MAX; t++)
+						if (t_x0 >= s_tab_x0[t] && t_x0 < s_tab_x1[t] && t != s_gl_tab) {
+							s_gl_tab = t;
+							int first = -1;
+							for (int i = 0; i < RSTV_LIST_N && first < 0; i++)
+								if (gl_visible(i) && !strcmp(gl_tab_name(i), s_gl_tabs[s_gl_tab]))
+									first = i;
+							n = gl_build(idx, first, &sel);
+							scr = -1;
+							drag = 0;
+							dirty = 1;
+						}
+				} else if (t_list && scr >= 0) { // row
+					const int i = (int)floorf((float)(t_y0 - la - 18) / GL_LINE + scr);
+					if (i >= 0 && i < n) {
+						if (t_x0 < 60) {
+							sel = i;
+							pressed |= SCE_CTRL_SQUARE;
+						} else if (i == sel)
+							pressed |= ok;
+						else
+							sel = i;
+						drag = 1; // (the tapped row stays where it is)
+						vel = 0;
+						dirty = 1;
+					}
+				}
+			}
+		}
+		if (pressed) // (a tap's key: drawn at once, as a button press; the gear's options opened only at the next key)
+			dirty = 1;
 #ifdef RSTV_DEBUG_TOOLS
 		{ // diag: ux0:data/restv/listpick = pick the game under the cursor 3 s after the list shows (timing of the pick)
 			static uint64_t lp_t0;
@@ -3677,6 +4262,24 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				sceIoRemove(DATA_DIR "/listpick");
 				pressed |= ok;
 				lp_t0 = 0;
+			}
+			if (sceIoGetstat(DATA_DIR "/listshot", &lst) >= 0) { // diag: the list canvas (header, tabs, footer) as a ppm
+				sceIoRemove(DATA_DIR "/listshot");
+				ui_save_ppm(c, DATA_DIR "/listshot.ppm", UI_RGBA(0, 0, 0, 0xFF));
+			}
+			if (sceIoGetstat(DATA_DIR "/listkey", &lst) >= 0 && lst.st_size > 0) { // diag: a button press from the file (hex mask;
+				                                                                    // empty: still being uploaded)
+				FILE *kf = fopen(DATA_DIR "/listkey", "r");
+				unsigned km = 0;
+				if (kf) {
+					if (fscanf(kf, "%x", &km) != 1)
+						km = 0;
+					fclose(kf);
+				}
+				sceIoRemove(DATA_DIR "/listkey");
+				RSTV_LOG("list: test key %x", km);
+				pressed |= km;
+				dirty = 1;
 			}
 		}
 #endif
@@ -3729,6 +4332,12 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				s_page = PAGE_MAIN;
 				ui_clear(c);
 			}
+			if (g_set.list_group != group0) { // (another grouping: the same game, in its tab)
+				group0 = g_set.list_group;
+				n = gl_build(idx, n ? idx[sel] : -1, &sel);
+				scr = -1;
+				dirty = 1;
+			}
 			if (mr == RSTV_MENU_UPDATE) { // ADR-213
 				rstv_update_check_now();
 				upd_asked = 1;
@@ -3769,7 +4378,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				s_gl_tab = wrap(s_gl_tab + ((pressed & SCE_CTRL_LTRIGGER) ? -1 : 1), s_gl_ntabs);
 				int first = -1; // first game of that tab
 				for (int i = 0; i < RSTV_LIST_N && first < 0; i++)
-					if (gl_visible(i) && !strcmp(s_stv_list[i].board, s_gl_tabs[s_gl_tab]))
+					if (gl_visible(i) && !strcmp(gl_tab_name(i), s_gl_tabs[s_gl_tab]))
 						first = i;
 				n = gl_build(idx, first, &sel);
 				scr = -1;
@@ -3785,7 +4394,30 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				if (g_set.list_filter == RSTV_LIST_FAVORITES && !gl_visible(cur))
 					w2 = sel + 1 < n ? idx[sel + 1] : (sel > 0 ? idx[sel - 1] : -1);
 				n = gl_build(idx, w2, &sel);
-			} else if (pressed & SCE_CTRL_TRIANGLE) {
+			} else if (pressed & SCE_CTRL_TRIANGLE) { // search; again: the whole list, at the game chosen in the results
+				const int cur = n ? idx[sel] : -1;
+				if (s_search[0]) {
+					s_search[0] = 0;
+					n = gl_build(idx, cur, &sel);
+					scr = -1;
+				} else {
+					char q[sizeof(s_search)];
+					if (rstv_ime_input("Search: ROM name or title", "", q, sizeof(q)) && q[0]) {
+						snprintf(s_search, sizeof(s_search), "%s", q);
+						snprintf(s_search_tab, sizeof(s_search_tab), "Search: %s", q);
+						n = gl_build(idx, -1, &sel);
+						scr = -1;
+						if (!n) {
+							snprintf(msg, sizeof(msg), "No game matches \"%s\"", q);
+							s_search[0] = 0;
+							n = gl_build(idx, cur, &sel);
+						}
+					}
+					prev = b = 0; // (the keyboard's buttons are not list presses)
+				}
+				fast_ok = 0; // (drawn again in full: header, tabs and footer change)
+				dirty = 1;
+			} else if (pressed & GL_FT_ABOUT) { // the footer's About (touch only)
 				about = 1;
 				s_about_scroll = 0;
 			} else if (pressed & SCE_CTRL_START) { // options: edit and save global settings only
@@ -3802,6 +4434,8 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					focus_off();
 					ui_hide(c);
 					rstv_video_strips(NULL, 0, 0, 0); // (the rows go with the list)
+					rstv_snap_request(NULL, NULL); // (and its preview)
+					rstv_video_set_ui_hide(0.0f);
 					return s_stv_list[g].set;
 				}
 				const char *par = s_stv_list[g].parent;
@@ -3836,12 +4470,23 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			float maxt = (float)n - rows_f;
 			if (maxt < 0)
 				maxt = 0;
-			if (sel < tgt + 1)
-				tgt = (float)sel - 1;
-			if (sel > tgt + rows_f - 2)
-				tgt = (float)sel - rows_f + 2;
-			if (tgt > maxt) tgt = maxt;
-			if (tgt < 0) tgt = 0;
+			if (!drag) {
+				if (sel < tgt + 1)
+					tgt = (float)sel - 1;
+				if (sel > tgt + rows_f - 2)
+					tgt = (float)sel - rows_f + 2;
+			} else if (!t_down && vel != 0) { // flick glide, slowing down
+				tgt += vel;
+				scr = tgt;
+				vel *= 0.92f;
+				if (fabsf(vel) < 0.01f)
+					vel = 0;
+				dirty = 1;
+			}
+			if (tgt > maxt) { tgt = maxt; vel = 0; }
+			if (tgt < 0) { tgt = 0; vel = 0; }
+			if (drag && scr >= 0 && (scr > maxt || scr < 0))
+				scr = tgt;
 			if (scr < 0)
 				scr = tgt;
 			else if (scr - tgt > 1.5f * rows_f || tgt - scr > 1.5f * rows_f) // long jumps: ease over the last half page only
@@ -3851,6 +4496,29 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				if (fabsf(tgt - scr) < 0.01f)
 					scr = tgt;
 				dirty = 1;
+			}
+		}
+		{ // ADR-239 the preview of the game the cursor rests on (from ReBOX): after 1 s, fading in; the cursor moved, gone
+		  // at once. 3 s after a video preview came, the list fades away over it (0.5 s); a key or a touch brings it back
+			const int want = n && g_set.list_snap && !s_list_mode && !msg[0] && !upd && !about ? idx[sel] : -1;
+			enum { PV_WAIT = 60, PV_HIDE = PV_WAIT + 180, PV_HIDE_FRAMES = 30 };
+			if (want != pv_game) {
+				if (pv_t >= PV_WAIT)
+					rstv_snap_request(NULL, NULL);
+				pv_game = want;
+				pv_t = 0;
+			} else if (want >= 0 && pv_t < PV_WAIT && ++pv_t == PV_WAIT)
+				rstv_snap_request(s_stv_list[want].set, s_stv_list[want].parent);
+			if (want >= 0 && pv_t >= PV_WAIT) {
+				if (b || t_down)
+					pv_t = PV_WAIT;
+				else if (pv_t < PV_HIDE + PV_HIDE_FRAMES && (pv_t < PV_HIDE || rstv_snap_kind() == RSTV_SNAP_VIDEO))
+					pv_t++;
+			}
+			const float hide = pv_t <= PV_HIDE ? 0.0f : (float)(pv_t - PV_HIDE) / PV_HIDE_FRAMES;
+			if (hide != pv_hide) {
+				pv_hide = hide;
+				rstv_video_set_ui_hide(hide);
 			}
 		}
 		// nothing open over the list: the rows are strips (row_tex) and the canvas is drawn again in full only when the
@@ -3922,6 +4590,8 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				gl_header(c, n, sel);
 				{ // tab row: current tab highlighted; on overflow, scrolled so the current tab stays visible
 					int tx = px + 16, first = 0, total = 0;
+					for (int t = 0; t < GL_TAB_MAX; t++)
+						s_tab_x0[t] = s_tab_x1[t] = -1;
 					for (int t = 0; t < s_gl_ntabs; t++)
 						total += ui_text_width(0.95f, s_gl_tabs[t]) + 28;
 					while (total > w - 32 && first < s_gl_tab) {
@@ -3935,6 +4605,10 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 						if (t == s_gl_tab) // ADR-194: current tab bright with an accent underline
 							rrect(c, tx + 6, py + TITLE_H + 26, tw - 12, 4, 2, COL_SEL);
 						ui_text(c, tx + 10, py + TITLE_H + 20, t == s_gl_tab ? COL_TEXT : COL_DIM, 0.95f, s_gl_tabs[t]);
+						if (t < GL_TAB_MAX) {
+							s_tab_x0[t] = tx - 4;
+							s_tab_x1[t] = tx + tw + 4;
+						}
 						tx += tw + 8;
 					}
 				}
@@ -3942,12 +4616,34 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					text_keys(c, px + 48, la + 40, COL_DIM, "No favorites. " G_SQU ": add, SELECT: filter");
 				else if (!n)
 					ui_text(c, px + 48, la + 40, COL_DIM, 1.0f, "No playable games. SELECT: show all");
-				{ // button help on one line (owner)
-					char foot[192];
-					snprintf(foot, sizeof(foot), "%s: play   " G_SQU ": favorite   " G_TRI ": about   %sLeft/Right: page   SELECT: %s   START: options",
-						o_ok ? G_CIR : G_CRO, s_gl_ntabs > 1 ? "L/R: system   " : "",
-						s_gl_filter_name[wrap(g_set.list_filter + 1, RSTV_LIST_FILTER_COUNT)]);
-					text_keys(c, px + 24, py + h - 13, COL_DIM, foot);
+				{ // the footer (from ReBOX): touch buttons (each also a pad key), the options button (gear) at the right
+					char f[5][48];
+					uint32_t fk[5];
+					int fn = 0;
+					snprintf(f[fn], sizeof(f[fn]), "%s  Play", o_ok ? G_CIR : G_CRO);
+					fk[fn++] = ok;
+					snprintf(f[fn], sizeof(f[fn]), G_SQU "  Favorite");
+					fk[fn++] = SCE_CTRL_SQUARE;
+					snprintf(f[fn], sizeof(f[fn]), G_TRI "  %s", s_search[0] ? "All games" : "Search");
+					fk[fn++] = SCE_CTRL_TRIANGLE;
+					snprintf(f[fn], sizeof(f[fn]), "SELECT  %s", s_gl_filter_name[wrap(g_set.list_filter + 1, RSTV_LIST_FILTER_COUNT)]);
+					fk[fn++] = SCE_CTRL_SELECT;
+					snprintf(f[fn], sizeof(f[fn]), "About");
+					fk[fn++] = GL_FT_ABOUT;
+					const int by = SCREEN_H - LIST_FOOT_H + 7, bh = 27, bpad = 12;
+					int fx = px + 16;
+					s_ft_n = fn;
+					for (int k = 0; k < fn; k++) {
+						const int bw = keys_width(f[k]) + 2 * bpad;
+						foot_button(c, fx, by, bw, bh);
+						text_keys(c, fx + bpad, by + 19, COL_ITEM, f[k]);
+						s_ft_x0[k] = fx;
+						s_ft_x1[k] = fx + bw;
+						s_ft_key[k] = fk[k];
+						fx += bw + 8;
+					}
+					foot_button(c, GL_GEAR_CX - 22, by, 44, bh);
+					gear(c, (float)GL_GEAR_CX, (float)GL_GEAR_CY, (float)GL_GEAR_R - 2, COL_TEXT);
 				}
 				if (msg[0]) { // notice box (over the list)
 					const int mw = 720, mh = 150, mx = (SCREEN_W - mw) / 2, my = (SCREEN_H - mh) / 2;

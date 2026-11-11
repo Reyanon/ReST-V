@@ -15,6 +15,7 @@
 
 #ifdef __vita__
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/stat.h>
 #endif
 
 #define MAX_THREADS (YAB_NUM_THREADS)
@@ -60,6 +61,11 @@ static void *thread_entry(void *p)
 			rstv_rax_thread_cpu == 8 ? SCE_KERNEL_CPU_MASK_USER_0 : SCE_KERNEL_CPU_MASK_USER_2) : // ADR-176 / 196 (7, 8: diag)
 		SCE_KERNEL_CPU_MASK_USER_2;
 	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+	{ // ReST-V diag (ADR-222): every core thread opens the JIT VM domain at its start (the Ari64 crash hunt)
+		extern void rstv_jit_code_write_begin(void);
+		if (sceIoGetstat("ux0:data/restv/vmall", &(SceIoStat){0}) >= 0)
+			rstv_jit_code_write_begin();
+	}
 	if (si->id == YAB_THREAD_RAX && rstv_rax_thread_cpu >= 4) { // ADR-196: on CPU0 / CPU1 where they are idle
 		extern int rstv_rax_thread_prio;
 		sceKernelChangeThreadPriority(0, 0x10000100 + rstv_rax_thread_prio); // (relative to the default user priority)

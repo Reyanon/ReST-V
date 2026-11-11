@@ -25,6 +25,13 @@ void rstv_video_frame_gpu(struct GxTex *tex, int w, int h);
 
 // draw the last completed frame to the screen and flip on vsync (main thread only)
 void rstv_video_present(void);
+// the same, with the system dialog (IME keyboard) drawn over it
+void rstv_video_present_dialog(void);
+// ADR-237 the touch light: a square RGBA texture (premultiplied ABGR, written through rstv_video_fx_pixels), shown at x, y
+// with radius r and opacity a, added over everything. Set each frame it shows
+void *rstv_video_fx_tex(int size);
+uint32_t *rstv_video_fx_pixels(void *tex, int *stride);
+void rstv_video_touch_fx(int slot, void *tex, float x, float y, float r, float a);
 
 // text at top-left of screen (uppercase, digits, some symbols, max 42 chars). NULL turns it off
 void rstv_video_set_osd(const char *text);
@@ -58,6 +65,10 @@ uint8_t *rstv_video_load_bg(int *w, int *h);
 void rstv_video_set_style(int scan_type, int scan_strength, int border, int border_color);
 // border artwork: ux0:data/restv/artwork/<set>.png (.jpg, .bmp), else parent. set NULL removes it
 void rstv_video_set_art(const char *set, const char *parent);
+// ADR-238: the game's marquee (ux0:data/restv/marquees/<set>.png|jpg, else the parent's) for Border = Marquee
+void rstv_video_set_marquee(const char *set, const char *parent);
+// ADR-239: the list fades away over a video preview (0 shown .. 1 gone)
+void rstv_video_set_ui_hide(float h);
 void rstv_video_art_retint(void); // (the blank artwork follows a theme change, ADR-210)
 
 #endif

@@ -33,6 +33,17 @@ void StvIoSetMahjong(const u8 rows[5])
 }
 
 void StvIoSetType(int type) { stv_io_type = type; }
+static int s_btn_layout; // STV_BTN_*
+void StvIoSetButtons(int layout) { s_btn_layout = layout; }
+// one player's PORT-A / PORT-B pressed bits for the button wiring
+static u8 player_bits(u16 p)
+{
+	switch (s_btn_layout) {
+	case STV_BTN_6B: return (u8)(p & 0xF7); // (button 4 is on PORT-F)
+	case STV_BTN_BATMAN: return (u8)((p & 0xF0) | ((p & 0x07) << 1));
+	default: return (u8)p;
+	}
+}
 
 void StvIoReset(void)
 {
@@ -46,10 +57,15 @@ void StvIoReset(void)
 	s_mj_mux = s_mj_portsel = 0;
 }
 
-void StvIoSetInputs(u8 p1, u8 p2, u8 system)
+void StvIoSetInputs(u16 p1, u16 p2, u8 system)
 {
-	s_port[PORT_A] = (u8)~p1;
-	s_port[PORT_B] = (u8)~p2;
+	s_port[PORT_A] = (u8)~player_bits(p1);
+	s_port[PORT_B] = (u8)~player_bits(p2);
+	if (s_btn_layout == STV_BTN_6B) { // buttons 4-6: PORT-F (MAME stv6b)
+		const u8 f1 = (u8)(((p1 & STV_IN_B4) ? 1 : 0) | ((p1 & STV_IN_B5) ? 2 : 0) | ((p1 & STV_IN_B6) ? 4 : 0));
+		const u8 f2 = (u8)(((p2 & STV_IN_B4) ? 1 : 0) | ((p2 & STV_IN_B5) ? 2 : 0) | ((p2 & STV_IN_B6) ? 4 : 0));
+		s_port[PORT_F] = (u8)~(f1 | f2 << 4);
+	}
 	s_frame++;
 	if (stv_io_type == STV_IO_HOPPER && s_hop_power)
 		s_hop_status = (u8)(((s_frame - s_hop_t0) / 6) & 1 ? 0 : 1);

@@ -5,9 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <psp2/common_dialog.h>
 #include <psp2/display.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <vitashark.h>
@@ -236,7 +238,8 @@ GxTex *gx_tex(int w, int h, int fmt, int linear, int rt)
 		RSTV_LOG("gx: textures in %s", s_cdram_all ? "CDRAM" : "LPDDR (GX_CDRAM only)");
 	}
 	int cdram = (fmt & GX_CDRAM) != 0 || s_cdram_all;
-	fmt &= ~GX_CDRAM;
+	const int noclear = (fmt & GX_NOCLEAR) != 0;
+	fmt &= ~(GX_CDRAM | GX_NOCLEAR);
 	t->w = ALIGN(w, 8);
 	t->h = h;
 	t->bpp = fmt == GX_L8 ? 1 : 4;
@@ -253,7 +256,8 @@ GxTex *gx_tex(int w, int h, int fmt, int linear, int rt)
 		free(t);
 		return NULL;
 	}
-	memset(t->data, 0, t->stride * h);
+	if (!noclear)
+		memset(t->data, 0, t->stride * h);
 	sceGxmTextureInitLinear(&t->tex, t->data, fmt == GX_L8 ? SCE_GXM_TEXTURE_FORMAT_R8 : SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
 		t->w, h, 0);
 	const SceGxmTextureFilter f = linear ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT;
@@ -270,8 +274,10 @@ GxTex *gx_tex(int w, int h, int fmt, int linear, int rt)
 		static SceGxmRenderTarget *slots[32];
 		const int slot = rt & 31;
 		if (!slots[slot]) {
+			const uint64_t t0 = sceKernelGetProcessTimeWide();
 			const int rr = make_rt(t->w, h, 1, &slots[slot]);
-			RSTV_LOG("gx: render target slot %d %dx%d -> %08x", slot, t->w, h, rr);
+			RSTV_LOG("gx: render target slot %d %dx%d -> %08x (%u us)", slot, t->w, h, rr,
+				(unsigned)(sceKernelGetProcessTimeWide() - t0));
 			if (rr < 0)
 				slots[slot] = s_rt_tex;
 		}
@@ -500,8 +506,8 @@ GxProg *gx_prog_bin(const void *vgp, const void *fgp, const GxAttr *attrs, int n
 	bi.colorMask = SCE_GXM_COLOR_MASK_ALL;
 	bi.colorFunc = SCE_GXM_BLEND_FUNC_ADD;
 	bi.alphaFunc = SCE_GXM_BLEND_FUNC_ADD;
-	bi.colorSrc = blend == GX_BLEND_PREMUL ? SCE_GXM_BLEND_FACTOR_ONE : SCE_GXM_BLEND_FACTOR_SRC_ALPHA;
-	bi.colorDst = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	bi.colorSrc = blend == GX_BLEND_PREMUL || blend == GX_BLEND_ADD ? SCE_GXM_BLEND_FACTOR_ONE : SCE_GXM_BLEND_FACTOR_SRC_ALPHA;
+	bi.colorDst = blend == GX_BLEND_ADD ? SCE_GXM_BLEND_FACTOR_ONE : SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 	bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
 	bi.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
 	r = sceGxmShaderPatcherCreateFragmentProgram(s_patcher, fid, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
@@ -648,6 +654,56 @@ void gx_swap(void)
 	s_frame_ready = 0;
 	spin_unlock(&s_templock);
 }
+
+// a system dialog (the IME keyboard) drawn over the frame about to be shown: call between gx_end and gx_swap.
+// The dialog needs a depth buffer of the display size (made the first time)
+void gx_dialog_update(void)
+{
+	static void *depth;
+	if (!depth) {
+		depth = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, ALIGN(DISP_W, 32) * ALIGN(DISP_H, 32) * 4,
+			SCE_GXM_MEMORY_ATTRIB_RW, NULL);
+		if (!depth) {
+			RSTV_LOG("gx: dialog depth buffer failed");
+			return;
+		}
+	}
+	SceCommonDialogUpdateParam p;
+	memset(&p, 0, sizeof(p));
+	p.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
+	p.renderTarget.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
+	p.renderTarget.width = DISP_W;
+	p.renderTarget.height = DISP_H;
+	p.renderTarget.strideInPixels = DISP_STRIDE;
+	p.renderTarget.colorSurfaceData = s_disp_addr[s_back];
+	p.renderTarget.depthSurfaceData = depth;
+	p.displaySyncObject = s_disp_sync[s_back];
+	sceCommonDialogUpdate(&p);
+}
+
+#ifdef RSTV_DEBUG_TOOLS
+// test: the last shown frame (the front display buffer) as a ppm (after the GPU is done with it)
+void gx_dump_front(const char *path)
+{
+	sceGxmFinish(s_ctx);
+	FILE *f = fopen(path, "wb");
+	if (!f)
+		return;
+	fprintf(f, "P6\n%d %d\n255\n", DISP_W, DISP_H);
+	static uint8_t row[DISP_W * 3];
+	const uint32_t *src = (const uint32_t *)s_disp_addr[s_front];
+	for (int y = 0; y < DISP_H; y++) {
+		for (int x = 0; x < DISP_W; x++) {
+			const uint32_t c = src[y * DISP_STRIDE + x];
+			row[x * 3] = (uint8_t)c;
+			row[x * 3 + 1] = (uint8_t)(c >> 8);
+			row[x * 3 + 2] = (uint8_t)(c >> 16);
+		}
+		fwrite(row, 1, sizeof(row), f);
+	}
+	fclose(f);
+}
+#endif
 
 void gx_finish(void)
 {

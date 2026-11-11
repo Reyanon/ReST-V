@@ -787,6 +787,7 @@ static void variant_files(void);
 static void cmp_variant_save(const char *key, const char *src);
 static char *cmp_variant_src(const float *vals, const float *sw);
 static void mig_scan(void);
+static void wide_note_write(void);
 static volatile int s_mig_pending;
 // worker thread (CPU1, lowest priority): variant source -> GXP (just reads if cached)
 static int cmp_worker(SceSize args, void *argp)
@@ -800,6 +801,7 @@ static int cmp_worker(SceSize args, void *argp)
 			s_mig_pending = 0;
 			mig_scan();
 		}
+		wide_note_write(); // (ADR-220)
 		variant_files();
 		for (int i = 0; i < s_nvar; i++) {
 			CmpVariant *v = &s_var[i];
@@ -897,6 +899,54 @@ static char s_game[32];
 static uint32_t s_cl_set[MAX_VARIANTS];
 static int s_cl_n, s_cl_loaded;
 void gvdp2_set_game(const char *game) { snprintf(s_game, sizeof(s_game), "%s", game ? game : ""); }
+// ADR-100 wide planes (2048 x 512, render target slots 24..27), made once. ADR-220: making one in play cost ~10 ms a
+// layer (render target set-up 6 ms; its 4 MB CPU clear is gone, GX_NOCLEAR); cottonbm's boss made three in one frame.
+// A game that made them gets them on its next start, while it loads (VARLIST_DIR/wide_<set>.txt: the layer mask)
+static GxTex *s_wide[4];
+static volatile int s_wide_note;
+static GxTex *wide_plane(int L, int note)
+{
+	if (s_wide[L])
+		return s_wide[L];
+	s_wide[L] = gx_tex(PLANE_WMAX, PLANE_H, GX_RGBA8 | GX_NOCLEAR, 0, 24 + L); // 24..27 (20 is the RBG0 half texture)
+	if (s_wide[L] && note && s_game[0] && s_cmp_sema >= 0) { // (the file is written by the compile worker: a card write
+		s_wide_note = 1;                                    // here stalled the frame 280 ms)
+		sceKernelSignalSema(s_cmp_sema, 1);
+	}
+	return s_wide[L];
+}
+static void wide_note_write(void) // compile worker
+{
+	if (!s_wide_note)
+		return;
+	s_wide_note = 0;
+	int m = 0;
+	for (int k = 0; k < 4; k++)
+		m |= s_wide[k] ? 1 << k : 0;
+	char path[128];
+	snprintf(path, sizeof(path), VARLIST_DIR "/wide_%s.txt", s_game);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "%d\n", m);
+		fclose(f);
+	}
+}
+static void wide_preload(void)
+{
+	char path[128];
+	snprintf(path, sizeof(path), VARLIST_DIR "/wide_%s.txt", s_game);
+	FILE *f = fopen(path, "r");
+	int m = 0;
+	if (!f)
+		return;
+	if (fscanf(f, "%d", &m) != 1)
+		m = 0;
+	fclose(f);
+	for (int k = 0; k < 4; k++)
+		if (m & (1 << k))
+			wide_plane(k, 0);
+	RSTV_LOG("gvdp2: wide planes %x made ahead", m);
+}
 static int cl_has(uint32_t h)
 {
 	for (int i = 0; i < s_cl_n; i++)
@@ -2360,12 +2410,10 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 		return (s_plane_rej[L] = 10, 0);
 	if (c->xmask + 1 > s_plane_w[L]) {
 		// ADR-100: a wider map: this layer's plane becomes 2048 x 512 (own render target slot 24 + L, made once)
-		static GxTex *wide[4];
-		if (!wide[L])
-			wide[L] = gx_tex(PLANE_WMAX, PLANE_H, GX_RGBA8, 0, 24 + L); // 24..27 (20 is the RBG0 half texture)
-		if (!wide[L])
+		GxTex *const wt = wide_plane(L, 1);
+		if (!wt)
 			return (s_plane_rej[L] = 11, 0);
-		s_plane[L] = wide[L];
+		s_plane[L] = wt;
 		s_plane_w[L] = PLANE_WMAX;
 		s_plane_h[L] = PLANE_H;
 		s_plane_valid[L] = 0;
@@ -2449,7 +2497,7 @@ static int plane_prepare(FrameSet *s, int L, const RstvLayerCapture *c)
 		return 1;
 	}
 	if (!s_plane[L]) {
-		s_plane[L] = gx_tex(PW, PLANE_H, GX_RGBA8, 0, 14 + L); // own render target slot (gx.c)
+		s_plane[L] = gx_tex(PW, PLANE_H, GX_RGBA8 | GX_NOCLEAR, 0, 14 + L); // own render target slot (gx.c)
 		if (!s_plane[L])
 			return (s_plane_rej[L] = 5, 0);
 	}
@@ -2870,15 +2918,13 @@ static void gvdp2_draw_screens(void)
 		s_end_pend = -1;
 	}
 	prep_wait(); // if the previous frame's prep is still pending
-#ifdef RSTV_DEBUG_TOOLS
-	{ // debug fast boot (main.c): no compose
+	{ // Fast boot (main.c, ADR-241): no compose
 		extern int rstv_fastboot_now;
 		if (rstv_fastboot_now) {
 			rstv_vdp1_gpu_on = s_prog_v1 != NULL; // VDP1 lists are recorded (and dropped), not drawn on the CPU
 			return;
 		}
 	}
-#endif
 	if (s_gpu_finish_from && s_frame >= s_gpu_finish_from)
 		s_gpu_finish = 1;
 	int vdp1w, vdp1h, vdp1ps;
@@ -3669,7 +3715,8 @@ static int prep_worker(SceSize args, void *argp)
 			s_prep_s->submitted = 1;
 		}
 		const u64 t3 = RSTV_PROF_T();
-		if (t3 - t0 > 15000) // diag: prep over 15ms (golf etc. normally take 9~10ms, so it logged every frame)
+		if (t3 - t0 - (t2 - t1) > 15000) // diag: prep over 15ms, the wait for the GPU lock left out (a fast emu thread
+			// waits there ~12 ms a frame: it logged every frame, 60 lines a second over the log's limit)
 			RSTV_LOG("gvdp2: slow prep f%u prep_b %u lock %u submit %u us | to_v1end %u copy %u (pal %u lines %u spr %u slut %u) layers %u rest %u | capture %u v1build %u fill %u | layers %u %u %u %u %u rbgprep %u atlas %u plane rows %u",
 				s_frame, (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t3 - t2), (unsigned)(s_pm[0] - t0), (unsigned)(s_pm[1] - s_pm[0]),
 				(unsigned)(s_pc[0] - s_pm[0]), (unsigned)(s_pc[1] - s_pc[0]), (unsigned)(s_pc[2] - s_pc[1]), (unsigned)(s_pm[1] - s_pc[2]),
@@ -4338,8 +4385,7 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 
 static void gvdp2_draw_end(void)
 {
-#ifdef RSTV_DEBUG_TOOLS
-	{ // debug fast boot (main.c): no composite, only the VDP1 framebuffer swap
+	{ // Fast boot (main.c, ADR-241): no composite, only the VDP1 framebuffer swap
 		extern int rstv_fastboot_now;
 		if (rstv_fastboot_now) {
 			s_cur = -1;
@@ -4347,7 +4393,6 @@ static void gvdp2_draw_end(void)
 			return;
 		}
 	}
-#endif
 	if (s_end_defer) {
 		// ADR-186: the prep worker starts a frame at V-blank-in and can still be busy at its end (V-blank-out); the
 		// main thread waited for it (vfremix 1.1 ms a frame). After 60 such frames the game stays in deferred mode: each
@@ -4941,6 +4986,7 @@ int gvdp2_init(void)
 	if (gvdp2_progress)
 		gvdp2_progress(300);
 	preload_variants();
+	wide_preload(); // (ADR-220)
 	if (gvdp2_progress)
 		gvdp2_progress(1000);
 	s_ok = 1;
@@ -4994,6 +5040,7 @@ int gvdp2_game_start(void)
 		s_var[i].listed = 0;
 	s_preload_again = 1;
 	preload_variants();
+	wide_preload(); // (ADR-220)
 	if (gvdp2_progress)
 		gvdp2_progress(1000);
 	RSTV_LOG("gvdp2: ready (game %s)", s_game);

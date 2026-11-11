@@ -7,11 +7,12 @@
 
 // start from <set>.zip and stvbios.zip in rom_dir. On failure the reason is in err
 // use_dynarec: 1 = SH-2 recompiler, 0 = interpreter
+int rstv_emu_uses_ari64(const char *romset); // ADR-228/229: the set runs on the Ari64 recompiler
 int rstv_emu_init(const char *rom_dir, const char *romset, int use_dynarec, char *err, int errlen);
 void rstv_emu_shutdown(void);
 
 // run one frame (input is STV_IN_* / STV_SYS_* bits, 1 = pressed)
-void rstv_emu_run_frame(uint8_t p1, uint8_t p2, uint8_t system);
+void rstv_emu_run_frame(uint16_t p1, uint16_t p2, uint8_t system);
 
 // menu "Reset game" (ADR-094): board reset (from BIOS again, cart and EEPROM kept). Only between frames
 void rstv_emu_reset(void);

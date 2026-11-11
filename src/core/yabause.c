@@ -66,6 +66,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 u64 (*rstv_prof_clock)(void) = NULL;
 int rstv_prof_fine = 1;
+int rstv_prof_slice;
 u64 rstv_prof_us[RSTV_PROF_COUNT];
 #include "scu.h"
 #include "sh2core.h"
@@ -401,9 +402,10 @@ int YabauseInit(yabauseinit_struct *init)
 
    yabsys.usequickload = 0;
 
-   #if defined(SH2_DYNAREC)
+   #if defined(SH2_DYNAREC) || defined(RSTV_ARI64)
    if(SH2Core->id==2) {
-     sh2_dynarec_init();
+     extern void sh2_dynarec_init(void);
+     sh2_dynarec_init(); /* ReST-V ADR-222: the Ari64 recompiler as a slice executor */
    }
    #endif
 
@@ -818,17 +820,17 @@ int YabauseEmulate(void) {
                SH2Exec(SSH2, step);
         }
       }else{
-        u64 pt = RSTV_PROF_TF();
+        u64 pt = RSTV_PROF_TS();
         if (rstv_slave_on && yabsys.IsSSH2Running)
           rstv_slave_post(sh2cycles); /* ADR-136: the slave thread runs this slice alongside */
         rstv_act = 1;
         { extern int rstv_probe_on; extern unsigned rstv_probe_us[12]; const u64 q_ = rstv_probe_on ? RSTV_PROF_T() : 0; SH2Exec(MSH2, sh2cycles); if (rstv_probe_on) rstv_probe_us[0] += (unsigned)(RSTV_PROF_T() - q_); }
-        RSTV_PROF_ADDF(RSTV_PROF_MSH2, pt);
+        RSTV_PROF_ADDS(RSTV_PROF_MSH2, pt);
         if (yabsys.IsSSH2Running && !rstv_slave_on) {
-          pt = RSTV_PROF_TF();
+          pt = RSTV_PROF_TS();
           rstv_act = 2;
           { extern int rstv_probe_on; extern unsigned rstv_probe_us[12]; const u64 q_ = rstv_probe_on ? RSTV_PROF_T() : 0; SH2Exec(SSH2, sh2cycles); if (rstv_probe_on) rstv_probe_us[1] += (unsigned)(RSTV_PROF_T() - q_); }
-          RSTV_PROF_ADDF(RSTV_PROF_SSH2, pt);
+          RSTV_PROF_ADDS(RSTV_PROF_SSH2, pt);
         }
         rstv_act = 3;
       }

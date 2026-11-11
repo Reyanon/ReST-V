@@ -325,9 +325,28 @@ static void auto_input_close(FILE *af)
 		sceIoRemove(DATA_DIR "/autoinput.txt");
 	}
 }
+// ADR-229: the app restarted itself to switch between the two SH-2 recompilers (each needs the code region):
+// ux0:data/restv/switchto = the set to start, without the list (not a measuring tool start: no auto input)
+static int s_switchto, s_relaunch_jit;
 static const char *pick_game(char *buf, int len)
 {
-	SceUID fd = sceIoOpen(DATA_DIR "/autostart", SCE_O_RDONLY, 0);
+	SceUID fd = sceIoOpen(DATA_DIR "/switchto", SCE_O_RDONLY, 0);
+	if (fd >= 0) {
+		int n = sceIoRead(fd, buf, len - 1);
+		sceIoClose(fd);
+		sceIoRemove(DATA_DIR "/switchto");
+		if (n > 0) {
+			buf[n] = 0;
+			for (int i = 0; i < n; i++)
+				if (buf[i] == '\r' || buf[i] == '\n' || buf[i] == ' ')
+					buf[i] = 0;
+			if (STVFindGame(buf)) {
+				s_switchto = 1;
+				return buf;
+			}
+		}
+	}
+	fd = sceIoOpen(DATA_DIR "/autostart", SCE_O_RDONLY, 0);
 	if (fd >= 0) {
 		int n = sceIoRead(fd, buf, len - 1);
 		sceIoClose(fd);
@@ -371,18 +390,18 @@ static const char *pick_game(char *buf, int len)
 // START = start. Buttons of system combos (SELECT+START menu, SELECT+L quick save, SELECT+R quick load; same as Reirem) are not passed
 // to the game
 static int s_test_frames; // frames left of the TEST switch press from the menu
-#ifdef RSTV_DEBUG_TOOLS
-// debug only (owner: not in released builds): ux0:data/restv/fastboot = frame number (empty: 1300). Up to that frame the
-// emulation runs flat out without composing or presenting (the BIOS boot screens), then normally. Measuring helper
+// ADR-241 Fast boot (a list option; before, a debug-only helper): up to frame 1300 the emulation runs flat out without
+// composing or presenting (the BIOS boot screens, run in full, only not shown), then normally. Debug builds:
+// ux0:data/restv/fastboot = that frame number (empty: 1300), also with the option off
 int rstv_fastboot_until, rstv_fastboot_now;
-#endif
 int rstv_test_session;     // after the menu's TEST switch press: L = SERVICE (move), R = TEST (enter) in the BIOS test menu
 // one player (re_pad: 1P and 2P each read their own controller with their own port settings: keys, stick, turbo,
 // combo keys, g_set.port, ADR-216). 1P sets *sys, 2P adds to it. The touch buttons, the test switches and the mahjong panel are 1P's
-static void map_player(int pl, const SceCtrlData *pad, uint8_t *pp, uint8_t *sys, unsigned frame)
+static void map_player(int pl, const SceCtrlData *pad, uint16_t *pp, uint8_t *sys, unsigned frame)
 {
 	uint32_t b = pad->buttons;
-	uint8_t p = 0, s = 0;
+	uint16_t p = 0;
+	uint8_t s = 0;
 	// this player's buttons, stick, turbo and combo keys: those of the device it reads (they go with the device)
 	const rstv_port *pr = &g_set.port[re_pad_player_profile(pl)];
 	const int *km = pr->keymap;
@@ -393,7 +412,10 @@ static void map_player(int pl, const SceCtrlData *pad, uint8_t *pp, uint8_t *sys
 			*sys = 0;
 		return;
 	}
-	if (!pl && g_set.touch_keys) // ADR-214: the touch buttons press their Vita keys (in the game only)
+	// ADR-214: the touch buttons press their Vita keys (in the game only), for the player on the Vita's own controls
+	// (owner: 1P on a controller, 2P on the Vita: the touch is 2P's); 1P's when nobody reads the Vita
+	const int touch_pl = re_pad_port(0) == 0 ? 0 : re_pad_port(1) == 0 ? 1 : 0;
+	if (pl == touch_pl && g_set.touch_keys)
 		b |= rstv_touch_buttons();
 	{ // ADR-214 combo keys (as ReiREM): a key with a combo acts as its two keys pressed together, not its own mapping
 		uint32_t add = 0;
@@ -410,46 +432,49 @@ static void map_player(int pl, const SceCtrlData *pad, uint8_t *pp, uint8_t *sys
 	if (b & SCE_CTRL_DOWN) p |= STV_IN_DOWN;
 	if (b & SCE_CTRL_LEFT) p |= STV_IN_LEFT;
 	if (b & SCE_CTRL_RIGHT) p |= STV_IN_RIGHT;
-	// analog stick: tilting more than 48 from center 128 gives that direction (diagonals included)
-	if (pr->stick == RSTV_STICK_LEFT || pr->stick == RSTV_STICK_BOTH) {
-		if (pad->ly < 80) p |= STV_IN_UP;
-		if (pad->ly > 176) p |= STV_IN_DOWN;
-		if (pad->lx < 80) p |= STV_IN_LEFT;
-		if (pad->lx > 176) p |= STV_IN_RIGHT;
-	}
-	if (pr->stick == RSTV_STICK_RIGHT || pr->stick == RSTV_STICK_BOTH) {
-		if (pad->ry < 80) p |= STV_IN_UP;
-		if (pad->ry > 176) p |= STV_IN_DOWN;
-		if (pad->rx < 80) p |= STV_IN_LEFT;
-		if (pad->rx > 176) p |= STV_IN_RIGHT;
+	// analog sticks (ADR-235): tilting more than 48 from center 128 gives that direction (diagonals included); each
+	// direction presses what the stick page gives it (a lever direction, a game button, coin or start)
+	unsigned stick_btn = 0; // (game buttons, bit k = button k + 1; bit 6 coin, bit 7 start)
+	for (int st = 0; st < 2; st++) {
+		const int x = st ? pad->rx : pad->lx, y = st ? pad->ry : pad->ly;
+		const int on[RSTV_SDIR_COUNT] = { y < 80, y > 176, x < 80, x > 176 };
+		for (int d = 0; d < RSTV_SDIR_COUNT; d++) {
+			const int t = on[d] ? pr->smap[st][d] : RSTV_STGT_NONE;
+			if (t == RSTV_STGT_UP) p |= STV_IN_UP;
+			else if (t == RSTV_STGT_DOWN) p |= STV_IN_DOWN;
+			else if (t == RSTV_STGT_LEFT) p |= STV_IN_LEFT;
+			else if (t == RSTV_STGT_RIGHT) p |= STV_IN_RIGHT;
+			else if (t >= RSTV_STGT_B1 && t <= RSTV_STGT_START)
+				stick_btn |= 1u << (t - RSTV_STGT_B1);
+		}
 	}
 	if (rstv_input_rot && re_pad_port(pl) == 0 && !re_pad_is_tv()) {
 		// ADR-190: the Vita is held turned (its own controls only, not a controller) (Vertical L / R): turn the screen directions back into the game's
 		// (90: screen right = game up; 270: screen left = game up)
 		const int u = (p & STV_IN_UP) != 0, d = (p & STV_IN_DOWN) != 0, l = (p & STV_IN_LEFT) != 0, r = (p & STV_IN_RIGHT) != 0;
-		p &= (uint8_t)~(STV_IN_UP | STV_IN_DOWN | STV_IN_LEFT | STV_IN_RIGHT);
+		p &= (uint16_t)~(STV_IN_UP | STV_IN_DOWN | STV_IN_LEFT | STV_IN_RIGHT);
 		if (rstv_input_rot == 90)
 			p |= (r ? STV_IN_UP : 0) | (l ? STV_IN_DOWN : 0) | (u ? STV_IN_LEFT : 0) | (d ? STV_IN_RIGHT : 0);
 		else
 			p |= (l ? STV_IN_UP : 0) | (r ? STV_IN_DOWN : 0) | (d ? STV_IN_LEFT : 0) | (u ? STV_IN_RIGHT : 0);
 	}
-	static const uint8_t stv_btn[4] = { STV_IN_B1, STV_IN_B2, STV_IN_B3, STV_IN_B4 };
+	static const uint16_t stv_btn[RSTV_GAME_BUTTONS] = { STV_IN_B1, STV_IN_B2, STV_IN_B3, STV_IN_B4, STV_IN_B5, STV_IN_B6 };
 	// ADR-097·126 turbo (same as Reirem): while the turbo key (None = off) is held, the turbo button is pressed for the first half of each period
 	// (Turbo speed: 4/6/8 frames) and released for the second half. The turbo key's normal mapping is not used
 	const uint32_t tm = rstv_key_code(pr->turbo_key);
 	const uint32_t nb = b & ~tm;
-	if (tm && (b & tm) && pr->turbo_btn >= 1 && pr->turbo_btn <= 4) {
+	if (tm && (b & tm) && pr->turbo_btn >= 1 && pr->turbo_btn <= rstv_menu_buttons()) {
 		const unsigned per = (unsigned)rstv_turbo_period(pr->turbo_speed);
 		if (frame % per < per / 2)
 			p |= stv_btn[pr->turbo_btn - 1];
 	}
 	for (int k = 0; k < rstv_menu_buttons(); k++)
-		if (nb & rstv_key_code(km[RSTV_ACT_B1 + k]))
+		if ((nb & rstv_key_code(km[RSTV_ACT_B1 + k])) || (stick_btn & (1u << k)))
 			p |= stv_btn[k];
 	// coin and start also from assigned buttons (ADR-126, default SELECT, START)
-	if (nb & rstv_key_code(km[RSTV_ACT_COIN]))
+	if ((nb & rstv_key_code(km[RSTV_ACT_COIN])) || (stick_btn & (1u << 6)))
 		s |= pl ? STV_SYS_COIN2 : STV_SYS_COIN1;
-	if (nb & rstv_key_code(km[RSTV_ACT_START]))
+	if ((nb & rstv_key_code(km[RSTV_ACT_START])) || (stick_btn & (1u << 7)))
 		s |= pl ? STV_SYS_START2 : STV_SYS_START1;
 	if (pl) {
 		*pp = p;
@@ -505,13 +530,73 @@ static void map_player(int pl, const SceCtrlData *pad, uint8_t *pp, uint8_t *sys
 		StvIoSetMahjong(r);
 	}
 }
-static void map_input(uint8_t *p1, uint8_t *p2, uint8_t *sys, unsigned frame)
+#ifdef RSTV_DEBUG_TOOLS
+// test: ux0:data/restv/padtest = "port lx ly rx ry buttons(hex) frames" lines: that port's raw read (before re_pad folds
+// a controller's buttons) for so many polls, one line after another; the game's input logged at each step's first frame
+static int pt_n, pt_at, pt_left, pt_new, pt_v[16][6], pt_f[16];
+int rstv_padtest(int port, SceCtrlData *d)
+{
+	static unsigned check;
+	if (port == 0 && pt_at >= pt_n && (check++ & 31) == 0) {
+		FILE *pf = fopen(DATA_DIR "/padtest", "r");
+		if (pf) {
+			pt_n = pt_at = 0;
+			unsigned bt;
+			while (pt_n < 16 && fscanf(pf, "%d %d %d %d %d %x %d", &pt_v[pt_n][0], &pt_v[pt_n][1], &pt_v[pt_n][2],
+				&pt_v[pt_n][3], &pt_v[pt_n][4], &bt, &pt_f[pt_n]) == 7) {
+				pt_v[pt_n][5] = (int)bt;
+				pt_n++;
+			}
+			fclose(pf);
+			sceIoRemove(DATA_DIR "/padtest");
+			pt_left = pt_n ? pt_f[0] : 0;
+			pt_new = 1;
+			RSTV_LOG("padtest: %d steps", pt_n);
+		}
+	}
+	if (pt_at >= pt_n || port != pt_v[pt_at][0])
+		return 0;
+	memset(d, 0, sizeof(*d));
+	d->lx = (uint8_t)pt_v[pt_at][1];
+	d->ly = (uint8_t)pt_v[pt_at][2];
+	d->rx = (uint8_t)pt_v[pt_at][3];
+	d->ry = (uint8_t)pt_v[pt_at][4];
+	d->buttons = (uint32_t)pt_v[pt_at][5];
+	if (--pt_left <= 0 && ++pt_at < pt_n) {
+		pt_left = pt_f[pt_at];
+		pt_new = 1;
+	}
+	return 1;
+}
+// the step just begun (1-based) once, else 0
+int rstv_padtest_step(void)
+{
+	if (!pt_new)
+		return 0;
+	pt_new = 0;
+	return pt_at < pt_n ? pt_at + 1 : pt_at;
+}
+#endif
+static void map_input(uint16_t *p1, uint16_t *p2, uint8_t *sys, unsigned frame)
 {
 	SceCtrlData pad1, pad2;
 	re_pad_read(0, &pad1);
 	re_pad_read(1, &pad2);
+#ifdef RSTV_DEBUG_TOOLS
+	extern int rstv_padtest_step(void);
+	const int pt_on = rstv_padtest_step();
+#endif
 	map_player(0, &pad1, p1, sys, frame);
 	map_player(1, &pad2, p2, sys, frame);
+#ifdef RSTV_DEBUG_TOOLS
+	if (pt_on > 0)
+	{
+		const rstv_port *pq = &g_set.port[re_pad_player_profile(0)];
+		RSTV_LOG("padtest: step %d (lx %d ly %d buttons %x, profile %d smap %d%d%d%d %d%d%d%d): p1 %04x sys %02x", pt_on - 1,
+			pad1.lx, pad1.ly, (unsigned)pad1.buttons, re_pad_player_profile(0), pq->smap[0][0], pq->smap[0][1],
+			pq->smap[0][2], pq->smap[0][3], pq->smap[1][0], pq->smap[1][1], pq->smap[1][2], pq->smap[1][3], *p1, *sys);
+	}
+#endif
 }
 
 // Start screen (ADR-094, Reirem list style): supported sets in roms. Cursor starts on the last picked game (game.txt); waits until one is picked.
@@ -710,7 +795,8 @@ static void c2_loop(const char *game, const char *jit_msg)
 				break;
 			continue;
 		}
-		uint8_t p1, p2, sys;
+		uint16_t p1, p2;
+		uint8_t sys;
 		map_input(&p1, &p2, &sys, frame);
 		for (int a = 0; a < n_auto; a++)
 			if (frame + 1 >= auto_frame[a] && frame + 1 < auto_frame[a] + 6) {
@@ -718,7 +804,7 @@ static void c2_loop(const char *game, const char *jit_msg)
 				p1 |= auto_p1[a];
 			}
 		const uint64_t t0 = rstv_time_us();
-		c2_run_frame(p1, p2, sys);
+		c2_run_frame((uint8_t)p1, (uint8_t)p2, sys); // (3 buttons: the low byte)
 		int n;
 		while ((n = c2_audio(abuf, 2048)) > 0)
 			rstv_audio_push(abuf, n);
@@ -927,10 +1013,11 @@ next_game:
 		rstv_settings_load(); // (the global settings again, as a new process: the last game's own ones are left)
 		rstv_settings_apply_video();
 		s_autostart = 0;
+		s_switchto = 0;
 		if (switch_next)
 			game = pick_game(game_buf, sizeof(game_buf));
 	}
-	if (!s_autostart)
+	if (!s_autostart && !s_switchto)
 		game = game_menu(game_buf, sizeof(game_buf));
 	if (!game) {
 		write_text_file(DATA_DIR "/last_error.txt", "no supported set in " ROM_DIR "\n", 0);
@@ -938,6 +1025,20 @@ next_game:
 		goto out;
 	}
 	RSTV_LOG("game: %s", game);
+	{ // ADR-229: one SH-2 recompiler per process (devmiyax 10.5 MB or Ari64 8 MB of the 16 MB code region): a set on
+		// the other one restarts the app straight into it
+		static int s_jit_kind; // 0 none yet, 1 devmiyax, 2 Ari64
+		const int k = !file_exists(DATA_DIR "/interp") && !c2_is_game(game) ? (rstv_emu_uses_ari64(game) ? 2 : 1) : 0;
+		if (k && s_jit_kind && k != s_jit_kind) {
+			RSTV_LOG("switch: %s needs the other recompiler, restarting the app", game);
+			write_text_file(DATA_DIR "/switchto", game, 0);
+			s_relaunch_jit = 1;
+			rstv_jit_shutdown();
+			goto out;
+		}
+		if (k)
+			s_jit_kind = k;
+	}
 	if (!c2_is_game(game)) { // owner: the loading screen at once when a game is picked (the rest below waited before it)
 		const StvGameInfo *gi = STVFindGame(game);
 		rstv_loading_title(gi && gi->name ? gi->name : game);
@@ -956,6 +1057,7 @@ next_game:
 			if (!strcmp(s_stv_list[i].set, game))
 				parent = s_stv_list[i].parent;
 		rstv_video_set_art(game, parent);
+		rstv_video_set_marquee(game, parent);
 	}
 	if (c2_is_game(game)) { // ADR-107: Sega System C / C2
 		c2_loop(game, jit_msg);
@@ -963,7 +1065,7 @@ next_game:
 	}
 	{
 		const StvGameInfo *gi = STVFindGame(game);
-		rstv_menu_init(game, gi && gi->name ? gi->name : game, gi && gi->buttons ? (int)gi->buttons : 4);
+		rstv_menu_init(game, gi && gi->name ? gi->name : game, STVGameButtons(game));
 	}
 	// SH-2 core: interpreter if ux0:data/restv/interp exists, else recompiler
 	const int use_dynarec = !file_exists(DATA_DIR "/interp");
@@ -973,6 +1075,7 @@ next_game:
 		rstv_prof_clock = NULL;
 	// SH-2 and other fine timing (inside loops) only when ux0:data/restv/proffine exists
 	rstv_prof_fine = file_exists(DATA_DIR "/proffine");
+	{ extern int rstv_prof_slice; rstv_prof_slice = file_exists(DATA_DIR "/profslice"); } // SH-2 slice times only
 	{
 		extern int rstv_chain_prof; // ADR-135: block chaining with the sampler's block PC and the chain count
 		rstv_chain_prof = rstv_prof_fine || file_exists(DATA_DIR "/sampler");
@@ -1017,6 +1120,8 @@ next_game:
 	// recompiler fast memory functions for high-speed RAM (ADR-017). Disabled if ux0:data/restv/nomemfast exists
 	extern int rstv_memfast;
 	rstv_memfast = !file_exists(DATA_DIR "/nomemfast");
+	{ extern int rstv_cpy8_on; rstv_cpy8_on = file_exists(DATA_DIR "/hle220") ? 7 : 0; } // ADR-231: the ADR-220 native loops (test only)
+	rstv_fastboot_until = g_set.fast_boot ? 1300 : 0; // ADR-241
 #ifdef RSTV_DEBUG_TOOLS
 	{
 		FILE *ff = fopen(DATA_DIR "/fastboot", "r");
@@ -1221,16 +1326,19 @@ next_game:
 	gx_set_busy(NULL);
 	gvdp2_progress = NULL;
 	rstv_loading_progress(1000);
-#ifdef RSTV_DEBUG_TOOLS
-	if (rstv_fastboot_until > 0) { // (debug fastboot: the BIOS boot runs unseen; its progress on the loading bar below)
+	// Fast boot (ADR-241): the BIOS boot runs unseen, its progress on the loading bar; from frame fb_from (0, or the
+	// frame of a Reset game: the boot runs again, owner)
+	uint32_t fb_from = 0;
+	char fb_title[128];
+	{
 		const StvGameInfo *gi = STVFindGame(game);
-		char lt[128];
-		snprintf(lt, sizeof(lt), "%s - BIOS boot (fastboot, debug build)", gi && gi->name ? gi->name : game);
-		rstv_loading_title(lt);
+		snprintf(fb_title, sizeof(fb_title), "%s - BIOS boot (Fast boot)", gi && gi->name ? gi->name : game);
+	}
+	if (rstv_fastboot_until > 0) {
+		rstv_loading_title(fb_title);
 		rstv_loading_progress(0);
 	} else
-#endif
-	rstv_loading_done();
+		rstv_loading_done();
 
 	// perf log: average and max every 60 frames, appended to file every 600 frames
 	char perf_path[128];
@@ -1376,7 +1484,12 @@ next_game:
 				case RSTV_MENU_RESET:
 					rstv_emu_reset();
 					rstv_test_session = 0;
-					rstv_osd_show("Game reset");
+					if (rstv_fastboot_until > 0) { // (the BIOS boot again: Fast boot again, owner)
+						fb_from = frame;
+						rstv_loading_title(fb_title);
+						rstv_loading_progress(0);
+					} else
+						rstv_osd_show("Game reset");
 					done = 1;
 					break;
 				case RSTV_MENU_SAVE: {
@@ -1431,7 +1544,8 @@ next_game:
 				break;
 			continue;
 		}
-		uint8_t p1, p2, sys;
+		uint16_t p1, p2;
+		uint8_t sys;
 		map_input(&p1, &p2, &sys, frame);
 		// auto input (measurement): press for 6 frames on each "frame coin|start" line of ux0:data/restv/autoinput.txt
 		for (int a = 0; a < n_auto; a++)
@@ -1461,6 +1575,10 @@ next_game:
 		const unsigned sp_c0 = rstv_comp_us[0], sp_c1 = rstv_comp_us[1], sp_c2 = rstv_comp_us[2];
 		extern unsigned rstv_dyn_cyc[2], rstv_tier_runs;
 		const unsigned sp_cm = rstv_dyn_cyc[0], sp_cs = rstv_dyn_cyc[1], sp_tr = rstv_tier_runs;
+		const u64 sp_pm = rstv_prof_us[RSTV_PROF_MSH2], sp_ps = rstv_prof_us[RSTV_PROF_SSH2]; // (with profslice)
+		extern unsigned rstv_dirty_n, rstv_dirty_first, rstv_evict_n;
+		rstv_dirty_n = 0;
+		const unsigned sp_ev = rstv_evict_n;
 		{
 			extern unsigned rstv_probe_us[12], rstv_probe_smpc_us;
 			memset(rstv_probe_us, 0, sizeof(rstv_probe_us));
@@ -1475,15 +1593,14 @@ next_game:
 		for (int k = 0; k < 8; k++)
 			sp_hus += rstv_hle_us[k];
 		uint64_t t0 = rstv_time_us();
-#ifdef RSTV_DEBUG_TOOLS
-		rstv_fastboot_now = frame < rstv_fastboot_until;
-		if (rstv_fastboot_until > 0) { // owner: the screen looked stuck at 100% for the 3-5 s of the fastboot frames
-			if (rstv_fastboot_now && frame % 30 == 0)
-				rstv_loading_progress((int)(frame * 1000u / (unsigned)rstv_fastboot_until));
-			else if (frame == (uint32_t)rstv_fastboot_until)
+		const uint32_t fb_at = frame - fb_from; // (frames since the boot began)
+		rstv_fastboot_now = frame >= fb_from && fb_at < (uint32_t)rstv_fastboot_until;
+		if (rstv_fastboot_until > 0 && frame >= fb_from) { // owner: the screen looked stuck at 100% for the 3-5 s of the fastboot frames
+			if (rstv_fastboot_now && fb_at % 30 == 0)
+				rstv_loading_progress((int)(fb_at * 1000u / (unsigned)rstv_fastboot_until));
+			else if (fb_at == (uint32_t)rstv_fastboot_until)
 				rstv_loading_done();
 		}
-#endif
 		rstv_emu_run_frame(p1, p2, sys);
 		for (int k = 0; k < n_poke; k++)
 			MappedMemoryWriteByteNocache(poke_addr[k], poke_val[k]);
@@ -1494,6 +1611,10 @@ next_game:
 				rstv_dyn_compile - sp_comp, rstv_comp_us[0] - sp_c0, rstv_comp_us[1] - sp_c1, rstv_comp_us[2] - sp_c2,
 				rstv_dsp_insns - sp_dsp, rstv_dma_units - sp_dma, (rstv_dyn_cyc[0] - sp_cm) / 1000, (rstv_dyn_cyc[1] - sp_cs) / 1000,
 				rstv_tier_runs - sp_tr);
+		if (dt > s_spike_us)
+			RSTV_LOG("spike f%u dirty %u first %08x evict %u (total %u)", frame, rstv_dirty_n, rstv_dirty_first, rstv_evict_n - sp_ev, rstv_evict_n);
+		if (dt > s_spike_us && rstv_prof_us[RSTV_PROF_MSH2] != sp_pm)
+			RSTV_LOG("spike f%u msh2 %u ssh2 %u us", frame, (unsigned)(rstv_prof_us[RSTV_PROF_MSH2] - sp_pm), (unsigned)(rstv_prof_us[RSTV_PROF_SSH2] - sp_ps));
 		if (dt > s_spike_us) {
 			unsigned hus = 0;
 			for (int k = 0; k < 8; k++)
@@ -1564,10 +1685,8 @@ next_game:
 		}
 
 		uint64_t tp0 = rstv_time_us();
-#ifdef RSTV_DEBUG_TOOLS
 		if (!rstv_fastboot_now)
-#endif
-		rstv_video_present();
+			rstv_video_present();
 		uint64_t tp = rstv_time_us() - tp0;
 		pres_sum += tp;
 		if (tp > pres_max)
@@ -1865,9 +1984,10 @@ out:
 	rstv_video_shutdown();
 	rstv_log_shutdown();
 	rstv_kctrl_cpu3_release(); // (ADR-218)
-	if (s_quit_mode == 2 || s_exit_next) { // System C / C2 menu "Select game" / measuring tools: relaunch the app
+	if (s_quit_mode == 2 || s_exit_next || s_relaunch_jit) { // System C / C2 menu "Select game" / measuring tools /
+		// the other SH-2 recompiler (ADR-229): relaunch the app
 		static char *const av[] = { "list", NULL }; // (back to the list: no update check, ADR-209)
-		sceAppMgrLoadExec("app0:eboot.bin", s_quit_mode == 2 ? av : NULL, NULL);
+		sceAppMgrLoadExec("app0:eboot.bin", s_quit_mode == 2 && !s_relaunch_jit ? av : NULL, NULL);
 	}
 	sceKernelExitProcess(0);
 	return 0;

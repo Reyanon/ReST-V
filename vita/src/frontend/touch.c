@@ -112,8 +112,49 @@ const char *rstv_touch_key_name(int key)
 	return rstv_key_name(key);
 }
 
+#ifdef RSTV_DEBUG_TOOLS
+// test: ux0:data/restv/touchsim = a finger script, one step a line "x y reads" (x < 0: no finger), played by the reads
+// that follow (one a frame in the list); the file is removed when it is loaded
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+static int s_sim_x[64], s_sim_y[64], s_sim_n[64], s_sim_steps, s_sim_at;
+static int touch_sim(int *x, int *y, int *n)
+{
+	static unsigned check;
+	if (s_sim_at >= s_sim_steps && (check++ & 15) == 0) {
+		SceIoStat st;
+		if (sceIoGetstat("ux0:data/restv/touchsim", &st) >= 0 && st.st_size > 0) {
+			FILE *f = fopen("ux0:data/restv/touchsim", "r");
+			s_sim_steps = s_sim_at = 0;
+			while (f && s_sim_steps < 64 &&
+				fscanf(f, "%d %d %d", &s_sim_x[s_sim_steps], &s_sim_y[s_sim_steps], &s_sim_n[s_sim_steps]) == 3)
+				s_sim_steps++;
+			if (f)
+				fclose(f);
+			sceIoRemove("ux0:data/restv/touchsim");
+			RSTV_LOG("touch: test script, %d steps", s_sim_steps);
+		}
+	}
+	if (s_sim_at >= s_sim_steps)
+		return 0;
+	*n = s_sim_x[s_sim_at] >= 0;
+	x[0] = s_sim_x[s_sim_at];
+	y[0] = s_sim_y[s_sim_at];
+	if (--s_sim_n[s_sim_at] <= 0)
+		s_sim_at++;
+	return 1;
+}
+#endif
+
 int rstv_touch_read(int *x, int *y)
 {
+#ifdef RSTV_DEBUG_TOOLS
+	{
+		int n;
+		if (touch_sim(x, y, &n))
+			return n;
+	}
+#endif
 	SceTouchData t;
 	int n = 0;
 	if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1) < 1)

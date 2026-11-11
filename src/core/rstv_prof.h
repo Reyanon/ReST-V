@@ -40,6 +40,10 @@ extern volatile int rstv_act;
 extern volatile unsigned rstv_act_pc;
 #define RSTV_PROF_TF() ((rstv_prof_fine && rstv_prof_clock) ? rstv_prof_clock() : 0)
 #define RSTV_PROF_ADDF(b, t0) do { if (rstv_prof_fine && rstv_prof_clock) rstv_prof_us[b] += rstv_prof_clock() - (t0); } while (0)
+/* the SH-2 slices only (about 2k clock reads a frame): rstv_prof_slice (ux0:data/restv/profslice) */
+extern int rstv_prof_slice;
+#define RSTV_PROF_TS() (((rstv_prof_fine || rstv_prof_slice) && rstv_prof_clock) ? rstv_prof_clock() : 0)
+#define RSTV_PROF_ADDS(b, t0) do { if ((rstv_prof_fine || rstv_prof_slice) && rstv_prof_clock) rstv_prof_us[b] += rstv_prof_clock() - (t0); } while (0)
 
 #ifdef __cplusplus
 }

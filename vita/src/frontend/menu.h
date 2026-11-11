@@ -13,10 +13,16 @@ enum {
 	RSTV_KEY_COUNT
 };
 #define RSTV_KEY_NONE RSTV_KEY_COUNT
-// game inputs to map: buttons 1-4, coin, start
-enum { RSTV_ACT_B1, RSTV_ACT_B2, RSTV_ACT_B3, RSTV_ACT_B4, RSTV_ACT_COIN, RSTV_ACT_START, RSTV_ACT_COUNT };
-#define RSTV_GAME_BUTTONS 4
+// game inputs to map: buttons 1-6 (ADR-219: 6 on MAME's 6-button panel), coin, start
+enum { RSTV_ACT_B1, RSTV_ACT_B2, RSTV_ACT_B3, RSTV_ACT_B4, RSTV_ACT_B5, RSTV_ACT_B6, RSTV_ACT_COIN, RSTV_ACT_START,
+	RSTV_ACT_COUNT };
+#define RSTV_GAME_BUTTONS 6
 enum { RSTV_STICK_OFF, RSTV_STICK_LEFT, RSTV_STICK_RIGHT, RSTV_STICK_BOTH, RSTV_STICK_COUNT };
+// ADR-235 (from ReBOX): a stick direction, and what it presses: nothing, a lever direction (order of RSTV_SDIR_*), game
+// buttons 1-6, coin, start
+enum { RSTV_SDIR_UP, RSTV_SDIR_DOWN, RSTV_SDIR_LEFT, RSTV_SDIR_RIGHT, RSTV_SDIR_COUNT };
+enum { RSTV_STGT_NONE, RSTV_STGT_UP, RSTV_STGT_DOWN, RSTV_STGT_LEFT, RSTV_STGT_RIGHT, RSTV_STGT_B1, RSTV_STGT_B6 = RSTV_STGT_B1 + 5,
+	RSTV_STGT_COIN, RSTV_STGT_START, RSTV_STGT_COUNT };
 // screen (Reirem order): 4:3, full, integer
 enum { RSTV_ASPECT_4_3, RSTV_ASPECT_FULL, RSTV_ASPECT_INT, RSTV_ASPECT_COUNT };
 enum { RSTV_FILTER_SMOOTH, RSTV_FILTER_SHARP, RSTV_FILTER_COUNT };
@@ -24,15 +30,20 @@ enum { RSTV_FILTER_SMOOTH, RSTV_FILTER_SHARP, RSTV_FILTER_COUNT };
 enum { RSTV_SCAN_OFF, RSTV_SCAN_CRT_SOFT, RSTV_SCAN_CRT_SHARP, RSTV_SCAN_PX2, RSTV_SCAN_PX3, RSTV_SCAN_PX4, RSTV_SCAN_COUNT };
 enum { RSTV_SCAN_LIGHT, RSTV_SCAN_MEDIUM, RSTV_SCAN_HEAVY, RSTV_SCAN_STRENGTH_COUNT };
 // outside the game screen (4:3 / integer): black, artwork (ux0:data/restv/artwork/<set>.png|jpg|bmp), solid color
-enum { RSTV_BORDER_BLACK, RSTV_BORDER_ARTWORK, RSTV_BORDER_COLOR, RSTV_BORDER_COUNT };
+enum { RSTV_BORDER_BLACK, RSTV_BORDER_ARTWORK, RSTV_BORDER_COLOR, RSTV_BORDER_MARQUEE, RSTV_BORDER_COUNT }; // (MARQUEE: ADR-238)
 // screen rotation (ADR-190): Auto = vertical games upright on the landscape screen; Vertical L / R = upright with the Vita
 // turned left (right edge up) / right (left edge up), directions turned with it
 enum { RSTV_ROT_AUTO, RSTV_ROT_OFF, RSTV_ROT_VL, RSTV_ROT_VR, RSTV_ROT_COUNT };
-enum { RSTV_BCOL_NAVY, RSTV_BCOL_GRAY, RSTV_BCOL_MAROON, RSTV_BCOL_GREEN, RSTV_BCOL_PURPLE, RSTV_BCOL_BRICK, RSTV_BCOL_COUNT };
+enum { RSTV_BCOL_NAVY, RSTV_BCOL_GRAY, RSTV_BCOL_MAROON, RSTV_BCOL_GREEN, RSTV_BCOL_PURPLE, RSTV_BCOL_BRICK,
+       RSTV_BCOL_BLACK, RSTV_BCOL_CHARCOAL, RSTV_BCOL_SILVER, RSTV_BCOL_WHITE, RSTV_BCOL_BLUE, RSTV_BCOL_SKY, RSTV_BCOL_TEAL,
+       RSTV_BCOL_OLIVE, RSTV_BCOL_FOREST, RSTV_BCOL_BROWN, RSTV_BCOL_ORANGE, RSTV_BCOL_GOLD, RSTV_BCOL_RED, RSTV_BCOL_WINE,
+       RSTV_BCOL_PINK, RSTV_BCOL_INDIGO, RSTV_BCOL_COUNT }; // (as ReBOX; new ones at the end: saved numbers stay)
 // menu confirm button (the other one is back)
 enum { RSTV_CONFIRM_CROSS, RSTV_CONFIRM_CIRCLE, RSTV_CONFIRM_COUNT };
 // game list filter (SELECT cycles in this order)
 enum { RSTV_LIST_PLAYABLE, RSTV_LIST_ALL, RSTV_LIST_FAVORITES, RSTV_LIST_FILTER_COUNT };
+// game list tabs (ADR-233, ReBOX's "Group games by"): by board, year, maker, or one tab of every game
+enum { RSTV_GROUP_BOARD, RSTV_GROUP_YEAR, RSTV_GROUP_MAKER, RSTV_GROUP_ALL, RSTV_GROUP_COUNT };
 enum { RSTV_TURBO_FAST, RSTV_TURBO_MEDIUM, RSTV_TURBO_SLOW, RSTV_TURBO_SPEED_COUNT };
 // colour themes (ADR-210, as ReSys12 / ReiREM; Blue is the ReST-V default)
 enum { RSTV_THEME_RED, RSTV_THEME_BLUE, RSTV_THEME_GREEN, RSTV_THEME_PURPLE, RSTV_THEME_ORANGE, RSTV_THEME_GRAPHITE, RSTV_THEME_COUNT };
@@ -41,10 +52,11 @@ enum { RSTV_THEME_RED, RSTV_THEME_BLUE, RSTV_THEME_GREEN, RSTV_THEME_PURPLE, RST
 #define RSTV_PORTS 2 // players with their own controls (Port 1 = 1P, Port 2 = 2P)
 // one player's controls (Controls > Port N Controls; RetroArch style)
 typedef struct {
-	int keymap[RSTV_ACT_COUNT]; // RSTV_KEY_* (buttons 3 and 4 may be RSTV_KEY_NONE)
-	int stick;         // RSTV_STICK_* (analog stick used as lever)
+	int keymap[RSTV_ACT_COUNT]; // RSTV_KEY_* (buttons 3-6 may be RSTV_KEY_NONE)
+	int stick;         // RSTV_STICK_* (files before ADR-235 only: read into smap)
+	int smap[2][RSTV_SDIR_COUNT]; // RSTV_STGT_*: what each direction of the left (0) and right (1) stick presses
 	int turbo_key;     // Vita button that triggers turbo, RSTV_KEY_NONE = off
-	int turbo_btn;     // game button to turbo, 1..4
+	int turbo_btn;     // game button to turbo, 1..6
 	int turbo_speed;   // RSTV_TURBO_*
 	int combo[RSTV_KEY_COUNT];      // ADR-214: combo keys: combo[RSTV_KEY_*] = bit mask (1 << RSTV_KEY_*) of two keys it presses, 0 = normal
 } rstv_port;
@@ -63,6 +75,9 @@ typedef struct {
 	int input_engine;  // RE_PAD_ENGINE_* (global only): Native or the bundled RePad plugin
 	int confirm;       // RSTV_CONFIRM_*
 	int list_filter;   // RSTV_LIST_*
+	int list_group;    // RSTV_GROUP_*
+	int list_snap;     // ADR-239: the preview of the game the cursor rests on (snap/<set>.mp4, .png, .jpg)
+	int fast_boot;     // ADR-241: the BIOS boot screens run unseen at full speed (global)
 	int theme;         // RSTV_THEME_* (global)
 	int touch_keys;    // ADR-214: the touch screen buttons press their keys
 	int touch_show;    // the touch buttons are drawn over the game
@@ -75,6 +90,7 @@ extern int rstv_input_rot;
 static inline int rstv_turbo_period(int speed) { return speed == 0 ? 4 : speed == 1 ? 6 : 8; }
 void rstv_settings_defaults(void);
 void rstv_settings_default_keys(void);     // every port and the touch buttons
+void rstv_stick_preset(rstv_port *p, int st, int dpad); // a stick as the d-pad, or pressing nothing
 void rstv_settings_default_port(int port); // one port's buttons, stick, turbo and combo keys
 void rstv_settings_load(void);
 void rstv_settings_save(void);
@@ -109,7 +125,7 @@ typedef enum {
 } rstv_menu_result;
 
 void rstv_menu_init(const char *set, const char *title, int buttons); // after the game is known (buttons = number of game buttons)
-int rstv_menu_buttons(void); // button count of the current game (2-4)
+int rstv_menu_buttons(void); // button count of the current game (2-6)
 void rstv_kctrl_init(int restarted); // kernel helper for the PS button (may restart the app once after boot)
 void rstv_kctrl_cpu3(int hook);      // ADR-218: open CPU3 (hook 1) or take over an earlier run's unlock (0)
 void rstv_kctrl_cpu3_release(void);  // give the unlock back (before exit / relaunch)

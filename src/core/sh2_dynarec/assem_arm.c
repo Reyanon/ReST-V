@@ -93,7 +93,7 @@ const pointer jump_vaddr_reg[2][16] = {
 u32 needs_clear_cache[1<<(TARGET_SIZE_2-17)];
 
 //#define JUMP_TABLE_SIZE (sizeof(jump_table_symbols)*2)
-#define JUMP_TABLE_SIZE 0
+#define JUMP_TABLE_SIZE 4096 // ReST-V (ADR-222): trampolines to far targets (ari_tramp)
 
 /* Linker */
 
@@ -180,6 +180,8 @@ void *kill_pointer(void *stub)
   return i_ptr;
 }
 
+u32 ari_tramp(u32 a); // ReST-V (ADR-222), below
+extern u32 ari_tramp_n;
 pointer get_pointer(void *stub)
 {
   //printf("get_pointer(%x)\n",(int)stub);
@@ -249,6 +251,7 @@ int isclean(pointer addr)
   if((*ptr&0xFF000000)!=0xeb000000) ptr++;
   if((*ptr&0xFF000000)!=0xeb000000) return 1; // bl instruction
   if((int)ptr+((*ptr<<8)>>6)+8==(int)verify_code) return 0;
+  if(ari_tramp_n&&(int)ptr+((*ptr<<8)>>6)+8==(int)ari_tramp((u32)verify_code)) return 0; // ReST-V (ADR-222)
   return 1;
 }
 
@@ -1135,7 +1138,7 @@ void emit_swapb(int rs,int rt)
   assem_debug("eor %s,%s,%s,lsr #%d\n",regname[14],regname[rs],regname[rs],8);
   output_w32(0xe0200020|rd_rn_rm(14,rs,rs)|(8<<7));
   emit_andimm(14,0xff,14);
-  emit_xor(14,rt,rt);
+  emit_xor(14,rs,rt); // ReST-V (ADR-222): was (14,rt,rt): wrong whenever rt != rs (swap.b r5,r0 in cotton2's slave)
   assem_debug("eor %s,%s,%s,lsl #%d\n",regname[rt],regname[rt],regname[14],8);
   output_w32(0xe0200000|rd_rn_rm(rt,rt,14)|(8<<7));
   #endif
@@ -1644,6 +1647,23 @@ void emit_subc(int s, int t, int sr)
   emit_adc(sr,sr,sr);
   emit_xorimm(sr,1,sr);
 }
+// ReST-V (ADR-222): ADDV / SUBV (were not implemented): t = t +/- s, T = signed overflow (the ARM V flag)
+void emit_addv(int s, int t, int sr)
+{
+  emit_andimm(sr,~1,sr);
+  assem_debug("adds %s,%s,%s\n",regname[t],regname[t],regname[s]);
+  output_w32(0xe0900000|rd_rn_rm(t,t,s));
+  assem_debug("orrvs %s,%s,#1\n",regname[sr],regname[sr]);
+  output_w32(0x63800001|(sr<<16)|(sr<<12));
+}
+void emit_subv(int s, int t, int sr)
+{
+  emit_andimm(sr,~1,sr);
+  assem_debug("subs %s,%s,%s\n",regname[t],regname[t],regname[s]);
+  output_w32(0xe0500000|rd_rn_rm(t,t,s));
+  assem_debug("orrvs %s,%s,#1\n",regname[sr],regname[sr]);
+  output_w32(0x63800001|(sr<<16)|(sr<<12));
+}
 void emit_shrsr(int t, int sr)
 {
   emit_andimm(sr,~1,sr);
@@ -1696,14 +1716,39 @@ void emit_rotcrsr(int t, int sr)
   emit_adc(sr,sr,sr);
 }
 
+// ReST-V (ADR-222): a target outside the code buffer and beyond a branch's +-32 MB (the Vita's code memory is far from
+// the program): called through ldr pc instead. Placeholders (small values) and targets in the buffer stay one branch
+// Such a target goes through a trampoline (ldr pc,[pc,#-4] + the address) in a table at the end of the code buffer,
+// so every call stays one bl / b (the code is parsed back: get_clean_addr, verify_dirty, isclean)
+int ari_far(int a)
+{
+  if((u32)a<4096) return 0;
+  if((u32)a>=(u32)BASE_ADDR&&(u32)a<(u32)BASE_ADDR+(1<<TARGET_SIZE_2)) return 0;
+  int offset=a-(int)out-8;
+  return offset<-33554432||offset>=33554432;
+}
+u32 ari_tramp_n;
+u32 ari_tramp(u32 a)
+{
+  u32 *tab=(u32 *)(BASE_ADDR+(1<<TARGET_SIZE_2)-JUMP_TABLE_SIZE);
+  for(u32 k=0;k<ari_tramp_n;k++)
+    if(tab[2*k+1]==a) return (u32)&tab[2*k];
+  assert(ari_tramp_n<JUMP_TABLE_SIZE/8);
+  tab[2*ari_tramp_n]=0xe51ff004; // ldr pc,[pc,#-4]
+  tab[2*ari_tramp_n+1]=a;
+  __clear_cache((void *)&tab[2*ari_tramp_n],(void *)&tab[2*ari_tramp_n+2]);
+  return (u32)&tab[2*ari_tramp_n++];
+}
 void emit_call(int a)
 {
+  if(ari_far(a)) a=(int)ari_tramp((u32)a);
   assem_debug("bl %x (%x+%x)\n",a,(int)out,a-(int)out-8);
   u32 offset=genjmp(a);
   output_w32(0xeb000000|offset);
 }
 void emit_jmp(int a)
 {
+  if(ari_far(a)) a=(int)ari_tramp((u32)a);
   assem_debug("b %x (%x+%x)\n",a,(int)out,a-(int)out-8);
   u32 offset=genjmp(a);
   output_w32(0xea000000|offset);
@@ -2243,6 +2288,11 @@ void emit_load_return_address(unsigned int rt)
 {
   // (assumes this instruction will be followed by a branch instruction)
   emit_mov(15,rt);
+}
+// ReST-V (ADR-222): the same before a far jump (ldr pc + its word): the address after both
+void emit_load_return_address_far(unsigned int rt)
+{
+  output_w32(0xe28f0004|(rt<<12)); // add rt,pc,#4
   //assem_debug("add %s,pc,#0\n",regname[rt]);
   //output_w32(0xe2800000|rd_rn_rm(rt,15,0));
 }
@@ -2791,11 +2841,11 @@ void do_readstub(int n)
     emit_loadreg(CCREG,2);
   }
   if(type==LOADB_STUB)
-    emit_call((int)MappedMemoryReadByte);
+    emit_call((int)ari_rb);
   if(type==LOADW_STUB)
-    emit_call((int)MappedMemoryReadWord);
+    emit_call((int)ari_rw);
   if(type==LOADL_STUB)
-    emit_call((int)MappedMemoryReadLong);
+    emit_call((int)ari_rl);
   if(type==LOADS_STUB)
   {
     // RTE instruction, pop PC and SR from stack
@@ -2803,7 +2853,7 @@ void do_readstub(int n)
     assert(pc>=0);
     if(rs<4||rs==12)
       emit_writeword(rs,(int)&dynarec_local+24);
-    emit_call((int)MappedMemoryReadLong);
+    emit_call((int)ari_rl);
     if(rs==1||rs==2||rs==3||rs==12)
       emit_readword((int)&dynarec_local+24,rs);
     if(pc==0) {
@@ -2821,7 +2871,7 @@ void do_readstub(int n)
       }else
         emit_addimm(rs,4,0);
     }
-    emit_call((int)MappedMemoryReadLong);
+    emit_call((int)ari_rl);
     assert(rt>=0);
     if(rt!=0) emit_mov(0,rt);
     if(pc<4||pc==12)
@@ -2859,11 +2909,11 @@ void inline_readstub(int type, int i, u32 addr, signed char regmap[], int target
   save_regs(reglist);
   emit_movimm(addr,0);
   if(type==LOADB_STUB)
-    emit_call((int)MappedMemoryReadByte);
+    emit_call((int)ari_rb);
   if(type==LOADW_STUB)
-    emit_call((int)MappedMemoryReadWord);
+    emit_call((int)ari_rw);
   if(type==LOADL_STUB)
-    emit_call((int)MappedMemoryReadLong);
+    emit_call((int)ari_rl);
   assert(type!=LOADS_STUB);
   if(type==LOADB_STUB)
   {
@@ -2980,7 +3030,7 @@ void do_rmwstub(int n)
     emit_writeword(0,(int)&dynarec_local+24);
   
   //if(i_regmap[HOST_CCREG]==CCREG) emit_storereg(CCREG,HOST_CCREG);//DEBUG
-  emit_call((int)MappedMemoryReadByte);
+  emit_call((int)ari_rb);
   //emit_mov(0,1);
   if(type==RMWA_STUB)
     emit_andimm(0,imm[i],1);
@@ -2996,7 +3046,7 @@ void do_rmwstub(int n)
     emit_readword((int)&dynarec_local+24,0);
   else
     emit_mov(rs,0);
-  //emit_call((int)MappedMemoryWriteByte);
+  //emit_call((int)ari_wb);
   emit_call((int)WriteInvalidateByte);
   
   restore_regs(reglist);

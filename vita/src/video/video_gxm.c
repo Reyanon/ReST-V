@@ -14,6 +14,8 @@
 #include "platform/log.h"
 #include "platform/cpu3.h"
 #include "video/gx.h"
+#include "video/neon.h"
+#include "frontend/avsnap.h"
 
 #define NUM_TEX 3
 
@@ -27,6 +29,8 @@ static int s_gpu_w, s_gpu_h, s_gpu_last;
 
 static GxProg *s_prog_img, *s_prog_osd, *s_prog_fill, *s_prog_layer; // layer: premultiplied alpha (ui.c, ADR-095)
 static GxProg *s_prog_tint; // layer times an opacity (blinking menu focus, ADR-194)
+static GxProg *s_prog_addt; // ADR-237: a premultiplied texture times an opacity, added (the touch light)
+static GxParam s_u_addt_scale, s_u_addt_tex, s_u_addt_a;
 static GxParam s_u_layer_scale, s_u_layer_tex, s_u_tint_scale, s_u_tint_tex, s_u_tint_a;
 static GxParam s_u_img_scale, s_u_img_tex, s_u_osd_scale, s_u_osd_tex, s_u_fill_scale, s_u_fill_color;
 
@@ -84,6 +88,12 @@ void rstv_video_init(void)
 	s_prog_osd = gx_prog(s_vs_img, s_fs_img, img_attr, 2, 16, GX_BLEND_ALPHA);
 	s_prog_layer = gx_prog(s_vs_img, s_fs_img, img_attr, 2, 16, GX_BLEND_PREMUL);
 	s_prog_tint = gx_prog(s_vs_img, s_fs_tint, img_attr, 2, 16, GX_BLEND_PREMUL);
+	s_prog_addt = gx_prog(s_vs_img, s_fs_tint, img_attr, 2, 16, GX_BLEND_ADD);
+	if (s_prog_addt) {
+		s_u_addt_scale = gx_param(s_prog_addt, "scale");
+		s_u_addt_tex = gx_param(s_prog_addt, "tex");
+		s_u_addt_a = gx_param(s_prog_addt, "alpha");
+	}
 	if (s_prog_tint) {
 		s_u_tint_scale = gx_param(s_prog_tint, "scale");
 		s_u_tint_tex = gx_param(s_prog_tint, "tex");
@@ -423,12 +433,18 @@ static GxTex *scan_texture(int dh, int lines)
 	return s_scan_tex[next];
 }
 
-// border solid colors (same 6 colors as Reirem)
+// border solid colors (the 22 colors of ReBOX, same order as the menu's border_col)
 static void border_rgba(float *c)
 {
-	static const uint8_t col[6][3] = { { 0x14, 0x18, 0x3C }, { 0x28, 0x28, 0x2C }, { 0x48, 0x10, 0x14 },
-		{ 0x10, 0x34, 0x1C }, { 0x2C, 0x14, 0x48 }, { 0x5A, 0x24, 0x18 } };
-	const int k = s_border_color < 0 || s_border_color > 5 ? 0 : s_border_color;
+	static const uint8_t col[22][3] = { { 0x14, 0x18, 0x3C }, { 0x28, 0x28, 0x2C }, { 0x48, 0x10, 0x14 },
+		{ 0x10, 0x34, 0x1C }, { 0x2C, 0x14, 0x48 }, { 0x5A, 0x24, 0x18 },
+		{ 0x00, 0x00, 0x00 }, { 0x18, 0x18, 0x1A }, { 0x80, 0x84, 0x8C }, // black, charcoal, silver
+		{ 0xE8, 0xE8, 0xE8 }, { 0x14, 0x30, 0x80 }, { 0x30, 0x70, 0xA8 }, // white, blue, sky
+		{ 0x0C, 0x4C, 0x50 }, { 0x48, 0x48, 0x14 }, { 0x0C, 0x24, 0x10 }, // teal, olive, forest
+		{ 0x40, 0x28, 0x14 }, { 0x90, 0x48, 0x10 }, { 0x8C, 0x70, 0x18 }, // brown, orange, gold
+		{ 0x80, 0x10, 0x10 }, { 0x30, 0x08, 0x14 }, { 0x9C, 0x40, 0x6C }, // red, wine, pink
+		{ 0x20, 0x10, 0x58 } };                                           // indigo
+	const int k = s_border_color < 0 || s_border_color > 21 ? 0 : s_border_color;
 	c[0] = col[k][0] / 255.0f;
 	c[1] = col[k][1] / 255.0f;
 	c[2] = col[k][2] / 255.0f;
@@ -570,6 +586,79 @@ static uint8_t *load_art_file(const char *name, int *w, int *h)
 		b = load_bmp(path, w, h);
 	}
 	return b;
+}
+// a png or jpg as RGBA (malloc'd; NULL if missing): the list's previews (avsnap.c)
+uint8_t *rstv_video_load_image(const char *path, int *w, int *h)
+{
+	const size_t n = strlen(path);
+	if (n > 4 && !strcmp(path + n - 4, ".jpg"))
+		return load_jpg(path, w, h);
+	return load_png(path, w, h);
+}
+// ADR-239: the list fades away over a video preview (0 shown .. 1 gone)
+static float s_ui_hide;
+void rstv_video_set_ui_hide(float h) { s_ui_hide = h < 0.0f ? 0.0f : h > 1.0f ? 1.0f : h; }
+// ADR-238 (from ReBOX): the game's marquee, ux0:data/restv/marquees/<set>.png or .jpg (else the parent's), at both sides of
+// the picture while it runs (Border = Marquee, on the border colour)
+static GxTex *s_marquee;
+static int s_mq_w, s_mq_h;
+static uint8_t *load_marquee(const char *name, int *w, int *h)
+{
+	char path[160];
+	snprintf(path, sizeof(path), "ux0:data/restv/marquees/%s.png", name);
+	uint8_t *b = load_png(path, w, h);
+	if (!b) {
+		snprintf(path, sizeof(path), "ux0:data/restv/marquees/%s.jpg", name);
+		b = load_jpg(path, w, h);
+	}
+	return b;
+}
+void rstv_video_set_marquee(const char *set, const char *parent)
+{
+	s_mq_w = s_mq_h = 0;
+	int w = 0, h = 0;
+	uint8_t *b = set ? load_marquee(set, &w, &h) : NULL;
+	if (!b && set && parent)
+		b = load_marquee(parent, &w, &h);
+	if (!b)
+		return;
+	if (w > 2048 || h > 2048) {
+		free(b);
+		return;
+	}
+	if (s_marquee && (w > s_marquee->w || h > s_marquee->h)) {
+		gx_finish();
+		gx_tex_free(s_marquee);
+		s_marquee = NULL;
+	}
+	if (!s_marquee)
+		s_marquee = gx_tex(w, h, GX_RGBA8, 1, 0);
+	if (s_marquee) {
+		for (int y = 0; y < h; y++)
+			memcpy(s_marquee->data + (size_t)y * s_marquee->stride, b + (size_t)y * w * 4, (size_t)w * 4);
+		s_mq_w = w;
+		s_mq_h = h;
+		RSTV_LOG("video: marquee %s %dx%d", set, w, h);
+	}
+	free(b);
+}
+// the marquee at both sides of the picture, turned along them: its top towards the picture
+static void draw_marquee(int pic_x, int pic_w)
+{
+	if (!s_marquee || s_mq_w <= 0 || pic_x < 32 || !s_prog_osd)
+		return;
+	const float w = (float)s_mq_w, h = (float)s_mq_h;
+	const float col = (float)pic_x * 0.9f, sa = col / h, sb = 544.0f * 0.9f / w, sc = sa < sb ? sa : sb;
+	const float xr = (float)(pic_x + pic_w), cl = (float)pic_x * 0.5f, cr = xr + (960.0f - xr) * 0.5f;
+	const float rw = h * sc, rh = w * sc; // (turned: the screen rectangle is h x w)
+	gx_tex_filter(s_marquee, 1);
+	for (int s = 0; s < 2; s++) {
+		const float c = s ? cr : cl;
+		gx_use(s_prog_osd);
+		gx_set_tex(s_u_osd_tex, s_marquee);
+		quad_rot(s_prog_osd, s_u_osd_scale, c - rw * 0.5f, 272.0f - rh * 0.5f, c + rw * 0.5f, 272.0f + rh * 0.5f,
+			w / s_marquee->w, h / s_marquee->h, s ? 3 : 1);
+	}
 }
 // the app's LiveArea background (RGBA, malloc'd; NULL if missing): loading screen (ADR-191)
 // owner: the loading screen right after a game is picked. Its background (the LiveArea art) and the blank artwork are
@@ -721,12 +810,59 @@ void rstv_video_picture_rect(int *x, int *y, int *w, int *h)
 	*h = s_pic_h;
 }
 
+static int s_dialog; // (present: a system dialog over the frame)
+
+// ADR-237 (from ReBOX): the touch light, over everything; set each frame it shows (gone 2 presents after the last set)
+#define FX_LAYERS 2
+static struct { GxTex *t; float x, y, r, a; } s_fx[FX_LAYERS];
+static int s_fx_ttl;
+void *rstv_video_fx_tex(int size)
+{
+	return gx_tex(size, size, GX_RGBA8, 1, 0);
+}
+uint32_t *rstv_video_fx_pixels(void *t, int *stride)
+{
+	GxTex *g = (GxTex *)t;
+	*stride = g->stride / 4;
+	return (uint32_t *)g->data;
+}
+void rstv_video_touch_fx(int slot, void *t, float x, float y, float r, float a)
+{
+	if (slot < 0 || slot >= FX_LAYERS)
+		return;
+	s_fx[slot].t = (GxTex *)t;
+	s_fx[slot].x = x;
+	s_fx[slot].y = y;
+	s_fx[slot].r = r;
+	s_fx[slot].a = a;
+	s_fx_ttl = 3;
+}
+static void draw_touch_fx(void)
+{
+	if (s_fx_ttl <= 0 || !--s_fx_ttl || !s_prog_addt)
+		return;
+	for (int k = 0; k < FX_LAYERS; k++) {
+		GxTex *t = s_fx[k].t;
+		if (!t || s_fx[k].a <= 0.0f)
+			continue;
+		gx_use(s_prog_addt);
+		gx_set_tex(s_u_addt_tex, t);
+		const float a4[4] = { s_fx[k].a, 0, 0, 0 };
+		gx_set4(s_u_addt_a, a4);
+		const float r = s_fx[k].r;
+		quad(s_prog_addt, s_u_addt_scale, s_fx[k].x - r, s_fx[k].y - r, s_fx[k].x + r, s_fx[k].y + r, 0, 0, 1, 1);
+	}
+}
 void rstv_video_present(void)
 {
 	if (!s_prog_img || !s_prog_fill)
 		return;
 	rstv_video_art_retint(); // owner: the blank artwork follows the theme at once, also while the menu is open
 	gx_lock(); // keep clear of the worker thread's GPU submits (ADR-029)
+	// ADR-240: the neon corridor's still part, drawn into its texture outside the screen's scene when it changes (the
+	// picture's place of the last present)
+	GxTex *neon = s_border == 1 && s_art_blank && s_scale_mode != 2 && (s_ready >= 0 || s_gpu_last) ?
+		rstv_neon_prepare((float)s_pic_x, (float)s_pic_w, rstv_menu_accent()) : NULL;
 	gx_begin(NULL);
 	// black background
 	{
@@ -778,7 +914,19 @@ void rstv_video_present(void)
 		s_pic_h = (int)(dh + 0.5f);
 		if (s_border && s_scale_mode != 2) {
 			// ADR-126 border: fill the whole screen with artwork (if any) or solid color, then the game screen
-			if (s_border == 1 && s_art && s_art_w > 0) {
+			if (s_border == 1 && s_art_blank && neon) {
+				// ADR-236 / 240: no artwork of its own: the neon corridor (from ReBOX). Its still part copied beside the
+				// picture only (the picture covers the middle), then the moving parts added
+				const float xr = x0 + dw;
+				gx_tex_filter(neon, 0);
+				gx_use(s_prog_img);
+				gx_set_tex(s_u_img_tex, neon);
+				quad(s_prog_img, s_u_img_scale, 0, 0, x0, 544, 0, 0, x0 / neon->w, 544.0f / neon->h);
+				gx_use(s_prog_img);
+				gx_set_tex(s_u_img_tex, neon);
+				quad(s_prog_img, s_u_img_scale, xr, 0, 960, 544, xr / neon->w, 0, 960.0f / neon->w, 544.0f / neon->h);
+				rstv_neon_draw();
+			} else if (s_border == 1 && s_art && s_art_w > 0) {
 				gx_tex_filter(s_art, 1);
 				gx_use(s_prog_img);
 				gx_set_tex(s_u_img_tex, s_art);
@@ -796,6 +944,8 @@ void rstv_video_present(void)
 					gx_set4(s_u_fill_scale, sc);
 					gx_draw(SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, v, gx_seq_indices(4), 4);
 				}
+				if (s_border == 3) // ADR-238 Marquee: on the border colour
+					draw_marquee((int)(x0 + 0.5f), (int)(dw + 0.5f));
 			}
 		}
 		gx_tex_filter((GxTex *)t, s_filter);
@@ -825,6 +975,18 @@ void rstv_video_present(void)
 	}
 	for (int kk = 0; kk < 5 && s_prog_layer; kk++) {
 		const int k = kk == 0 ? 4 : kk - 1; // (slot 4 first: under the others)
+		if (kk == 2 && s_prog_tint) { // ADR-239 the list's preview: over its background (slot 0), under its rows
+			float u1, v1;
+			const GxTex *pv = rstv_snap_frame(&u1, &v1);
+			if (pv) { // (video 60%, picture 50%; opaque as the list hides)
+				const float base = rstv_snap_kind() == RSTV_SNAP_VIDEO ? 0.6f : 0.5f;
+				const float a4[4] = { (base + (1.0f - base) * s_ui_hide) * rstv_snap_fade(), 0, 0, 0 };
+				gx_use(s_prog_tint);
+				gx_set_tex(s_u_tint_tex, (GxTex *)pv);
+				gx_set4(s_u_tint_a, a4);
+				quad(s_prog_tint, s_u_tint_scale, 0, 0, 960, 544, 0, 0, u1, v1);
+			}
+		}
 		if (kk == 2) // the list rows' strips: over slot 0, under the focus outline
 			for (int i = 0; i < s_nstrip; i++) {
 				const RstvStrip *s = &s_strip[i];
@@ -833,6 +995,15 @@ void rstv_video_present(void)
 					continue;
 				GxTex *st = (GxTex *)s->t;
 				gx_tex_filter(st, 0);
+				if (s_ui_hide > 0.0f && s_prog_tint) { // (fading away over a video preview)
+					const float a4[4] = { 1.0f - s_ui_hide, 0, 0, 0 };
+					gx_use(s_prog_tint);
+					gx_set_tex(s_u_tint_tex, st);
+					gx_set4(s_u_tint_a, a4);
+					quad(s_prog_tint, s_u_tint_scale, (float)s->x, (float)sy0, (float)(s->x + s->w), (float)sy1,
+						0, (float)(sy0 - s->y) / st->h, (float)s->w / st->w, (float)(sy1 - s->y) / st->h);
+					continue;
+				}
 				gx_use(s_prog_layer);
 				gx_set_tex(s_u_layer_tex, st);
 				quad(s_prog_layer, s_u_layer_scale, (float)s->x, (float)sy0, (float)(s->x + s->w), (float)sy1,
@@ -848,10 +1019,11 @@ void rstv_video_present(void)
 		}
 		gx_tex_filter(t, 0);
 		const float x0 = (float)s_layer[k].x, y0 = (float)s_layer[k].y, w = (float)s_layer[k].w, h = (float)s_layer[k].h;
-		if (s_layer[k].a < 0.999f && s_prog_tint) {
+		const float la = s_layer[k].a * (1.0f - s_ui_hide); // (the list and its focus, fading over a video preview)
+		if (la < 0.999f && s_prog_tint) {
 			gx_use(s_prog_tint);
 			gx_set_tex(s_u_tint_tex, t);
-			const float a4[4] = { s_layer[k].a, 0, 0, 0 };
+			const float a4[4] = { la, 0, 0, 0 };
 			gx_set4(s_u_tint_a, a4);
 			quad(s_prog_tint, s_u_tint_scale, x0, y0, x0 + w, y0 + h, 0, 0, w / t->w, h / t->h);
 			continue;
@@ -865,7 +1037,27 @@ void rstv_video_present(void)
 		else
 			quad(s_prog_layer, s_u_layer_scale, x0, y0, x0 + w, y0 + h, 0, 0, w / t->w, h / t->h);
 	}
+	draw_touch_fx();
 	gx_end();
+	if (s_dialog)
+		gx_dialog_update();
 	gx_swap();
 	gx_unlock();
+#ifdef RSTV_DEBUG_TOOLS
+	{ // test: ux0:data/restv/screen = the whole screen as screen.ppm (checked once a second)
+		static unsigned n;
+		FILE *sf;
+		if (++n % 60 == 0 && (sf = fopen("ux0:data/restv/screen", "r")) != NULL) {
+			fclose(sf);
+			remove("ux0:data/restv/screen");
+			gx_dump_front("ux0:data/restv/screen.ppm");
+		}
+	}
+#endif
+}
+void rstv_video_present_dialog(void)
+{
+	s_dialog = 1;
+	rstv_video_present();
+	s_dialog = 0;
 }

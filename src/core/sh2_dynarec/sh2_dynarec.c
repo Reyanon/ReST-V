@@ -24,7 +24,9 @@
 #include <assert.h>
 #include <string.h> //include for memset
 
+#ifndef __vita__
 #include <sys/mman.h>
+#endif
 
 #include "../memory.h"
 #include "../sh2core.h"
@@ -40,8 +42,15 @@
 #ifdef __arm__
 #include "assem_arm.h"
 #endif
+#ifdef __vita__
+// ReST-V (ADR-222): the recompiler's messages go to the log, and its fatal exits fault in place (exit() frees the heap
+// block while the other threads run, so the dump showed them instead of this one)
+extern void rstv_log_printf(const char *fmt, ...);
+#define printf rstv_log_printf
+#define exit(c) __assert_func(__FILE__, __LINE__, __func__, "ari64 exit")
+#endif
 
-#define MAXBLOCK 4096
+#define MAXBLOCK 512 // ReST-V (ADR-229): was 4096; the passes are O(n^2) in the block length (32 us an instruction on the Vita)
 #define MAX_OUTPUT_BLOCK_SIZE 262144
 #define CLOCK_DIVIDER 1
 #define SH2_REGS 23
@@ -260,8 +269,15 @@ void nullf(const char *format, ...) {}
 
 // Get address from virtual address
 // This is called from the recompiled BRAF/BSRF instructions
+static int ari_blk_hle; // (ADR-225: this block is the CPY8 call)
+static int ari_ip_stale; // (see SH2DynarecExec)
+extern int ari_sidle_cyc; // (ADR-223)
+int ari_nolit; // ReST-V diag (ADR-222): PC-relative literals are not compile-time constants (flag arinolit)
+u32 ari_ga_ring[16], ari_ga_n; // ReST-V diag (ADR-222): the last get_addr / get_addr_ht targets
 void *get_addr(u32 vaddr)
 {
+  ari_ga_ring[ari_ga_n++ & 15] = vaddr;
+  { extern u32 ari_n_ga; ari_n_ga++; }
   struct ll_entry *head;
   u32 page=(vaddr&0xDFFFFFFF)>>12;
   if(page>1024) page=1024+(page&1023);
@@ -339,12 +355,23 @@ void *get_addr(u32 vaddr)
     }
     head=head->next;
   }
+#ifdef __vita__
+  { // diag (ADR-229): compile time into the spike line's "open" field (rstv_comp_us[0]) and the block length
+    extern int sceKernelGetProcessTimeLow(void); extern unsigned rstv_comp_us[3];
+    const unsigned t0 = (unsigned)sceKernelGetProcessTimeLow();
+    sh2_recompile_block(vaddr);
+    rstv_comp_us[0] += (unsigned)sceKernelGetProcessTimeLow() - t0; rstv_comp_us[1] += slen;
+  }
+#else
   sh2_recompile_block(vaddr);
+#endif
   return get_addr(vaddr);
 }
 // Look up address in hash table first
 void *get_addr_ht(u32 vaddr)
 {
+  ari_ga_ring[ari_ga_n++ & 15] = vaddr | 0x80000000u; // (diag: bit 31 = from get_addr_ht)
+  { extern u32 ari_n_ght; ari_n_ght++; }
   //printf("TRACE: count=%d next=%d (get_addr_ht %x)\n",Count,next_interupt,vaddr);
   //if(vaddr>>12==0x60a0) printf("TRACE: (get_addr_ht %x)\n",vaddr);
   u32 *ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
@@ -717,6 +744,125 @@ static pointer map_address(u32 address)
 #ifdef __x86_64__
 #include "assem_x64.c"
 #endif
+// ReST-V (ADR-222): the memory functions the code calls. They keep the wait cycles the memory map charges (sound RAM
+// reads 50, VDP RAM, the low work RAM, ...), per CPU; SH2DynarecExec adds them to that CPU's cycle overshoot after the
+// slice. Without them the SH-2 ran the sound driver's mailbox far too fast against the 68K on its own thread (the BGM
+// did not start, a voice repeated)
+static u32 ari_wait_m, ari_wait_s;
+#define ARI_WAIT(c) do { if (CurrentSH2 == SSH2) ari_wait_s += (c); else ari_wait_m += (c); } while (0)
+// ReST-V diag (ADR-222): writes into the cottonbm object at 060cd258 (its +8 became "MAL" text); the page is made
+// write-protected each frame (SH2DynarecOnFrame) so the code's stores come here
+extern u32 ari_ga_ring[16], ari_ga_n;
+static void ari_watch(u32 a, u32 v, int sz)
+{
+  static int n;
+  if (n++ < 40)
+    printf("[aridiag] watch w%d %08x = %08x %s pc %08x/%08x ga %08x %08x\n", sz, a, v, CurrentSH2 == SSH2 ? "slave" : "master",
+      master_pc, slave_pc, ari_ga_ring[(ari_ga_n - 2) & 15], ari_ga_ring[(ari_ga_n - 1) & 15]);
+}
+#define ARI_WATCH(a, v, sz) do { (void)(a); (void)(v); } while (0) // (diag watch off; ari_watch kept for a later hunt)
+// ReST-V (ADR-224): cart ROM reads straight from host memory. The ROM is stored big-endian; its byte-swapped 64 KB
+// chunk copies (made for compiling code there, ari_cart_chunk) have the work RAM's layout, so the first slow read in
+// a chunk maps the chunk's 16 pages (and their cache-through mirror) read-only in memory_map: later reads are direct
+// (cottonbm's boss copies ~135 KB a frame out of the ROM byte by byte: 66-80 ms frames). Writes stay on the slow path
+// (bit 30). Not for sets whose cart reads go through a chip (315-5881 protection, 315-5838 decompression). The ROM's
+// wait cycles are not charged then (speed over accuracy, ADR-005).
+static u8 *ari_cart_chunk(u32 a);
+int ari_cart_direct = 1;
+// (a ring of at most 64 data chunks mapped: the BIOS boot reads the whole ROM; the oldest data chunk is unmapped and
+// freed, a chunk that code was compiled from is kept, verify_dirty compares against it later)
+extern void ari_cart_drop(int c);
+static void ari_cart_set(u32 base, u8 *ch)
+{
+  for (u32 p = 0; p < 16; p++) {
+    const u32 v = base + (p << 12), vc = v | 0x20000000;
+    memory_map[v >> 12] = ch ? ((((u32)ch + (p << 12) - v) >> 2) | 0x40000000) : (u32)-1;
+    memory_map[vc >> 12] = ch ? ((((u32)ch + (p << 12) - vc) >> 2) | 0x40000000) : (u32)-1;
+  }
+}
+static int ari_ring[64], ari_ringn, ari_ringp;
+void ari_cart_ring_reset(void) { ari_ringn = ari_ringp = 0; }
+static void ari_cart_map(u32 a)
+{
+  extern int stv_prot_enabled, stv_5838_enabled;
+  const u32 ca = a & 0x0FFFFFFF;
+  if (!ari_cart_direct || ca < 0x02000000 || ca >= 0x05000000 || stv_prot_enabled || stv_5838_enabled)
+    return;
+  if ((int)memory_map[ca >> 12] >= 0) // (already mapped)
+    return;
+  u8 *const ch = ari_cart_chunk(ca);
+  if (!ch)
+    return;
+  const int c = (int)((ca - 0x02000000) >> 16);
+  if (ari_ringn == 64) {
+    const int old = ari_ring[ari_ringp];
+    ari_cart_set(0x02000000 + ((u32)old << 16), NULL);
+    ari_cart_drop(old);
+  } else
+    ari_ringn++;
+  ari_ring[ari_ringp] = c;
+  ari_ringp = (ari_ringp + 1) & 63;
+  ari_cart_set(ca & ~0xFFFFu, ch);
+}
+u32 ari_n_rd, ari_n_wr, ari_n_inv, ari_n_ga, ari_n_ght, ari_n_comp, ari_n_sl; // (diag ADR-224: slow paths a frame)
+u8 FASTCALL ari_rb(u32 a) { ari_n_rd++; ari_cart_map(a); u32 c = 0; const u8 v = MappedMemoryReadByte(a, &c); ARI_WAIT(c); return v; }
+u16 FASTCALL ari_rw(u32 a) { ari_n_rd++; ari_cart_map(a); u32 c = 0; const u16 v = MappedMemoryReadWord(a, &c); ARI_WAIT(c); return v; }
+u32 FASTCALL ari_rl(u32 a) { ari_n_rd++; ari_cart_map(a); u32 c = 0; const u32 v = MappedMemoryReadLong(a, &c); ARI_WAIT(c); return v; }
+void FASTCALL ari_wb(u32 a, u8 v) { ari_n_wr++; ARI_WATCH(a, v, 1); u32 c = 0; MappedMemoryWriteByte(a, v, &c); ARI_WAIT(c); }
+void FASTCALL ari_ww(u32 a, u16 v) { ari_n_wr++; ARI_WATCH(a, v, 2); u32 c = 0; MappedMemoryWriteWord(a, v, &c); ARI_WAIT(c); }
+// ReST-V (ADR-225): the byte copy loop head (devmiyax CPY8, ADR-220), as one call:
+//   mov.b @Rm+,Rx / add #1,Rc / mov.b Rx,@Rn / cmp/ge Rr,Rc / bf/s (loop) / add #1,Rn
+// registers x | m << 4 | n << 8 | c << 12 | r << 16, or -1
+static int ari_cpy8_regs(const u16 *w)
+{
+  const int x = (w[0] >> 8) & 15, m = (w[0] >> 4) & 15, c = (w[1] >> 8) & 15, n = (w[2] >> 8) & 15, r = (w[3] >> 4) & 15;
+  if ((w[0] & 0xF00F) != 0x6004 || (w[1] & 0xF0FF) != 0x7001 || (w[2] & 0xF00F) != 0x2000 || ((w[2] >> 4) & 15) != x ||
+      (w[3] & 0xF00F) != 0x3003 || ((w[3] >> 8) & 15) != c || w[4] != 0x8FFA || w[5] != (0x7001 | (n << 8)))
+    return -1;
+  const int rg[5] = { x, m, c, n, r };
+  for (int i = 0; i < 5; i++)
+    for (int j = i + 1; j < 5; j++)
+      if (rg[i] == rg[j])
+        return -1;
+  return x | m << 4 | n << 8 | c << 12 | r << 16;
+}
+int ari_cpy8_regs_x(const u16 *w) { return ari_cpy8_regs(w); }
+int ari_hle_on = 1;
+u32 ari_hle_next, ari_hle_runs;
+// The loop's iterations that fit in the cycles left (7 a byte, 6 for the last), byte by byte in order; registers in
+// master_reg / slave_reg (a block entry: nothing cached). Returns the next PC; the cycle counter goes to master_cc /
+// slave_cc (the code reloads it from there).
+u32 ari_hle_cpy8(u32 pcs, int cc)
+{
+  const int sl = pcs & 1;
+  const u32 pc = pcs & ~1u;
+  int *const R = sl ? slave_reg : master_reg;
+  const u16 *const w = (const u16 *)(HighWram + (pc & 0xFFFFE));
+  const int rg = ari_cpy8_regs(w);
+  const int rx = rg & 15, rm = (rg >> 4) & 15, rn = (rg >> 8) & 15, rc = (rg >> 12) & 15, rr = (rg >> 16) & 15;
+  const s64 d = (s64)(s32)R[rr] - (s64)(s32)R[rc]; // (c is counted up first, then compared)
+  const u64 todo = d <= 1 ? 1 : (u64)d;
+  const u64 can = cc < 0 ? ((u64)(-(s64)cc) + 6) / 7 : 1;
+  const u32 n = (u32)(todo < can ? todo : can);
+  u32 s = (u32)R[rm], t = (u32)R[rn];
+  u8 b = 0;
+  for (u32 k = 0; k < n; k++, s++, t++) {
+    const u32 ms = memory_map[s >> 12], mt = memory_map[t >> 12];
+    b = (int)ms >= 0 ? *(u8 *)((s ^ 1) + (ms << 2)) : ari_rb(s);
+    if ((int)mt >= 0 && !(mt & 0x40000000)) *(u8 *)((t ^ 1) + (mt << 2)) = b;
+    else ari_wb(t, b);
+  }
+  R[rx] = (s32)(s8)b;
+  R[rm] = (int)s;
+  R[rn] = (int)t;
+  R[rc] += (int)n;
+  if (n == todo) { R[SR] |= 1; ari_hle_next = pc + 12; }
+  else { R[SR] &= ~1; ari_hle_next = pc; }
+  ari_hle_runs++;
+  { extern int master_cc, slave_cc; *(sl ? &slave_cc : &master_cc) = cc + (int)(n * 7) - (n == todo ? 1 : 0); }
+  return ari_hle_next;
+}
+void FASTCALL ari_wl(u32 a, u32 v) { ari_n_wr++; ARI_WATCH(a, v, 4); u32 c = 0; MappedMemoryWriteLong(a, v, &c); ARI_WAIT(c); }
 #ifdef __arm__
 #include "assem_arm.c"
 #endif
@@ -814,8 +960,10 @@ void ll_remove_matching_addrs(struct ll_entry **head,int addr,int shift)
 {
   struct ll_entry *next;
   while(*head) {
-    if(((u32)((*head)->addr)>>shift)==(addr>>shift) ||
-       ((u32)(((char *)(*head)->addr)-MAX_OUTPUT_BLOCK_SIZE)>>shift)==(addr>>shift))
+    // ReST-V (ADR-226): (u32)addr: an int shifted arithmetically never matched code above 0x80000000 (the Vita's code
+    // buffer), so the code buffer's wrap left stale entries (the master ran into overwritten code at cottonbm f4144)
+    if((((u32)((*head)->addr)-BASE_ADDR)>>shift)==(((u32)addr-BASE_ADDR)>>shift) ||
+       (((u32)(((char *)(*head)->addr)-MAX_OUTPUT_BLOCK_SIZE)-BASE_ADDR)>>shift)==(((u32)addr-BASE_ADDR)>>shift)) // (ADR-228: relative to the buffer)
     {
       inv_debug("EXP: Remove pointer to %x (%x)\n",(int)(*head)->addr,(*head)->vaddr);
       remove_hash((*head)->vaddr);
@@ -851,8 +999,8 @@ void ll_kill_pointers(struct ll_entry *head,int addr,int shift)
   while(head) {
     int ptr=get_pointer(head->addr);
     inv_debug("EXP: Lookup pointer to %x at %x (%x)\n",(int)ptr,(int)head->addr,head->vaddr);
-    if(((ptr>>shift)==(addr>>shift)) ||
-       (((ptr-MAX_OUTPUT_BLOCK_SIZE)>>shift)==(addr>>shift)))
+    if(((((u32)ptr-BASE_ADDR)>>shift)==(((u32)addr-BASE_ADDR)>>shift)) ||
+       ((((u32)ptr-MAX_OUTPUT_BLOCK_SIZE-BASE_ADDR)>>shift)==(((u32)addr-BASE_ADDR)>>shift)))
     {
       u32 host_addr;
       inv_debug("EXP: Kill pointer at %x (%x)\n",(int)head->addr,head->vaddr);
@@ -977,6 +1125,7 @@ void invalidate_blocks(u32 firstblock,u32 lastblock)
 }
 void invalidate_addr(u32 addr)
 {
+  { extern u32 ari_n_inv; ari_n_inv++; }
   u32 index=addr&0xDFFFFFFF;
   if(index>4194304) index=(addr|0x400000)&0x7fffff;
   if(!((cached_code_words[index>>5]>>((index>>2)&7))&1)) {
@@ -1129,10 +1278,10 @@ void do_consts(int i,u32 *isconst,u32 *constmap)
     case RMW:
       break;
     case PCREL:
-      if(opcode[i]==12) sh2_set_const(isconst,constmap,rt1[i],((start+i*2+4)&~3)+imm[i]); // MOVA
+      if(opcode[i]==12) sh2_clear_const(isconst,constmap,rt1[i]); // MOVA (ReST-V ADR-222: not a constant, see pcrel_alloc)
       else { // PC-relative load (constant pool)
         u32 addr=((start+i*2+4)&~3)+imm[i];
-        if((u32)((addr-start)>>1)<slen) {
+        if(!ari_nolit&&(u32)((addr-start)>>1)<slen) {
           int value;
           if(opcode[i]==9) value=(s16)source[((start+i*2+4)+imm[i]-start)>>1]; // MOV.W
           else value=(source[(((start+i*2+4)&~3)+imm[i]-start)>>1]<<16)+source[(((start+i*2+4)&~3)+imm[i]+2-start)>>1]; // MOV.L
@@ -1539,8 +1688,11 @@ void pcrel_alloc(struct regstat *current,int i)
   alloc_reg(current,i,rt1[i]);
   addr=((start+i*2+4)&~3)+imm[i];
   if(opcode[i]==12) { // MOVA, address generation only
-    set_const(current,rt1[i],addr);
-  }else if((unsigned)((addr-start)>>1)<slen) {
+    // ReST-V (ADR-222): not a propagated constant: a slice exit before the indexed load that used it (mova / mov.l
+    // @(r0,r1)) left r0 unmaterialized on the way back in (cottonbm's / cotton2's slave command dispatch read the BIOS
+    // vector table and jumped to 0x148)
+    clear_const(current,rt1[i]);
+  }else if(!ari_nolit&&(unsigned)((addr-start)>>1)<slen) {
     if(opcode[i]==9) { // MOV.W
       addr=(start+i*2+4)+imm[i];
       set_const(current,rt1[i],(s16)source[(addr-start)>>1]);
@@ -1957,12 +2109,10 @@ void alu_assemble(int i,struct regstat *i_regs)
         //assert(s2==t);
         if(opcode2[i]==8) emit_sub(t,s,t);
         if(opcode2[i]==10) emit_subc(s,t,sr);
-        //if(opcode2[i]==11) emit_subv(s,sr,temp);
-        assert(opcode2[i]!=11);
+        if(opcode2[i]==11) emit_subv(s,t,sr); // ReST-V (ADR-222)
         if(opcode2[i]==12) emit_add(s,t,t);
         if(opcode2[i]==14) emit_addc(s,t,sr);
-        //if(opcode2[i]==15) emit_addv(s,sr,temp);
-        assert(opcode2[i]!=15);
+        if(opcode2[i]==15) emit_addv(s,t,sr); // ReST-V (ADR-222)
       }
     }
   }
@@ -2607,7 +2757,10 @@ void pcrel_assemble(int i,struct regstat *i_regs)
     if(!((i_regs->isdoingcp>>t)&1)) {
       int jaddr=0;
       // This is to handle the exceptional case where we can not do constant propagation
-      assert(opcode[i]!=12); // MOVA should always be able to do constant propagation
+      if(opcode[i]==12) { // ReST-V (ADR-222): MOVA as a plain move (see pcrel_alloc)
+        emit_movimm(((start+i*2+4)&~3)+imm[i],t);
+        return;
+      }
       constaddr=((start+i*2+4)&~3)+imm[i];
       if(opcode[i]==9) constaddr=(start+i*2+4)+imm[i]; // MOV.W
       assem_debug("Can't do constant propagation, doing PC-relatve load\n");
@@ -3562,6 +3715,7 @@ void ds_assemble_entry(int i)
   emit_jmp(0);
 }
 
+static int ari_idle_pc(int w, u32 a); // (ReST-V ADR-222/223, below)
 void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int invert)
 {
   int count;
@@ -3585,7 +3739,11 @@ void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int invert)
   if(itype[i]==CJUMP) *adj-=2+cycles[i]; // Two extra cycles for taken BT/BF
   if(itype[i]==SJUMP) *adj-=1+cycles[i]+cycles[i+1]; // One extra cycle for taken BT/BF with delay slot
   count=ccadj[i]+((taken==NODS)?0:cycles[i]+cycles[i+1]);
-  if(taken==TAKEN && i==(ba[i]-start)>>1 && source[i+1]==0) {
+  // ReST-V (ADR-223): for the slave, a wait loop idles where its own poll branches back to the head (nothing to
+  // do), not on every entry to the head: entered after a command handler, the head ended the slice each time, the
+  // slave ran one command a slice and fell behind the master (cottonbm then called an unready object and ran away)
+  const int ari_back_idle=taken==TAKEN&&slave&&internal_branch(ba[i])&&ba[i]<=start+i*2&&ari_idle_pc(slave,ba[i]);
+  if((taken==TAKEN && i==(ba[i]-start)>>1 && source[i+1]==0) || ari_back_idle) {
     // Idle loop
     // FIXME
     //if(count&1) emit_addimm_and_set_flags(2*(count+2),HOST_CCREG);
@@ -4068,6 +4226,10 @@ void cjump_assemble(int i,struct regstat *i_regs)
   #ifdef CORTEX_A8_BRANCH_PREDICTION_HACK
   if(i>(ba[i]-start)>>1) invert=1;
   #endif
+  // ReST-V (ADR-223): the slave's poll branching back to a wait-loop head: the slice ends only when it branches back
+  // (nothing to do); taken, the cycle counter becomes 0 and the cycle check before the branch leaves on the next round
+  const int ari_sidle=ari_sidle_cyc>0&&slave&&internal&&ba[i]<=start+i*2&&ari_idle_pc(slave,ba[i]);
+  if(ari_sidle) invert=1;
   sr=get_reg(i_regmap,SR);
   assert(sr>=0);
   cc=get_reg(i_regmap,CCREG);
@@ -4132,6 +4294,8 @@ void cjump_assemble(int i,struct regstat *i_regs)
     }
     if(invert) {
       if(taken) set_jump_target(taken,(pointer)out);
+      if(ari_sidle) emit_addimm(cc,CLOCK_DIVIDER*ari_sidle_cyc,cc); // (ADR-223: a poll round with nothing to do costs more,
+      // the slave still sees the flag within a few cycles; ending the slice there broke cottonbm's master/slave timing)
       #ifdef CORTEX_A8_BRANCH_PREDICTION_HACK
       if(match&&(!internal||!is_ds[(ba[i]-start)>>1])) {
         if(adj) {
@@ -4476,6 +4640,16 @@ void bios_assemble(int i,struct regstat *i_regs)
   signed char ccreg=get_reg(i_regs->regmap,CCREG);
   assert(ccreg==HOST_CCREG);
   assert(!is_delayslot);
+  if(ari_blk_hle) { // ReST-V (ADR-225): the CPY8 call, then on at the PC it returns
+    extern u32 ari_hle_cpy8(u32 pcs, int cc);
+    emit_movimm(start+i*2+slave,0);
+    emit_mov(HOST_CCREG,1);
+    emit_call((pointer)ari_hle_cpy8); // (returns the next PC; the cycle counter in master_cc / slave_cc)
+    emit_mov(0,12);
+    emit_readword(slave?(int)&slave_cc:(int)&master_cc,HOST_CCREG);
+    emit_jmp(jump_vaddr_reg[slave][12]);
+    return;
+  }
   emit_movimm(start+i*2,0);
   //emit_writeword(0,slave?(int)&slave_pc:(int)&master_pc);
   emit_addimm(HOST_CCREG,CLOCK_DIVIDER*ccadj[i],HOST_CCREG);
@@ -5235,15 +5409,72 @@ void disassemble_inst(int i)
     }
 }
 
+u8 *ari_code_base; // ReST-V (ADR-222): the code buffer (assem_arm.h)
+#ifdef __vita__
+// code memory from the VM block (rstv_jit; the domain stays open, ADR-043)
+#include "../rstv_jit.h"
+u32 ari_sync_n, ari_sync_bytes;
+void ari_clear_cache(void *start, void *end)
+{
+  // ReST-V diag (ADR-222): a range outside the code buffer would sync other memory (the Vita crash hunt)
+  u8 *s = (u8 *)start, *e = (u8 *)end, *lo = ari_code_base, *hi = ari_code_base + (1 << TARGET_SIZE_2);
+  if (s < lo || e > hi || e <= s) {
+    extern void rstv_log_printf(const char *fmt, ...);
+    static int n;
+    if (n++ < 20) rstv_log_printf("[aridiag] clear_cache %p-%p outside %p-%p\n", start, end, lo, hi);
+    if (s < lo) s = lo;
+    if (e > hi) e = hi;
+    if (e <= s) return;
+  }
+  ari_sync_n++; ari_sync_bytes += (u32)(e - s);
+  { // diag (ADR-229): VM domain sync time into the spike line's "sync" field (rstv_comp_us[2])
+    extern int sceKernelGetProcessTimeLow(void); extern unsigned rstv_comp_us[3];
+    const unsigned t0 = (unsigned)sceKernelGetProcessTimeLow();
+    rstv_jit_code_sync(s, (size_t)(e - s));
+    rstv_comp_us[2] += (unsigned)sceKernelGetProcessTimeLow() - t0;
+    return;
+  }
+  rstv_jit_code_sync(s, (size_t)(e - s));
+}
+#endif
 void sh2_dynarec_init()
 {
   int n;
   //printf("Init new dynarec\n");
-  out=(u8 *)BASE_ADDR;
-  if (mmap (out, 1<<TARGET_SIZE_2,
+#if !defined(__vita__)
+  { extern int ari_hle_on; ari_hle_on = getenv("RSTV_ARINOHLE") == NULL; } // (harness A/B, ADR-225)
+  { extern int ari_cart_direct; ari_cart_direct = getenv("RSTV_ARINOCART") == NULL; } // (harness A/B, ADR-224)
+  { const char *e = getenv("RSTV_ARISIDLECYC"); if (e) ari_sidle_cyc = atoi(e); } // (harness A/B, ADR-223)
+  ari_nolit = getenv("RSTV_ARINOLIT") != NULL; // (harness A/B)
+  { const char *e = getenv("RSTV_ARICHKM"); // (harness: from,lo,hi master block check, see ari_chk_master)
+    extern int ari_chkm_on; extern u32 ari_chkm_lo, ari_chkm_hi, ari_chkm_from;
+    if (e) { ari_chkm_on = 1; sscanf(e, "%u,%x,%x", &ari_chkm_from, &ari_chkm_lo, &ari_chkm_hi); } }
+#endif
+#ifdef __vita__
+  if (!ari_code_base)
+    ari_code_base = (u8 *)rstv_jit_code_alloc(1 << TARGET_SIZE_2);
+  if (!ari_code_base) { printf("ari64: no code memory\n"); return; }
+  { // ReST-V diag (ADR-222): the memory layout for the Vita crash hunt
+    extern void rstv_log_printf(const char *fmt, ...);
+    extern u8 *SoundRam;
+    size_t vs = 0;
+    void *vb = rstv_jit_code_region(&vs), *hp = malloc(64);
+    rstv_log_printf("[aridiag] vm %p+%x code %p+%x avail %x heap %p snd %p\n", vb, (unsigned)vs, ari_code_base,
+      1u << TARGET_SIZE_2, (unsigned)rstv_jit_code_avail(), hp, SoundRam);
+    free(hp);
+  }
+#else
+  if (!ari_code_base) {
+    void *m = mmap ((void *)0x90000000, 1<<TARGET_SIZE_2,
             PROT_READ | PROT_WRITE | PROT_EXEC,
             MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
-            -1, 0) <= 0) {printf("mmap() failed\n");}
+            -1, 0);
+    if (m == MAP_FAILED) {printf("mmap() failed\n"); return;}
+    ari_code_base = (u8 *)m;
+  }
+#endif
+  { extern void ari_cart_reset(void); ari_cart_reset(); } // (ADR-224: the cart chunk copies are the old game's)
+  out=(u8 *)BASE_ADDR;
   //for(n=0x80000;n<0x80800;n++)
   //  invalid_code[n]=1;
   for(n=0;n<131072;n++)
@@ -5258,11 +5489,13 @@ void sh2_dynarec_init()
   copy=shadow;
   expirep=16384; // Expiry pointer, +2 blocks
   literalcount=0;
-  stop_after_jal=0;
+  stop_after_jal=0; // (ReST-V: 1 hit an assert in the BIOS boot on the Vita, ADR-222)
+#ifndef __vita__
   if (mmap ((void *)0x80000000, 4194304,
             PROT_READ | PROT_WRITE,
             MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
             -1, 0) <= 0) {printf("mmap() failed\n");}
+#endif
 
   // This has to be done after BiosRom etc are allocated
   for(n=0;n<1048576;n++) {
@@ -5320,14 +5553,84 @@ void SH2DynarecReset(SH2_struct *context) {
 void sh2_dynarec_cleanup()
 {
   int n;
+#ifndef __vita__
   if (munmap ((void *)BASE_ADDR, 1<<TARGET_SIZE_2) < 0) {printf("munmap() failed\n");}
+#endif
   for(n=0;n<2048;n++) ll_clear(jump_in+n);
   for(n=0;n<2048;n++) ll_clear(jump_out+n);
   for(n=0;n<2048;n++) ll_clear(jump_dirty+n);
 }
 
+// ReST-V (ADR-222): idle-loop heads for CPU w (0 master, 1 slave): the list of stv.c / sh2int.c, else the hint check
+// (it adds the loop to the list when the code is one of the known wait loops)
+int ari_noidle_s;
+int ari_sidle_cyc = 64; // (ADR-223)
+static int ari_idle_pc(int w, u32 a)
+{
+  extern u32 rstv_idle_pc[2][6];
+  extern int rstv_idle_n[2];
+  extern int rstv_idle_hint_at(int w, u32 addr);
+  a &= ~1u;
+#if !defined(__vita__)
+  { static int nm = -1; if (nm < 0) nm = getenv("RSTV_ARINOMIDLE") != NULL; if (nm && !w) return 0; } // (harness A/B)
+#endif
+#ifdef __vita__
+  { static int said; // (diag: the slave's wait loop code)
+    if (w && !said && (a & 0x0FFFFFFF) == 0x06032b52) {
+      said = 1;
+      const u16 *c = (const u16 *)(HighWram + (a & 0xFFFFE) - 8);
+      printf("[aridiag] sidle %08x-8: %04x %04x %04x %04x | %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n", a,
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+    }
+  }
+#endif
+  for (int k = 0; k < rstv_idle_n[w]; k++)
+    if (rstv_idle_pc[w][k] == a)
+      return 1;
+  return rstv_idle_hint_at(w, a);
+}
+
+// ReST-V (ADR-222): the cartridge ROM is stored big-endian (T1); the recompiler reads native 16-bit words, so code
+// run from it is compiled from a byte-swapped copy of its 64 KB chunk (made on first use, kept: the ROM does not change)
+#include "../cs0.h"
+static u8 *ari_chunks[0x300]; // (freed by ari_cart_reset: a game switch loads another ROM)
+static int ari_nchunks_mapped;
+int ari_nchunks_mapped_get(void) { return ari_nchunks_mapped; }
+static u8 ari_chunk_code[0x300]; // (code was compiled from the chunk: kept)
+void ari_cart_drop(int c)
+{
+  if (c >= 0 && c < 0x300 && !ari_chunk_code[c]) { free(ari_chunks[c]); ari_chunks[c] = NULL; }
+}
+void ari_cart_reset(void)
+{
+  extern void ari_cart_ring_reset(void);
+  for (int c = 0; c < 0x300; c++) { free(ari_chunks[c]); ari_chunks[c] = NULL; ari_chunk_code[c] = 0; }
+  ari_nchunks_mapped = 0;
+  ari_cart_ring_reset();
+}
+static u8 *ari_cart_chunk(u32 a)
+{
+  u8 **const chunks = ari_chunks;
+  const u32 c = (a - 0x02000000) >> 16;
+  if (c >= 0x300 || !CartridgeArea || !CartridgeArea->rom) return NULL;
+  if (!chunks[c]) {
+    // + the next 1 KB: PC-relative literals (MOV.W / MOV.L @(disp,PC), up to 1020 bytes ahead) are read from the
+    // source at compile time, past the chunk end for code near it
+    const u32 len = 0x10000 + 0x400, end = c == 0x2FF ? 0x10000 : len;
+    u8 *p = (u8 *)malloc(len);
+    if (!p) return NULL;
+    const u8 *r = (const u8 *)CartridgeArea->rom + (c << 16);
+    for (u32 k = 0; k < end; k += 2) { p[k] = r[k + 1]; p[k + 1] = r[k]; }
+    if (end < len) memset(p + end, 0xFF, len - end);
+    chunks[c] = p;
+  }
+  return chunks[c];
+}
+
 int sh2_recompile_block(int addr)
 {
+  { extern u32 ari_n_comp; extern unsigned rstv_dyn_compile; ari_n_comp++; rstv_dyn_compile++; } // (the spike line's comp count)
+  ari_blk_hle=0;
   pointer beginning;
   int hr;
   int ds=0;
@@ -5371,7 +5674,88 @@ int sh2_recompile_block(int addr)
     source = (u16 *)((char *)HighWram+(start & 0xFFFFF));
     pagelimit = (addr|0xFFFFF) + 1;
   }
+  else if (cached_addr >= 0x02000000 && cached_addr < 0x05000000 && ari_cart_chunk(cached_addr)) {
+    // ReST-V (ADR-222): code run from the cartridge ROM (cottonbm 0x22021202): a native-order copy of its 64 KB chunk
+    source = (u16 *)(ari_cart_chunk(cached_addr) + (start & 0xFFFF));
+    ari_chunk_code[(cached_addr - 0x02000000) >> 16] = 1;
+    { // ReST-V diag (ADR-222): who runs code in the ROM (a real path, or a wrong jump?)
+      static int n;
+      const int *rg = slave ? slave_reg : master_reg;
+      if (n++ < 6) printf("[aridiag] rom compile %08x %s pr %08x r0 %08x r1 %08x r2 %08x r3 %08x r15 %08x f%u\n", addr,
+        slave ? "slave" : "master", rg[PR], rg[0], rg[1], rg[2], rg[3], rg[15], (unsigned)yabsys.frame_count);
+      if (n == 1) {
+        printf("[aridiag] r4-r14 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x gbr %08x\n", rg[4], rg[5], rg[6],
+          rg[7], rg[8], rg[9], rg[10], rg[11], rg[12], rg[13], rg[14], rg[GBR]);
+        const u32 p = (u32)rg[PR] - 0x30;
+        if ((p & 0xFF000000) == 0x06000000) {
+          const u16 *w = (const u16 *)(HighWram + (p & 0xFFFFE));
+          printf("[aridiag] code %08x: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
+            p, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15], w[16],
+            w[17], w[18], w[19], w[20], w[21], w[22], w[23], w[24], w[25]);
+          for (int q = 0; q < 4; q++) {
+            const u16 *f = (const u16 *)(HighWram + 0x15aa8 + q * 48);
+            printf("[aridiag] fn %08x: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
+              0x06015aa8 + q * 48, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
+              f[14], f[15], f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23]);
+          }
+          for (u32 o = 0; o < 0x100000; o += 2) { // where is the bad target stored? (T2: high word first)
+            const u16 *h = (const u16 *)(HighWram + o);
+            if (h[0] == ((u32)addr >> 16) && h[1] == ((u32)addr & 0xFFFF)) printf("[aridiag] target found at %08x\n", 0x06000000 + o);
+          }
+          {
+            const u32 *gr = ari_ga_ring, gn = ari_ga_n;
+#define GA(k) gr[(gn + (k)) & 15]
+            printf("[aridiag] ga %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", GA(0), GA(1),
+              GA(2), GA(3), GA(4), GA(5), GA(6), GA(7), GA(8), GA(9), GA(10), GA(11), GA(12), GA(13), GA(14), GA(15));
+#undef GA
+            const u32 v = 0x0602f508, *hb = hash_table[((v >> 16) ^ v) & 0xFFFF];
+            printf("[aridiag] ht %08x %08x %08x %08x\n", hb[0], hb[1], hb[2], hb[3]);
+            const u32 pg = 1024 + ((v >> 12) & 1023);
+            for (struct ll_entry *e = jump_in[pg]; e; e = e->next)
+              if (e->vaddr == v) printf("[aridiag] jump_in %08x -> %p\n", e->vaddr, e->addr);
+            for (struct ll_entry *e = jump_dirty[pg]; e; e = e->next)
+              if (e->vaddr == v) printf("[aridiag] jump_dirty %08x -> %p\n", e->vaddr, e->addr);
+            for (struct ll_entry *e = jump_in[1024 + 0x15]; e; e = e->next)
+              if (e->vaddr == 0x06015aac) {
+                extern int sceKernelDelayThread(unsigned int us);
+                const u32 *c = (const u32 *)e->addr;
+                printf("[aridiag] blk 06015aac at %p\n", e->addr);
+                printf("[aridiag] blklit %08x %08x %08x %08x %08x %08x %08x %08x\n", c[0x72c / 4], c[0x730 / 4], c[0x734 / 4],
+                  c[0x738 / 4], c[0x73c / 4], c[0x740 / 4], c[0x744 / 4], c[0x748 / 4]);
+                for (int k = 0; k < 0; k += 16) {
+                  printf("[aridiag] arm %03x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    k * 4, c[k], c[k + 1], c[k + 2], c[k + 3], c[k + 4], c[k + 5], c[k + 6], c[k + 7], c[k + 8], c[k + 9],
+                    c[k + 10], c[k + 11], c[k + 12], c[k + 13], c[k + 14], c[k + 15]);
+                  sceKernelDelayThread(40 * 1000); // (under the log's 30 lines a second)
+                }
+                break;
+              }
+          }
+          const u16 *l = (const u16 *)(HighWram + 0x15c20);
+          const u16 *rr = (const u16 *)ari_cart_chunk(cached_addr) + ((start & 0xFFFF) >> 1);
+          printf("[aridiag] lit 06015c20: %04x%04x %04x%04x %04x%04x rom@target %04x %04x %04x %04x %04x %04x %04x %04x\n",
+            l[0], l[1], l[2], l[3], l[4], l[5], rr[0], rr[1], rr[2], rr[3], rr[4], rr[5], rr[6], rr[7]);
+        }
+      }
+    }
+    pagelimit = (addr|0xFFFF) + 1;
+  }
   else {
+    { // (diag: where the bogus address came from)
+      const int *rg = slave ? slave_reg : master_reg;
+      printf("bogus %s pr %08x r0-r3 %08x %08x %08x %08x r4 %08x r14 %08x r15 %08x f%u\n", slave ? "S" : "M", rg[PR], rg[0], rg[1],
+        rg[2], rg[3], rg[4], rg[14], rg[15], (unsigned)yabsys.frame_count);
+      printf("bogus master pr %08x r0-r7 %08x %08x %08x %08x %08x %08x %08x %08x r14 %08x r15 %08x gbr %08x\n", master_reg[PR],
+        master_reg[0], master_reg[1], master_reg[2], master_reg[3], master_reg[4], master_reg[5], master_reg[6], master_reg[7],
+        master_reg[14], master_reg[15], master_reg[GBR]);
+      { const u32 a1 = MappedMemoryReadLongNocache(0x06013218), a2 = MappedMemoryReadLongNocache(a1);
+        printf("bogus [06013218] %08x -> [%08x] = %08x\n", a1, a1, a2); }
+      { const u16 *w = (const u16 *)(HighWram + 0x13190);
+        printf("bogus code 06013190:"); for (int k = 0; k < 24; k++) printf(" %04x", w[k]); printf("\n"); }
+      printf("bogus ga");
+      for (int g = 0; g < 16; g++) printf(" %08x", ari_ga_ring[(ari_ga_n + g) & 15]);
+      printf("\n");
+    }
     printf("Compile at bogus memory address: %x \n", (int)addr);
     exit(1);
   }
@@ -6090,6 +6474,17 @@ int sh2_recompile_block(int addr)
       // Don't get too close to the limit
       if(i>MAXBLOCK/2) done=1;
     }
+    // ReST-V (ADR-225): a byte copy loop head starts its own block (made one HLE call below)
+    if(ari_hle_on&&!done&&(start&0x0FF00000)==0x06000000&&start+(i+1)*2+12<=pagelimit
+       &&itype[i]!=UJUMP&&itype[i]!=RJUMP&&itype[i]!=CJUMP&&itype[i]!=SJUMP&&itype[i]!=SYSTEM
+       &&!(i>0&&(itype[i-1]==UJUMP||itype[i-1]==RJUMP)) // (after a BT/S, BF/S delay slot: allowed, cottonbm's 06013730)
+       &&ari_cpy8_regs(source+i+1)>=0) done=1;
+    if(ari_hle_on&&i==0&&(start&0x0FF00000)==0x06000000&&start+12<=pagelimit&&ari_cpy8_regs(source)>=0) {
+      strcpy(insn[i],"(HLE CPY8)");
+      itype[i]=BIOS;
+      ari_blk_hle=1;
+      done=1;
+    }
     if(yabsys.emulatebios) {
       if(start+i*2>=0x200&&start+i*2<0x600) {
         strcpy(insn[i],"(BIOS)");
@@ -6115,6 +6510,28 @@ int sh2_recompile_block(int addr)
     }
   }
   slen=i;
+#if !defined(__vita__)
+  if(getenv("RSTV_ARILOG")) fprintf(stderr,"ari block %s %08x len %d f%u: %04x %04x %04x %04x %04x %04x\n",slave?"S":"M",start,slen,
+    (unsigned)yabsys.frame_count,source[0],source[1],source[2],source[3],source[4],source[5]);
+  if(getenv("RSTV_ARILOG")&&slave&&start<0x1000) {
+    extern u32 ari_spc_ring[16]; extern unsigned ari_spc_n;
+    fprintf(stderr,"ari slave pcs before:");
+    for(int k=16;k>0;k--) fprintf(stderr," %08x",ari_spc_ring[(ari_spc_n-k)&15]);
+    fprintf(stderr," | sr %08x vbr %08x r15 %08x pr %08x gbr %08x [gbr+44] %08x r0 %08x r1 %08x r4 %08x\n",slave_reg[16],
+      slave_reg[18],slave_reg[15],slave_reg[21],slave_reg[17],MappedMemoryReadLongNocache(slave_reg[17]+0x44),slave_reg[0],
+      slave_reg[1],slave_reg[4]);
+    fprintf(stderr,"ari bios 0-3c:");
+    for(int k=0;k<16;k++) fprintf(stderr," %08x",MappedMemoryReadLongNocache(k*4));
+    fprintf(stderr,"\nari table:");
+    for(int k=0;k<32;k++) fprintf(stderr," %08x",MappedMemoryReadLongNocache(0x0603390C+k*4));
+    fprintf(stderr,"\nari queue %08x:",MappedMemoryReadLongNocache(MappedMemoryReadLongNocache(0x06033908)));
+    for(int k=-4;k<8;k++) fprintf(stderr," %08x",MappedMemoryReadLongNocache(0x260fd258+k*4));
+    fprintf(stderr,"\n");
+  }
+#endif
+  // ReST-V (ADR-222): a block that ends on a branch without its delay slot (compiling on past a call into a literal
+  // pool) exited the program: end the block before that branch instead
+  while(slen>1&&(itype[slen-1]==UJUMP||itype[slen-1]==RJUMP||itype[slen-1]==SJUMP)) slen--;
   assert(slen>0);
 
   /* Pass 2 - Register dependencies and branch targets */
@@ -6216,7 +6633,7 @@ int sh2_recompile_block(int addr)
         if(rs2[i]>=0) current.u&=~(1LL<<rs2[i]); // CCREG
         if(rs1[i]==TBIT||rs2[i]==TBIT) current.u&=~(1LL<<SR); // BT/S BF/S
         regs[i].u=current.u;
-      } else { printf("oops, branch at end of block with no delay slot\n");exit(1); }
+      } else { printf("oops, branch at end of block with no delay slot (start %x i %d slen %d pagelimit %x)\n",start,i,slen,pagelimit);exit(1); }
     }else if(itype[i]==CJUMP) {
       current.u=branch_unneeded_reg[i];
       regs[i].u=current.u;
@@ -7841,6 +8258,27 @@ int sh2_recompile_block(int addr)
       }
       // branch target entry point
       instr_addr[i]=(pointer)out;
+      // ReST-V (ADR-222): an idle-loop head (the per-set list, MAME hints and recognized wait loops, stv.c): the
+      // cycle counter becomes 0 here, so the cycle check at the loop's branch leaves the slice (the rest of it idles)
+      if((i==0||bt[i])&&ari_idle_pc(slave,start+i*2)
+#if !defined(__vita__)
+        && !(slave&&getenv("RSTV_ARINOSIDLE")) // (harness diagnostics: no slave idle heads)
+#else
+        && !(slave&&ari_noidle_s) // (Vita diag flag arinosidle)
+#endif
+        && !slave // (ADR-223: the slave idles at its poll branch, see do_cc)
+        ) {
+#if !defined(__vita__)
+        if(getenv("RSTV_ARILOG")) fprintf(stderr,"ari idle %s %08x cc %d\n",slave?"S":"M",start+i*2,regs[i].regmap_entry[HOST_CCREG]);
+#endif
+#ifdef __vita__
+        { static u32 seen[16]; static int ns; int k; // (diag: which idle heads)
+          for (k = 0; k < ns && seen[k] != start+i*2; k++);
+          if (k == ns && ns < 16) { seen[ns++] = start+i*2; printf("[aridiag] idle head %s %08x cc %d\n", slave?"S":"M", start+i*2, regs[i].regmap_entry[HOST_CCREG]); } }
+#endif
+        if(regs[i].regmap_entry[HOST_CCREG]==CCREG)
+          emit_zeroreg(HOST_CCREG);
+      }
       assem_debug("<->\n");
       // load regs
       if(regs[i].regmap_entry[HOST_CCREG]==CCREG&&regs[i].regmap[HOST_CCREG]!=CCREG)
@@ -8093,7 +8531,12 @@ int sh2_recompile_block(int addr)
 
   // If we're within 256K of the end of the buffer,
   // start over from the beginning. (Is 256K enough?)
-  if((int)out>BASE_ADDR+(1<<TARGET_SIZE_2)-MAX_OUTPUT_BLOCK_SIZE-JUMP_TABLE_SIZE) out=(u8 *)BASE_ADDR;
+  if((int)out>BASE_ADDR+(1<<TARGET_SIZE_2)-MAX_OUTPUT_BLOCK_SIZE-JUMP_TABLE_SIZE) {
+    out=(u8 *)BASE_ADDR;
+#if !defined(__vita__)
+    if(getenv("RSTV_ARILOG")) fprintf(stderr,"ari code buffer wraps f%u\n",(unsigned)yabsys.frame_count);
+#endif
+  }
 
   // Trap writes to any of the pages we compiled
   for(i=start>>12;i<=(start+slen*2)>>12;i++) {
@@ -8128,6 +8571,10 @@ int sh2_recompile_block(int addr)
     switch((expirep>>11)&3)
     {
       case 0:
+        // ReST-V (ADR-226): a slice exit's resume address in the code about to be overwritten: enter at the saved
+        // PC again (cottonbm f~4140 on the Vita: the master resumed into new code, an undefined instruction)
+        if(((((u32)master_ip-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift))||(slave_ip&&((((u32)slave_ip-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift))))
+          ari_ip_stale=1;
         // Clear jump_in and jump_dirty
         ll_remove_matching_addrs(jump_in+(expirep&2047),base,shift);
         ll_remove_matching_addrs(jump_dirty+(expirep&2047),base,shift);
@@ -8140,13 +8587,13 @@ int sh2_recompile_block(int addr)
         // Clear hash table
         for(i=0;i<32;i++) {
           u32 *ht_bin=hash_table[((expirep&2047)<<5)+i];
-          if((ht_bin[3]>>shift)==(base>>shift) ||
-             ((ht_bin[3]-MAX_OUTPUT_BLOCK_SIZE)>>shift)==(base>>shift)) {
+          if(((ht_bin[3]-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift) ||
+             ((ht_bin[3]-MAX_OUTPUT_BLOCK_SIZE-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift)) { // (ADR-226/228)
             inv_debug("EXP: Remove hash %x -> %x\n",ht_bin[2],ht_bin[3]);
             ht_bin[2]=ht_bin[3]=-1;
           }
-          if((ht_bin[1]>>shift)==(base>>shift) ||
-             ((ht_bin[1]-MAX_OUTPUT_BLOCK_SIZE)>>shift)==(base>>shift)) {
+          if(((ht_bin[1]-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift) ||
+             ((ht_bin[1]-MAX_OUTPUT_BLOCK_SIZE-BASE_ADDR)>>shift)==(((u32)base-BASE_ADDR)>>shift)) {
             inv_debug("EXP: Remove hash %x -> %x\n",ht_bin[0],ht_bin[1]);
             ht_bin[0]=ht_bin[2];
             ht_bin[1]=ht_bin[3];
@@ -8182,12 +8629,12 @@ void DynarecMasterHandleInterrupts()
   if (MSH2->interrupts[MSH2->NumberOfInterrupts-1].level > ((master_reg[SR]>>4)&0xF))
   {
     master_reg[15] -= 4;
-    MappedMemoryWriteLong(master_reg[15], master_reg[SR]);
+    MappedMemoryWriteLongNocache(master_reg[15], master_reg[SR]);
     master_reg[15] -= 4;
-    MappedMemoryWriteLong(master_reg[15], master_pc);
+    MappedMemoryWriteLongNocache(master_reg[15], master_pc);
     master_reg[SR] &= 0xFFFFFF0F;
     master_reg[SR] |= (MSH2->interrupts[MSH2->NumberOfInterrupts-1].level)<<4;
-    master_pc = MappedMemoryReadLong(master_reg[VBR] + (MSH2->interrupts[MSH2->NumberOfInterrupts-1].vector << 2));
+    master_pc = MappedMemoryReadLongNocache(master_reg[VBR] + (MSH2->interrupts[MSH2->NumberOfInterrupts-1].vector << 2));
     master_ip = get_addr_ht(master_pc);
     MSH2->NumberOfInterrupts--;
     MSH2->isIdle = 0;
@@ -8203,12 +8650,17 @@ void DynarecSlaveHandleInterrupts()
   if (SSH2->interrupts[SSH2->NumberOfInterrupts-1].level > ((slave_reg[SR]>>4)&0xF))
   {
     slave_reg[15] -= 4;
-    MappedMemoryWriteLong(slave_reg[15], slave_reg[SR]);
+    MappedMemoryWriteLongNocache(slave_reg[15], slave_reg[SR]);
     slave_reg[15] -= 4;
-    MappedMemoryWriteLong(slave_reg[15], slave_pc);
+    MappedMemoryWriteLongNocache(slave_reg[15], slave_pc);
     slave_reg[SR] &= 0xFFFFFF0F;
     slave_reg[SR] |= (SSH2->interrupts[SSH2->NumberOfInterrupts-1].level)<<4;
-    slave_pc = MappedMemoryReadLong(slave_reg[VBR] + (SSH2->interrupts[SSH2->NumberOfInterrupts-1].vector << 2));
+    slave_pc = MappedMemoryReadLongNocache(slave_reg[VBR] + (SSH2->interrupts[SSH2->NumberOfInterrupts-1].vector << 2));
+#if !defined(__vita__)
+    if (getenv("RSTV_ARILOG")) fprintf(stderr, "ari slave int vec %x lvl %d vbr %08x -> pc %08x f%u\n",
+      SSH2->interrupts[SSH2->NumberOfInterrupts-1].vector, SSH2->interrupts[SSH2->NumberOfInterrupts-1].level,
+      slave_reg[VBR], slave_pc, (unsigned)yabsys.frame_count);
+#endif
     slave_ip = get_addr_ht(slave_pc|1);
     SSH2->NumberOfInterrupts--;
     SSH2->isIdle = 0;
@@ -8221,6 +8673,7 @@ void DynarecSlaveHandleInterrupts()
 #define SH2CORE_DYNAREC 2
 
 void SH2InterpreterSendInterrupt(SH2_struct *context, u8 level, u8 vector);
+void SH2InterpreterRemoveInterrupt(SH2_struct *context, u8 vector, u8 level);
 int SH2InterpreterGetInterrupts(SH2_struct *context,
                                 interrupt_struct interrupts[MAX_INTERRUPTS]);
 void SH2InterpreterSetInterrupts(SH2_struct *context, int num_interrupts,
@@ -8232,10 +8685,132 @@ void SH2DynarecDeInit() {
   sh2_dynarec_cleanup();
 }
 
+// ReST-V (ADR-222): one CPU for a slice of cycles (linkage_arm.s ari_exec_*); the frame loop and events stay in C
+void ari_exec_master(u32 cycles);
+void ari_exec_slave(u32 cycles);
+u32 ari_save_m[11], ari_save_s[11]; // (ADR-223: host registers at the last slice exit, linkage_arm.s)
+static int ari_ip_stale;
+int ari_slaveint; // (Vita diag flag arislaveint, see SH2DynarecExec)
+// ReST-V diag (ADR-222): when does the cottonbm object field 060cd260 become "MAL" text (where: 0/1 master slice
+// start/end, 10/11 slave slice start/end)
+static void ari_mal_check(int where)
+{
+  static int done;
+  if (done) return;
+  const u16 *w = (const u16 *)(HighWram + 0xcd260);
+  if (w[0] == 0x4d41 && w[1] == 0x4c00) {
+    done = 1;
+    printf("[aridiag] MAL at %d f%u l%d mpc %08x spc %08x ga %08x %08x %08x %08x\n", where, (unsigned)yabsys.frame_count,
+      yabsys.LineCount, master_pc, slave_pc, ari_ga_ring[(ari_ga_n - 4) & 15], ari_ga_ring[(ari_ga_n - 3) & 15],
+      ari_ga_ring[(ari_ga_n - 2) & 15], ari_ga_ring[(ari_ga_n - 1) & 15]);
+  }
+}
+static int ari_mdepth; static unsigned ari_mnested; // (see SH2DynarecExec)
+u32 ari_spc_ring[16]; unsigned ari_spc_n; // (harness diagnostics: the slave's PCs at its last slice ends)
 void FASTCALL SH2DynarecExec(SH2_struct *context, u32 cycles) {
-  printf("SH2DynarecExec called! oops\n");
-  printf("master_ip=%x\n",(int)master_ip);
-  exit(1);
+  if (ari_ip_stale) { // (the PCs are where the code stopped: a cycle-check stub stores them)
+    ari_ip_stale = 0;
+#if !defined(__vita__)
+    if (getenv("RSTV_ARILOG")) fprintf(stderr, "ari stale: master pc %08x slave pc %08x ip %p\n", master_pc, slave_pc, slave_ip);
+#endif
+    master_ip = get_addr_ht(master_pc);
+    if (slave_ip)
+      slave_ip = get_addr_ht(slave_pc | 1);
+  }
+  if (context == MSH2) {
+    // ReST-V (ADR-222): no master slice inside a master slice (a C call from the code, e.g. a write that syncs the
+    // CPUs): master_pc is only right at a slice end, so an interrupt taken there pushed an old PC and the RTE went back
+    // to it (cottonbm: 06015aac, then garbage, then the empty cart ROM)
+    if (ari_mdepth) { ari_mnested++; return; }
+    ari_mdepth = 1;
+    if (MSH2->NumberOfInterrupts)
+      DynarecMasterHandleInterrupts();
+#if !defined(__vita__)
+    const u32 r15a = master_reg[15], pca = master_pc;
+#endif
+    { extern u32 ari_n_sl; ari_n_sl++; }
+    { extern int ari_chkm_on; extern int ari_chk_master(u32 c); extern u32 ari_chkm_from; if (!(ari_chkm_on && yabsys.frame_count >= ari_chkm_from && ari_chk_master(cycles))) {
+#if !defined(__vita__)
+      static int ms = -1; if (ms < 0) { const char *e = getenv("RSTV_ARIMSLICE"); ms = e ? atoi(e) : 0; } // (harness: short slices)
+      if (ms > 0) { s32 left = (s32)cycles; while (left > 0) { const u32 c = left > ms ? (u32)ms : (u32)left; master_cc = 0; ari_exec_master(c); left -= (s32)c + (s32)master_cc; } master_cc = 0; } else
+#endif
+      ari_exec_master(cycles); } }
+    master_cc += ari_wait_m; // (memory wait cycles of the slice, see ari_rb)
+    ari_wait_m = 0;
+    ari_mdepth = 0;
+#if !defined(__vita__)
+    { static int mp = -1; if (mp < 0) mp = getenv("RSTV_ARIMPC") != NULL; // (harness: the master enters at its saved PC too)
+      if (mp && MappedMemoryReadWordNocache(master_pc) != 0x001B) master_ip = get_addr_ht(master_pc); } // (not at a SLEEP)
+#endif
+#ifdef __vita__
+    { // ReST-V diag (ADR-222): nested master slices refused (log the count now and then)
+      static unsigned s_last;
+      if (ari_mnested != s_last && (ari_mnested - s_last) >= 1) {
+        static int s_n;
+        if (s_n++ < 8) rstv_log_printf("[aridiag] nested master slices %u f%u\n", ari_mnested, (unsigned)yabsys.frame_count);
+        s_last = ari_mnested;
+      }
+    }
+#endif
+#if !defined(__vita__)
+    if (getenv("RSTV_ARILOG") && (master_reg[15] >> 16) != (r15a >> 16))
+      fprintf(stderr, "ari r15 %08x -> %08x pc %08x -> %08x f%u l%d\n", r15a, master_reg[15], pca, master_pc,
+        (unsigned)yabsys.frame_count, yabsys.LineCount);
+#endif
+  } else {
+    if (!slave_ip) // (not started)
+      return;
+#if !defined(__vita__)
+    { // harness diagnostics: RSTV_ARISLAVEINT runs the slave in the interpreter (registers handed over each slice)
+      static int si = -1;
+      if (si < 0) si = getenv("RSTV_ARISLAVEINT") != NULL;
+      if (si) {
+        extern void FASTCALL SH2InterpreterExec(SH2_struct *context, u32 cycles);
+        extern int SH2InterpreterInit(void);
+        static int ii;
+        if (!ii) { ii = 1; SH2InterpreterInit(); }
+        SH2DynarecGetRegisters(SSH2, &SSH2->regs);
+        SH2InterpreterExec(SSH2, cycles);
+        SH2DynarecSetRegisters(SSH2, &SSH2->regs);
+        return;
+      }
+    }
+#endif
+#ifdef __vita__
+    if (ari_slaveint) { // diag (ADR-222, flag file arislaveint): the slave in the interpreter, as RSTV_ARISLAVEINT
+      extern void FASTCALL SH2InterpreterExec(SH2_struct *context, u32 cycles);
+      extern int SH2InterpreterInit(void);
+      static int ii;
+      if (!ii) { ii = 1; SH2InterpreterInit(); }
+      SH2DynarecGetRegisters(SSH2, &SSH2->regs);
+      SH2InterpreterExec(SSH2, cycles);
+      SH2DynarecSetRegisters(SSH2, &SSH2->regs);
+      return;
+    }
+#endif
+    if (SSH2->NumberOfInterrupts)
+      DynarecSlaveHandleInterrupts();
+    { extern int ari_chk_slave(u32 cycles); if (ari_chk_slave(cycles)) return; } // block check (RSTV_ARICHK; Vita: flag arichks)
+    ari_exec_slave(cycles);
+    slave_cc += ari_wait_s; // (memory wait cycles of the slice, see ari_rb)
+    ari_wait_s = 0;
+    // ReST-V (ADR-227): the slave enters its next slice at the PC its cycle stub saved, not in the stub's continuation
+    // (sandor from a BIOS boot never saw its coin with the stub resume; the master changes what the slave runs between
+    // its slices). One hash lookup a slice. (harness RSTV_ARISTUB=1: the old stub resume)
+    {
+#if !defined(__vita__)
+      static int st = -1; if (st < 0) st = getenv("RSTV_ARISTUB") != NULL;
+      if (!st)
+#endif
+        slave_ip = get_addr_ht(slave_pc | 1);
+    }
+#if !defined(__vita__)
+    { extern u32 ari_spc_ring[16]; extern unsigned ari_spc_n; ari_spc_ring[ari_spc_n++ & 15] = slave_pc; }
+    { static int said; if (!said && (slave_reg[16] & 0xFFFFFC00) && getenv("RSTV_ARILOG")) { said = 1;
+      fprintf(stderr, "ari slave SR %08x after a slice: pc %08x r0 %08x r1 %08x f%u l%d\n", slave_reg[16], slave_pc, slave_reg[0],
+        slave_reg[1], (unsigned)yabsys.frame_count, yabsys.LineCount); } }
+#endif
+  }
 }
 
 u32 SH2DynarecGetSR(SH2_struct *context)
@@ -8340,7 +8915,9 @@ void SH2DynarecSetGPR(SH2_struct *context, int num, u32 value) {
 }
 
 void SH2DynarecSetPC(SH2_struct *context, u32 value) {
-  //printf("SH2DynarecSetPC(%s,%x)\n",(context==MSH2)?"master":"slave",value);
+#if !defined(__vita__)
+  if (getenv("RSTV_ARILOG")) fprintf(stderr, "ari setpc %s %08x\n", context == MSH2 ? "M" : "S", value);
+#endif
   if(context==MSH2) {
     master_pc=value;
     master_ip=get_addr_ht(value);
@@ -8388,10 +8965,13 @@ void SH2DynarecSetRegisters(SH2_struct *context, const sh2regs_struct *regs)
   SH2DynarecSetPC(context, regs->PC);
 }
 
+static int ari_ip_stale;
+static int ari_mdepth; static unsigned ari_mnested; // (see SH2DynarecExec) // ReST-V (ADR-222): the resume addresses may point into dropped code (state load)
 void SH2DynarecWriteNotify(u32 start, u32 length) {
   int block,wp=0;
   // Ignore non-RAM regions
   if((start&0xDFF00000)!=0x200000&&(start&0xDE000000)!=0x6000000) return;
+  if(length>=0x10000) ari_ip_stale=1; // (a whole work RAM replaced: enter at the PCs again)
   // Check if any pages contain compiled code
   for(block=start>>12;block<=(start+length-1)>>12;block++)
     wp|=((cached_code[block>>3]>>(block&7))&1);
@@ -8401,7 +8981,41 @@ void SH2DynarecWriteNotify(u32 start, u32 length) {
 }
 
 void SH2DynarecOnFrame(SH2_struct *context) {
-
+  // ReST-V (ADR-222): what nextframe did in linkage_arm.s: every frame one word of restore_candidate, its dirty
+  // pages' blocks back to the clean list
+  extern u32 rccount;
+  if (context != MSH2)
+    return;
+#ifdef __vita__
+  { // ReST-V diag (ADR-224): slow-path calls a frame, logged only when unusual
+    extern u32 ari_n_rd, ari_n_wr, ari_n_inv, ari_n_ga, ari_n_ght, ari_n_comp, ari_n_sl;
+    extern void rstv_log_printf(const char *fmt, ...);
+    if (ari_n_rd + ari_n_wr + ari_n_inv > 50000 || ari_n_ga + ari_n_ght + ari_n_comp > 20000)
+      rstv_log_printf("[aridiag] f%u slow rd %u wr %u inv %u ga %u ght %u comp %u slices %u", (unsigned)yabsys.frame_count,
+        ari_n_rd, ari_n_wr, ari_n_inv, ari_n_ga, ari_n_ght, ari_n_comp, ari_n_sl);
+    ari_n_rd = ari_n_wr = ari_n_inv = ari_n_ga = ari_n_ght = ari_n_comp = ari_n_sl = 0;
+  }
+#endif
+#if !defined(__vita__)
+  { static u32 last = 0xdeadbeef; static int n; // (diag astrass: the literal at 06013214)
+    const u16 *w = (const u16 *)(HighWram + 0x13214); const u32 v = ((u32)w[0] << 16) | w[1];
+    if (v != last && n++ < 20) { printf("lit06013214 f%u = %08x (mpc %08x)\n", (unsigned)yabsys.frame_count, v, master_pc); last = v;
+      if (master_pc < 0x80000) { const u16 *b = (const u16 *)(BiosRom + ((master_pc - 0x20) & 0x7FFFE));
+        printf("  bios:"); for (int k = 0; k < 40; k++) printf(" %04x", b[k]); printf("\n"); } } }
+#endif
+#if !defined(__vita__)
+  { static int nr = -1; if (nr < 0) nr = getenv("RSTV_ARINORESTORE") != NULL; if (nr) return; } // (harness A/B)
+#endif
+  u32 *const rcw = (u32 *)restore_candidate;
+  rccount = (rccount + 1) & 0x3f;
+  invalidate_count = 0;
+  const u32 w = rcw[rccount];
+  if (w) {
+    rcw[rccount] = 0;
+    for (int b = 0; b < 32; b++)
+      if ((w >> b) & 1)
+        clean_blocks(rccount * 32 + b);
+  }
 }
 
 SH2Interface_struct SH2Dynarec = {
@@ -8435,10 +9049,12 @@ SH2Interface_struct SH2Dynarec = {
    SH2DynarecOnFrame,
 
    SH2InterpreterSendInterrupt,
+   SH2InterpreterRemoveInterrupt, // ReST-V (ADR-222): the ReST-V interface has it (the fields after it were shifted)
    SH2InterpreterGetInterrupts,
    SH2InterpreterSetInterrupts,
 
-   SH2DynarecWriteNotify
+   SH2DynarecWriteNotify,
+   NULL // AddCycle (not called)
 };
 
 u32 * decilinestop_p = &yabsys.DecilineStop;
@@ -8453,3 +9069,128 @@ int * vblanklinecount_p = &yabsys.VBlankLineCount;
 int * maxlinecount_p = &yabsys.MaxLineCount;
 
 void * NumberOfInterruptsOffset = &((SH2_struct *)0)->NumberOfInterrupts;
+
+// ReST-V diag (ADR-222): the master check, blocks starting in [ari_chkm_lo, ari_chkm_hi) only (Vita: the flag file
+// ux0:data/restv/arichkm; the cottonbm wrong jump comes from 0602f508): each such block is run again in the
+// interpreter from the same registers up to the PC the block left at (memory side effects run twice)
+u32 ari_chkm_lo = 0x06000000, ari_chkm_hi = 0x06080000, ari_chkm_from = 15880;
+int ari_chkm_on;
+int ari_chk_cmp; static u32 ari_chk_pc;
+void ari_chk_store_diff(u32 addr, int size, u32 old, u32 val)
+{
+  static int n;
+  if (n++ < 40) printf("storediff f%u blk %08x addr %08x size %d ari %08x interp %08x\n", (unsigned)yabsys.frame_count,
+    ari_chk_pc, addr, size, old, val);
+}
+int ari_chk_master(u32 cycles)
+{
+  extern void FASTCALL SH2InterpreterExec(SH2_struct *context, u32 cycles);
+  extern int SH2InterpreterInit(void);
+  static int ii, nbad;
+  if (!ii) { ii = 1; SH2InterpreterInit(); }
+  s32 left = (s32)cycles;
+  while (left > 0) {
+    sh2regs_struct r0, ra;
+    SH2DynarecGetRegisters(MSH2, &r0);
+    const int in = (r0.PC & 0x1FFFFFFF) >= ari_chkm_lo && (r0.PC & 0x1FFFFFFF) < ari_chkm_hi;
+    master_cc = 0;
+    ari_exec_master(1);
+    left -= 1 + (s32)master_cc;
+    if (!in) continue;
+    SH2DynarecGetRegisters(MSH2, &ra);
+    MSH2->regs = r0;
+    int steps = 0;
+    ari_chk_cmp = 1; ari_chk_pc = r0.PC;
+    while (MSH2->regs.PC != ra.PC && steps < 2048) {
+      SH2InterpreterExec(MSH2, 1);
+      steps++;
+    }
+    ari_chk_cmp = 0;
+    int bad = MSH2->regs.PC != ra.PC;
+    for (int k = 0; k < 16; k++) bad |= MSH2->regs.R[k] != ra.R[k] && ra.R[k] != r0.R[k];
+    bad |= ((MSH2->regs.SR.all ^ ra.SR.all) & 0x3F2) != 0;
+    bad |= (MSH2->regs.PR != ra.PR && ra.PR != r0.PR) || (MSH2->regs.GBR != ra.GBR && ra.GBR != r0.GBR);
+    if ((MSH2->regs.PC != ra.PC || (ra.PC & 0x0FF00000) != 0x06000000) && nbad < 12) { // (control flow only: memory side effects run twice)
+      nbad++;
+      printf("arichkm f%u: from %08x to %08x (interp %08x, %d steps) sr %03x/%03x pr %08x/%08x\n",
+        (unsigned)yabsys.frame_count, r0.PC, ra.PC, MSH2->regs.PC, steps, (unsigned)ra.SR.all & 0x3F3,
+        (unsigned)MSH2->regs.SR.all & 0x3F3, ra.PR, MSH2->regs.PR);
+      if ((ra.PC & 0x0FF00000) != 0x06000000)
+        printf("  before r4 %08x r13 %08x r14 %08x r15 %08x pr %08x gbr %08x\n", r0.R[4], r0.R[13], r0.R[14], r0.R[15], r0.PR, r0.GBR);
+      if ((nbad == 1 || (ra.PC & 0x0FF00000) != 0x06000000 || MSH2->regs.PC != ra.PC || r0.PC < 0x80000) && ((r0.PC & 0xFF000000) == 0x06000000 || r0.PC < 0x80000)) {
+        const u16 *w = (const u16 *)((r0.PC < 0x80000 ? BiosRom : HighWram) + (r0.PC & 0x7FFFE));
+        printf("  code %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n", w[0], w[1], w[2],
+          w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+      }
+      for (int k = 0; k < 16; k++)
+        if (MSH2->regs.R[k] != ra.R[k])
+          printf("  r%d ari %08x interp %08x (before %08x)\n", k, ra.R[k], MSH2->regs.R[k], r0.R[k]);
+    }
+    SH2DynarecSetRegisters(MSH2, &ra);
+  }
+  master_cc = 0;
+  return 1;
+}
+
+// harness check (RSTV_ARICHK), see SH2DynarecExec: returns 1 when it ran the slave slice
+int ari_chks_on; // (Vita flag arichks)
+int ari_chk_slave(u32 cycles)
+    { // harness check (RSTV_ARICHK): the slave one block at a time; each block run again in the interpreter from the
+      // same registers up to the PC the block left at; registers compared (memory is the recompiled run's)
+      static int chk = -1;
+      #ifdef __vita__
+      chk = ari_chks_on && yabsys.frame_count >= 15880;
+#else
+      if (chk < 0) chk = getenv("RSTV_ARICHK") != NULL;
+#endif
+      if (chk) {
+        extern void FASTCALL SH2InterpreterExec(SH2_struct *context, u32 cycles);
+        extern int SH2InterpreterInit(void);
+        static int ii, nbad;
+        if (!ii) { ii = 1; SH2InterpreterInit(); }
+        s32 left = (s32)cycles;
+        while (left > 0) {
+          sh2regs_struct r0, ra;
+          SH2DynarecGetRegisters(SSH2, &r0);
+          slave_cc = 0;
+          ari_exec_slave(1);
+          left -= 1 + (s32)slave_cc;
+          SH2DynarecGetRegisters(SSH2, &ra);
+          SSH2->regs = r0;
+          int steps = 0;
+          while (SSH2->regs.PC != ra.PC && steps < 2048) {
+            SH2InterpreterExec(SSH2, 1);
+            steps++;
+          }
+          // (a register the recompiled code left unchanged may be dead there: it is not written back. Only a changed
+          // register that differs counts)
+          int bad = SSH2->regs.PC != ra.PC;
+          for (int k = 0; k < 16; k++) bad |= SSH2->regs.R[k] != ra.R[k] && ra.R[k] != r0.R[k];
+          bad |= ((SSH2->regs.SR.all ^ ra.SR.all) & 0x3F2) != 0;
+          bad |= (SSH2->regs.MACH != ra.MACH && ra.MACH != r0.MACH) || (SSH2->regs.MACL != ra.MACL && ra.MACL != r0.MACL);
+          bad |= (SSH2->regs.PR != ra.PR && ra.PR != r0.PR) || (SSH2->regs.GBR != ra.GBR && ra.GBR != r0.GBR);
+          if (bad && nbad < 20) {
+            nbad++;
+            printf("arichk f%u: from %08x to %08x (interp %08x, %d steps)\n", (unsigned)yabsys.frame_count, r0.PC, ra.PC,
+              SSH2->regs.PC, steps);
+            if (nbad == 1 && (r0.PC & 0x0FF00000) == 0x06000000) {
+              const u16 *w = (const u16 *)(HighWram + (r0.PC & 0xFFFFE));
+              printf("  code %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15], w[16], w[17]);
+              printf("  before r0-r7 %08x %08x %08x %08x %08x %08x %08x %08x sr %03x gbr %08x\n", r0.R[0], r0.R[1], r0.R[2],
+                r0.R[3], r0.R[4], r0.R[5], r0.R[6], r0.R[7], (unsigned)r0.SR.all & 0x3F3, r0.GBR);
+            }
+            for (int k = 0; k < 16; k++)
+              if (SSH2->regs.R[k] != ra.R[k]) printf("  r%d ari %08x interp %08x (before %08x)\n", k, ra.R[k], SSH2->regs.R[k], r0.R[k]);
+            if ((SSH2->regs.SR.all ^ ra.SR.all) & 0x3F3) printf("  sr ari %08x interp %08x\n", ra.SR.all, SSH2->regs.SR.all);
+            if (SSH2->regs.MACH != ra.MACH || SSH2->regs.MACL != ra.MACL)
+              printf("  mac ari %08x%08x interp %08x%08x\n", ra.MACH, ra.MACL, SSH2->regs.MACH, SSH2->regs.MACL);
+            if (SSH2->regs.PR != ra.PR || SSH2->regs.GBR != ra.GBR) printf("  pr/gbr differ\n");
+          }
+          SH2DynarecSetRegisters(SSH2, &ra);
+        }
+        slave_cc = 0;
+        return 1;
+      }
+  return 0;
+}

@@ -181,6 +181,24 @@ void rstv_log_printf(const char *fmt, ...)
 	sceNetSendto(s_sock, line, n, 0, (SceNetSockaddr *)&s_addr, sizeof(s_addr));
 }
 
+// A failed assert: newlib's abort exits the process, which frees the heap block while the other threads still run,
+// so the dump showed one of them faulting on the heap instead (ADR-222). Log the assert (past the rate limit) and
+// fault here, so the dump has this thread's stack.
+void __assert_func(const char *file, int line, const char *func, const char *expr)
+{
+	char m[LINE_MAX_LEN];
+	const int n = snprintf(m, sizeof(m), "ASSERT %s:%d %s: %s\n", file ? file : "?", line, func ? func : "?",
+		expr ? expr : "?");
+	if (s_sock >= 0 && n > 0)
+		for (int k = 0; k < 3; k++)
+			sceNetSendto(s_sock, m, n < (int)sizeof(m) ? n : (int)sizeof(m) - 1, 0, (SceNetSockaddr *)&s_addr, sizeof(s_addr));
+	rstv_log_flush();
+	sceKernelDelayThread(200 * 1000);
+	*(volatile int *)0 = line;
+	for (;;)
+		sceKernelDelayThread(1000 * 1000);
+}
+
 #else
 // (logging off: the core's diagnostic lines call this directly)
 void rstv_log_printf(const char *fmt, ...) { (void)fmt; }

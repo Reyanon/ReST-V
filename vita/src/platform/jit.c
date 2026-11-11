@@ -11,7 +11,12 @@ typedef int (*JitFn)(int);
 
 int rstv_jit_selftest(char *msg, size_t msg_len)
 {
-	int r = rstv_jit_code_reserve(RSTV_JIT_CODE_SIZE);
+	// ADR-228: devmiyax (10.5MB) + DSP/SCU code + Ari64 (8MB) in one process: the largest VM block that works
+	int r = -1;
+	for (unsigned mb = 21; r != 0 && mb > 12; mb--)
+		r = rstv_jit_code_reserve(mb << 20);
+	if (r != 0)
+		r = rstv_jit_code_reserve(RSTV_JIT_CODE_SIZE);
 	if (r != 0)
 		r = rstv_jit_code_reserve(9u << 20); // the size before ADR-136 (no slave block cache: slaveasync stays off)
 	size_t size = 0;
