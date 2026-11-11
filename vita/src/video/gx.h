@@ -47,6 +47,7 @@ enum { GX_RGBA8, GX_L8 };
 enum { GX_BLEND_NONE, GX_BLEND_ALPHA, GX_BLEND_PREMUL, GX_BLEND_ADD }; // PREMUL: premultiplied alpha (src + dst * (1 - a)); ADD: src + dst
 
 int gx_init(int vsync);
+void gx_cache_version(const char *version); // (ADR-246: another app version empties the shader cache)
 void gx_shutdown(void);
 
 // texture (w rounded to a multiple of 8). linear: bilinear filter, rt: nonzero = also a render target (value = render target slot,

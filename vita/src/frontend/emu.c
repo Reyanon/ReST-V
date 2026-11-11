@@ -20,6 +20,7 @@
 
 #include "frontend/audio.h"
 #include "frontend/cheats.h"
+#include <math.h>
 #include "platform/log.h"
 #include "video/video.h"
 
@@ -42,28 +43,73 @@ M68K_struct *M68KCoreList[] = { &M68KMusashi, NULL };
 #define SNDCORE_VITA 21
 static int16_t s_snd_buf[4096 * 2];
 
-static int snd_init(void) { return 0; }
+static int snd_init(void);
 static void snd_deinit(void) {}
 static int snd_reset(void) { return 0; }
 static int snd_vf(int f) { (void)f; return 0; }
 // ADR-192 (owner): the output was about half of MAME's (6 dB lower in dnmtdeka, diehard, vfkids). Doubled, with a soft
 // limit above 75% of full scale instead of clipping (loud sets such as thuntk already peak near full scale): past the
 // knee the curve bends smoothly towards full scale (same slope at the knee, never reaches it)
+// ADR-248 (owner: Princess Clara was much quieter than the rest; as ReBOX audio.c ADR-021): the gain follows the level
+// instead of a fixed x2: x6 at most, less where the peaks would pass the knee. An envelope of the peaks (x256: at once
+// up, about 11 s down), so a game's gain settles and quiet games come up; the soft limit stays for what is past it
+#define SND_GAIN_MAX 6
+static int32_t s_env = 4096 << 8, s_gain256 = SND_GAIN_MAX * 256;
+static inline void gain_track(int32_t l, int32_t r)
+{
+	int32_t m = l < 0 ? -l : l;
+	const int32_t mr = r < 0 ? -r : r;
+	if (mr > m)
+		m = mr;
+	m <<= 8;
+	if (m > s_env)
+		s_env = m;
+	else
+		s_env -= (s_env - m) >> 19;
+	const int32_t e = (s_env >> 8) < 4096 ? 4096 : (s_env >> 8);
+	s_gain256 = (int32_t)((int64_t)24576 * 256 / e);
+	if (s_gain256 > SND_GAIN_MAX * 256)
+		s_gain256 = SND_GAIN_MAX * 256;
+}
 static inline int16_t snd_out(int32_t v)
 {
 	enum { KNEE = 24576, ROOM = 32767 - KNEE };
-	v *= 2;
+	v = (int32_t)(((int64_t)v * s_gain256) >> 8);
 	const int32_t m = v < 0 ? -v : v;
 	if (m <= KNEE)
 		return (int16_t)v;
 	const int32_t e = m - KNEE, y = KNEE + (int32_t)((int64_t)e * ROOM / (e + ROOM));
 	return (int16_t)(v < 0 ? -y : y);
 }
+#ifdef RSTV_DEBUG_TOOLS
+// diag: the output's level every ~10 s (RMS and peak of the doubled signal before the limiter, dBFS)
+static double s_lvl_sum;
+static int32_t s_lvl_peak;
+static uint32_t s_lvl_n;
+#endif
 static void snd_update(u32 *l, u32 *r, u32 n)
 {
 	while (n > 0) {
 		u32 k = n > 4096 ? 4096 : n;
 		for (u32 i = 0; i < k; i++) {
+#ifdef RSTV_DEBUG_TOOLS
+			{
+				const int32_t a = (int32_t)l[i] * 2, b = (int32_t)r[i] * 2;
+				s_lvl_sum += (double)a * a + (double)b * b;
+				const int32_t ma = a < 0 ? -a : a, mb = b < 0 ? -b : b;
+				if (ma > s_lvl_peak) s_lvl_peak = ma;
+				if (mb > s_lvl_peak) s_lvl_peak = mb;
+				if (++s_lvl_n >= 441000) {
+					const double rms = sqrt(s_lvl_sum / (2.0 * s_lvl_n));
+					RSTV_LOG("audio level: rms %.1f dBFS peak %.1f dBFS (input x2) gain x%.2f", rms > 0 ? 20.0 * log10(rms / 32768.0) : -99.0,
+						s_lvl_peak > 0 ? 20.0 * log10(s_lvl_peak / 32768.0) : -99.0, s_gain256 / 256.0);
+					s_lvl_sum = 0;
+					s_lvl_peak = 0;
+					s_lvl_n = 0;
+				}
+			}
+#endif
+			gain_track((int32_t)l[i], (int32_t)r[i]);
 			s_snd_buf[i * 2] = snd_out((int32_t)l[i]);
 			s_snd_buf[i * 2 + 1] = snd_out((int32_t)r[i]);
 		}
@@ -72,6 +118,12 @@ static void snd_update(u32 *l, u32 *r, u32 n)
 		r += k;
 		n -= k;
 	}
+}
+static int snd_init(void)
+{
+	s_env = 4096 << 8; // (each game's gain from x6, ADR-248)
+	s_gain256 = SND_GAIN_MAX * 256;
+	return 0;
 }
 static u32 snd_space(void) { return 0x10000; }
 static void snd_nop(void) {}

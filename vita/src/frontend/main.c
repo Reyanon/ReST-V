@@ -40,6 +40,7 @@ void MappedMemoryWriteByteNocache(unsigned int addr, unsigned char val); // core
 #include "platform/cpu3.h"
 #include "platform/jit.h"
 #include "platform/log.h"
+#include "rstv_version.h" // (ADR-246: the version the shader cache belongs to)
 #include "platform/timer.h"
 #include "video/gvdp2.h"
 #include "video/gx.h"
@@ -634,7 +635,7 @@ static void fatal_screen(uint32_t abgr)
 
 // vita-elf-create appends SCE data (a few KB) to the end of the text segment. If text ends just below a 1MB boundary it overlaps the data segment
 // and fails, so push text past the boundary with read-only padding (adjust the size if build error "segment 1 overlaps" shows up again)
-__attribute__((used)) static const unsigned char s_text_pad[28 * 1024] = { 1 };
+__attribute__((used)) static const unsigned char s_text_pad[32 * 1024] = { 1 };
 
 static unsigned s_spike_us = 25000; // late frame log threshold (us)
 static int s_spike_sampler;         // if the sampling profiler is on, log top blocks on every late frame
@@ -981,6 +982,12 @@ int main(int argc, char *argv[])
 	write_text_file(DATA_DIR "/jit_result.txt", jit_msg, 0);
 
 	const int mhz_pre_video = rstv_clock_measure_arm_mhz();
+#ifndef RSTV_DEBUG_TOOLS
+	{ // ADR-246: release builds: a new version deletes the old shader cache (debug builds change version every commit)
+		extern void gx_cache_version(const char *version);
+		gx_cache_version(RSTV_VERSION);
+	}
+#endif
 	rstv_video_init();
 	rstv_video_preload();
 	rstv_loading_prepare();
@@ -1122,6 +1129,10 @@ next_game:
 	rstv_memfast = !file_exists(DATA_DIR "/nomemfast");
 	{ extern int rstv_cpy8_on; rstv_cpy8_on = file_exists(DATA_DIR "/hle220") ? 7 : 0; } // ADR-231: the ADR-220 native loops (test only)
 	rstv_fastboot_until = g_set.fast_boot ? 1300 : 0; // ADR-241
+#ifdef RSTV_DEBUG_TOOLS
+	{ extern int rstv_rbg_perdot_on; rstv_rbg_perdot_on = !file_exists(DATA_DIR "/noperdot"); } // ADR-242 A/B
+	{ extern int gx_nodraw; gx_nodraw = file_exists(DATA_DIR "/gxnodraw"); } // GPU scene cost test
+#endif
 #ifdef RSTV_DEBUG_TOOLS
 	{
 		FILE *ff = fopen(DATA_DIR "/fastboot", "r");
@@ -1977,6 +1988,9 @@ next_game:
 		goto next_game;
 	}
 	RSTV_LOG("exit: clean shutdown at f%u", frame);
+	// the prep worker may still be submitting the last frame: let it finish before the core and the GPU are torn down
+	// (two core dumps in rstv_prep inside SceGxm after measuring tools' exit requests, 2026-11-12)
+	gvdp2_game_end();
 	rstv_emu_shutdown();
 	rstv_jit_shutdown(); // ADR-086: close VM area, free code blocks
 out:

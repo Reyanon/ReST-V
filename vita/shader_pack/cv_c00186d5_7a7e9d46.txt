@@ -1,0 +1,169 @@
+0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4096,8,2048,2,2048,1,1,1,1,0,5,0,0,0,0,0,1,1,0,0,1,1,1,1,0,0,0,0,
+half lut8(half i, half4 lo, half4 hi) {
+  half4 a = step(abs(half4(i, i, i, i) - half4(0.0, 1.0, 2.0, 3.0)), half4(0.5, 0.5, 0.5, 0.5));
+  half4 b = step(abs(half4(i, i, i, i) - half4(4.0, 5.0, 6.0, 7.0)), half4(0.5, 0.5, 0.5, 0.5));
+  return dot(a, lo) + dot(b, hi);
+}
+float4 fetch(sampler2D t, float2 p, float2 sz) { return floor(tex2D(t, (p + 0.5) / sz) * 255.0 + 0.5); }
+float4 fetchv(sampler2D t, float2 uv) { return floor(tex2D(t, uv) * 255.0 + 0.5); }
+half3 mixa(half3 t, half r, half3 b) { half w = (r * 4.0 + 3.0) / 255.0; return t * w + b * (1.0 - w); }
+half3 blend(half m, half3 t, half tr, half tq, half3 b, half br) {
+  if (m < 0.5) return mixa(t, tr, b);
+  if (m < 1.5) return (tq < 0.5) ? t : mixa(t, br, b);
+  return min(t + b, 1.0);
+}
+half trans(half m, half r, half q) { return (m < 0.5) ? ((r < 62.5) ? 1.0 : 0.0) : q; }
+float2 mu(float2 uv, float x, float on, float m) { return (on > 0.5) ? float2((floor(x / m) * m + 0.5) / 512.0, uv.y) : uv; }
+float4 main(float2 vPix : TEXCOORD0, float2 vUV : TEXCOORD1, float2 vL0 : TEXCOORD2, float2 vL1 : TEXCOORD3,
+  uniform sampler2D tN3, uniform sampler2D tN2, uniform sampler2D tN1, uniform sampler2D tN0, uniform sampler2D tR0,
+  uniform sampler2D tSpr, uniform sampler2D tPal, uniform sampler2D tLine, uniform sampler2D tSLut,
+  uniform float4 offB, uniform float4 off3, uniform float4 off2, uniform float4 off1, uniform float4 off0,
+  uniform float4 offr, uniform float4 offs_,
+  uniform float4 layerOn, uniform float4 layerAlpha, uniform float4 layerShad, uniform float4 layerLs, uniform float4 misc,
+  uniform float4 sprA, uniform float4 sprB, uniform float4 sprC, uniform float4 sprD, uniform float4 sprE,
+  uniform float4 prioLo, uniform float4 prioHi, uniform float4 ccLo, uniform float4 ccHi, uniform float4 mode,
+  uniform float4 ccwA, uniform float4 ccwB, uniform float4 ccw0, uniform float4 ccw1, uniform float4 mosaic, uniform float4 mosaicOn) : COLOR
+{
+  float x = floor(vPix.x);
+  float y = floor(vPix.y);
+  float ccok = 1.0;
+  if (ccwA.x > 0.5) {
+    float h0 = step(ccw0.x, x) * step(x, ccw0.z), h1 = step(ccw1.x, x) * step(x, ccw1.z);
+    float i0 = h0 * step(ccw0.y, y) * step(y, ccw0.w), i1 = h1 * step(ccw1.y, y) * step(y, ccw1.w);
+    float v0 = (ccwA.z > 0.5) ? i0 : 1.0 - max(i0, h0 * ccwB.z);
+    float v1 = (ccwA.w > 0.5) ? i1 : 1.0 - max(i1, h1 * ccwB.w);
+    if (ccwB.x < 0.5) ccok = v0;
+    else if (ccwA.y < 0.5) ccok = v1;
+    else ccok = (ccwB.y > 0.5) ? max(v0, v1) : min(v0, v1);
+  }
+  half4 lB = tex2D(tLine, vL0);
+  half4 lL = tex2D(tLine, vL1);
+  half3 back = lB.xyz;
+  if ((1.000000) > 0.5) back = saturate(back + offB.xyz / 255.0);
+  half4 c3 = half4(0.0, 0.0, 0.0, 0.0), c2 = c3, c1 = c3, c0 = c3, cr = c3;
+  if ((0.000000) > 0.5) c3 = tex2D(tN3, mu(vUV, x, (0.000000), mosaic.x));
+  if ((1.000000) > 0.5) c2 = tex2D(tN2, mu(vUV, x, (0.000000), mosaic.y));
+  if ((0.000000) > 0.5) c1 = tex2D(tN1, mu(vUV, x, (0.000000), mosaic.z));
+  if ((0.000000) > 0.5) c0 = tex2D(tN0, mu(vUV, x, (0.000000), mosaic.w));
+  if ((0.000000) > 0.5) cr = tex2D(tR0, vUV);
+  half4 W = half4(c3.w, c2.w, c1.w, c0.w);
+  half4 F = step(half4(0.5, 0.5, 0.5, 0.5), W);
+  half4 K = W - F * (128.0 / 255.0);
+  half fr = step(0.5, cr.w);
+  half kr = cr.w - fr * (128.0 / 255.0);
+  half4 hA = layerAlpha;
+  half4 LQ = step(half4(128.0, 128.0, 128.0, 128.0), hA);
+  half4 FC = F * ccok;
+  half4 R4 = 63.0 + FC * (hA - 128.0 * LQ - 63.0);
+  half4 Q4 = FC * LQ;
+  half hmy = misc.y;
+  half mq = step(128.0, hmy);
+  half frc = fr * ccok;
+  half rR = 63.0 + frc * (hmy - 128.0 * mq - 63.0), rQ = frc * mq;
+  half ks = 0.0; half3 cols = half3(0.0, 0.0, 0.0); half sa = 63.0; half shs = 0.0;
+  if ((1.000000) > 0.5 && (1.000000) > 0.5) {
+    float4 st = tex2D(tSpr, vUV);
+    if (st.x + st.y > 0.0) {
+    float2 lu = st.xy * float2(255.0 / 512.0, 255.0 / 256.0) + float2(0.5 / 512.0, 0.5 / 256.0);
+    float4 d = tex2D(tSLut, lu);
+    float4 d2 = tex2D(tSLut, lu + float2(0.5, 0.0));
+    float pu = dot(d.xy, float2(255.0 / 2048.0, 65280.0 / 2048.0)) + 0.5 / 2048.0;
+    float4 pc = tex2D(tPal, float2(pu, 0.5));
+    cols = (d2.w > 0.5) ? pc.xyz : d.xyz;
+    ks = d.w;
+    sa = floor(((pc.w > 0.5) ? d2.y : d2.x) * 255.0 + 0.5);
+    shs = floor(d2.z * 255.0 + 0.5);
+    if ((1.000000) > 0.5 && (shs < 0.5 || shs > 1.5)) cols = saturate(cols + offs_.xyz / 255.0);
+    }
+  } else if ((1.000000) > 0.5) {
+    float4 st = fetch(tSpr, float2(floor(x / 2.0), y), float2(256.0, 256.0));
+    float pix = (fmod(x, 2.0) < 0.5) ? (st.x + st.y * 256.0) : (st.z + st.w * 256.0);
+    if (pix > 0.5) {
+      float sprio = 0.0; float doOff = 1.0;
+      if (pix >= 32768.0 && (1.000000) > 0.5) {
+        float a = 63.0;
+        if ((1.000000) > 2.5 && (0.000000) > 0.5) { a = ccLo.x; if ((0.000000) > 0.5) a += 128.0; }
+        float draw = (pix != 32768.0 || (5.000000) < 2.0 || ((5.000000) < 8.0 && (0.000000) < 0.5)) ? 1.0 : 0.0;
+        if (draw > 0.5) {
+          float v = pix - 32768.0;
+          cols = float3(fmod(v, 32.0), fmod(floor(v / 32.0), 32.0), floor(v / 1024.0)) * (8.0 / 255.0);
+          sprio = prioLo.x; sa = a;
+        }
+      } else {
+        float pi = fmod(floor(pix / (4096.000000)), (8.000000));
+        float ci = fmod(floor(pix / (2048.000000)), (2.000000));
+        float code = fmod(pix, (2048.000000));
+        float msb = ((1.000000) > 0.5 && pix >= 32768.0) ? 1.0 : 0.0;
+        float pv = lut8(pi, prioLo, prioHi);
+        if (code == (2048.000000) - 2.0) {
+          sprio = pv; shs = 1.0; doOff = 0.0;
+        } else {
+          float pa = fmod(sprC.w + code, 2048.0);
+          float4 pc = tex2D(tPal, float2((pa + 0.5) / 2048.0, 0.5));
+          float a = 63.0;
+          if ((0.000000) > 0.5) {
+            float tr = 0.0;
+            if ((1.000000) < 0.5) tr = (pv <= sprC.y) ? 1.0 : 0.0;
+            else if ((1.000000) < 1.5) tr = (pv == sprC.y) ? 1.0 : 0.0;
+            else if ((1.000000) < 2.5) tr = (pv >= sprC.y) ? 1.0 : 0.0;
+            else tr = (pc.w > 0.5) ? 1.0 : 0.0;
+            float cv = lut8(ci, ccLo, ccHi);
+            if ((0.000000) > 0.5) { a = cv; if (tr > 0.5) a += 128.0; }
+            else if (tr > 0.5) { a = cv; if ((0.000000) > 0.5) a += 128.0; }
+          }
+          sprio = pv; sa = a;
+          if (msb > 0.5) shs = 2.0;
+          cols = (msb > 0.5 && code < 0.5) ? float3(0.0, 0.0, 0.0) : pc.xyz;
+        }
+      }
+      if (sprio > 0.5) {
+        ks = (sprio * 8.0 + 5.0) / 255.0;
+        if (doOff > 0.5 && (1.000000) > 0.5) cols = saturate(cols + offs_.xyz / 255.0);
+      }
+    }
+  }
+  if (ccok < 0.5) sa = 63.0;
+  half sq = step(128.0, sa);
+  half sR = sa - 128.0 * sq;
+  half e = 0.5 / 255.0;
+  half m1 = max(max(max(K.x, K.y), max(K.z, K.w)), max(kr, ks));
+  half4 E1 = step(abs(K - m1), half4(e, e, e, e)) * step(half4(e, e, e, e), K);
+  half er1 = step(abs(kr - m1), e) * step(e, kr), es1 = step(abs(ks - m1), e) * step(e, ks), eb1 = 1.0 - step(e, m1);
+  half3 n1 = E1.x * c3.xyz + E1.y * c2.xyz + E1.z * c1.xyz + E1.w * c0.xyz + er1 * cr.xyz;
+  half4 o1 = E1.x * off3 + E1.y * off2 + E1.z * off1 + E1.w * off0 + er1 * offr;
+  if (o1.w > 0.5) n1 = saturate(n1 + o1.xyz / 255.0);
+  half3 t0c = n1 + es1 * cols + eb1 * back;
+  half t0r = dot(E1, R4) + er1 * rR + es1 * sR + eb1 * 63.0;
+  half t0q = dot(E1, Q4) + er1 * rQ + es1 * sq;
+  half t0s = es1 * shs;
+  half t0l = E1.x * (0.000000) + E1.y * (0.000000) + E1.z * (0.000000) + E1.w * (0.000000) + er1 * (0.000000) + es1 * (0.000000);
+  half m = (0.000000);
+  if (t0l > 0.5) {
+    half lq = step(128.0, lL.w * 255.0 + 0.5);
+    t0c = blend(m, t0c, t0r, t0q, lL.xyz, lL.w * 255.0 - 128.0 * lq);
+    if (m < 0.5 || m > 1.5) { t0r = 63.0; t0q = 0.0; }
+  }
+  half3 r = t0c;
+  // ADR-051: the second layer only where the top one blends or is a shadow (most pixels skip it)
+  if (trans(m, t0r, t0q) > 0.5 || t0s > 0.5) {
+    half4 K2 = K * step(K, half4(m1 - e, m1 - e, m1 - e, m1 - e));
+    half m2 = max(max(max(K2.x, K2.y), max(K2.z, K2.w)), max(kr * step(kr, m1 - e), ks * step(ks, m1 - e)));
+    half4 E2 = step(abs(K - m2), half4(e, e, e, e)) * step(half4(e, e, e, e), K);
+    half er2 = step(abs(kr - m2), e) * step(e, kr), es2 = step(abs(ks - m2), e) * step(e, ks), eb2 = 1.0 - step(e, m2);
+    half3 n2 = E2.x * c3.xyz + E2.y * c2.xyz + E2.z * c1.xyz + E2.w * c0.xyz + er2 * cr.xyz;
+    half4 o2 = E2.x * off3 + E2.y * off2 + E2.z * off1 + E2.w * off0 + er2 * offr;
+    if (o2.w > 0.5) n2 = saturate(n2 + o2.xyz / 255.0);
+    half3 t1c = n2 + es2 * cols + eb2 * back;
+    half t1r = dot(E2, R4) + er2 * rR + es2 * sR + eb2 * 63.0;
+    half t1e = E2.x * (0.000000) + E2.y * (0.000000) + E2.z * (0.000000) + E2.w * (0.000000) + er2 * (0.000000);
+    half3 sh = (t1e > 0.5) ? t1c * (124.0 / 255.0) : t1c;
+    r = (trans(m, t0r, t0q) > 0.5) ? blend(m, t0c, t0r, t0q, t1c, t1r) : t0c;
+    if ((1.000000) > 0.5) {
+      half zero = (t0c.x + t0c.y + t0c.z < 0.5 / 255.0) ? 1.0 : 0.0;
+      half3 r2 = ((0.000000) < 0.5) ? r * (124.0 / 255.0) : r;
+      r = (t0s > 1.5) ? ((zero > 0.5) ? sh : r2) : r;
+    }
+    r = (t0s > 0.5 && t0s < 1.5) ? sh : r;
+  }
+  return float4(r, 1.0);
+}

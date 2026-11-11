@@ -1497,6 +1497,7 @@ int Rbg0CheckRam(Vdp2* regs)
    Supported: tile mode, parameter A or B only, line coefficients (or none) with modes 0-2, no windows,
    no rotation line colour, 16/256 palette colours or RGB555. Everything else is drawn by the CPU as before. */
 int rstv_rbg_unrot_on = 1; /* ADR-083; 0: ux0:data/restv/norbgunrot */
+int rstv_rbg_perdot_on = 1; /* ADR-242; 0: ux0:data/restv/noperdot (debug builds) */
 volatile int rstv_rbg_unrot_seen; /* ADR-083 diagnostics: frames captured as unrotated (the frontend can take a picture) */
 static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_struct *parameter, Vdp2 *regs, u8 *ram)
 {
@@ -1525,7 +1526,9 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
          KTCTL 0x11 with LNCLEN 0: RBG0 went to the CPU, 27 ms a frame) */
       ((regs->KTCTL & 0x1010) && (regs->LNCLEN & 0x10) ? 8 : 0) | (info->specialprimode == 2 ? 16 : 0) | (vdp2_x_hires ? 32 : 0) |
       (!(info->colornumber <= 1 || info->colornumber == 3) ? 128 : 0) |
-      (p->coefenab && p->deltaKAx != 0 ? 256 : 0) | (p->coefenab && p->coefmode > 2 ? 512 : 0);
+      /* ADR-242: per-dot coefficients go to the GPU as line pieces (parameter A, no rotation parameter or layer window) */
+      (p->coefenab && p->deltaKAx != 0 && (!rstv_rbg_perdot_on || (regs->RPMD & 3) >= 2 || (info->wctl & 0x0A)) ? 256 : 0) |
+      (p->coefenab && p->coefmode > 2 ? 512 : 0);
    if (rstv_rot_why)
       return 0;
    /* ADR-083: no coefficients and no rotation (IsScreenRotatedFP is true when the plane is NOT rotated):
@@ -1632,6 +1635,7 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
          Vdp2ReadCoefficientFP(p2, p2->coeftbladdr + (coefy2 + touint(rcoefy2)) * p2->coefdatasize, ram);
       r->enable = !(p->coefenab && p->msb);
       r->nseg = 0;
+      r->nsub = 0;
       if (lwin)
          ReadLineWindowClip(islw, lclip, &lwnd0, &lwnd1, ram, regs);
       if (rpwin)
@@ -1739,6 +1743,39 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
          r->dx = (float)((double)p->kx * (double)p->dX / 4294967296.0);
          r->y0 = (float)((double)p->ky * (double)Ysp / 4294967296.0 + (double)p->Yp / 65536.0);
          r->dy = (float)((double)p->ky * (double)p->dY / 4294967296.0);
+         if (p->coefenab && p->deltaKAx != 0)
+         {
+            /* ADR-242: per-dot coefficients (Vdp2DrawRotationFP reads one at every dot: dot i takes entry
+               coefy + i * int(dKAx) + int(i * frac(dKAx) + rcoefy)). The line in RSTV_ROT_SUB pieces, each straight
+               between the exact positions at its ends; a piece is shown if its first dot's coefficient MSB is clear */
+            const int nsub = rbg0width < RSTV_ROT_SUB ? rbg0width : RSTV_ROT_SUB;
+            double ex[RSTV_ROT_SUB + 1], ey[RSTV_ROT_SUB + 1];
+            u8 en[RSTV_ROT_SUB + 1];
+            int k;
+            for (k = 0; k <= nsub; k++)
+            {
+               const int i = k * rbg0width / nsub;
+               const int ic = i < rbg0width ? i : rbg0width - 1; /* (the end: the last dot's coefficient) */
+               const u32 idx = (u32)(coefy + ic * toint(p->deltaKAx) + toint(ic * decipart(p->deltaKAx) + rcoefy));
+               Vdp2ReadCoefficientFP(p, p->coeftbladdr + idx * p->coefdatasize, ram);
+               en[k] = !p->msb;
+               ex[k] = (double)p->kx * ((double)Xsp + (double)p->dX * i) / 4294967296.0 + (double)p->Xp / 65536.0;
+               ey[k] = (double)p->ky * ((double)Ysp + (double)p->dY * i) / 4294967296.0 + (double)p->Yp / 65536.0;
+               r->subx[k] = (u16)i;
+            }
+            for (k = 0; k < nsub; k++)
+            {
+               const double w = (double)(r->subx[k + 1] - r->subx[k]);
+               const double ddx = (ex[k + 1] - ex[k]) / w, ddy = (ey[k + 1] - ey[k]) / w;
+               r->sdx[k] = (float)ddx;
+               r->sdy[k] = (float)ddy;
+               r->sx0[k] = (float)(ex[k] - ddx * r->subx[k]);
+               r->sy0[k] = (float)(ey[k] - ddy * r->subx[k]);
+               r->suben[k] = en[k];
+            }
+            r->nsub = (u8)nsub;
+            r->enable = 1;
+         }
       }
       if (lwin && !rpwin)
       {

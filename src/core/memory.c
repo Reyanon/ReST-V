@@ -419,9 +419,10 @@ static void rstv_qlogr(u32 addr, u32 val, int size)
 #endif
 #if !defined(__vita__)
 /* harness (Ari64 master check): a store the interpreter makes again that differs from what is in RAM */
-extern int ari_chk_cmp;
-extern void ari_chk_store_diff(u32 addr, int size, u32 old, u32 val);
-#define ARI_CHK_STORE(a, sz, old, v) do { if (ari_chk_cmp && (u32)(old) != (u32)(v)) ari_chk_store_diff((a), (sz), (old), (v)); } while (0)
+/* (weak: the x86 harness has no Ari64, so neither symbol is there) */
+extern int ari_chk_cmp __attribute__((weak));
+extern void ari_chk_store_diff(u32 addr, int size, u32 old, u32 val) __attribute__((weak));
+#define ARI_CHK_STORE(a, sz, old, v) do { if (&ari_chk_cmp && ari_chk_cmp && (u32)(old) != (u32)(v)) ari_chk_store_diff((a), (sz), (old), (v)); } while (0)
 #else
 #define ARI_CHK_STORE(a, sz, old, v) do { } while (0)
 #endif

@@ -214,7 +214,15 @@ uint32_t rbgq_shade(const RstvRotCapture *c, const uint8_t *pages, const uint8_t
 	const RstvRotLine *r = &c->row[j];
 	float x0 = r->x0, dx = r->dx, y0 = r->y0, dy = r->dy;
 	int so = c->screenover;
-	if (r->nseg) {
+	if (r->nsub) {
+		// ADR-242: per-dot coefficient pieces
+		int k = 0;
+		while (k + 1 < r->nsub && i >= r->subx[k + 1])
+			k++;
+		if (!r->suben[k])
+			return 0;
+		x0 = r->sx0[k]; dx = r->sdx[k]; y0 = r->sy0[k]; dy = r->sdy[k];
+	} else if (r->nseg) {
 		// line spans (ADR-037 rotation parameter window, ADR-063 layer window): nothing drawn outside spans, B spans use B coords
 		int k = 0;
 		while (k < r->nseg && !(r->sx[k] <= i && i <= r->ex[k]))

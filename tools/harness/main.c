@@ -1052,15 +1052,16 @@ int main(int argc, char **argv)
 		printf("dsp last_step %d nonzero %d\n", scsp_dsp.last_step, nz);
 	}
 	{ // routines run natively (found by their code or listed per game): pc / kind
-		extern unsigned rstv_hle_runs;
-		printf("hle %d routines, %u runs:", rstv_hle_n, rstv_hle_runs);
+		extern unsigned rstv_hle_runs __attribute__((weak)); // (weak: the x86 harness has no devmiyax recompiler)
+		printf("hle %d routines, %u runs:", rstv_hle_n, &rstv_hle_runs ? rstv_hle_runs : 0);
 		for (int k = 0; k < rstv_hle_n; k++)
 			printf(" %08x/%d", (unsigned)rstv_hle[k].pc, rstv_hle[k].kind);
 		printf("\n");
 	}
 	double dt = now_s() - t0;
-	{ extern unsigned rstv_cw_same, rstv_cw_diff; extern unsigned rstv_dirty_n; // (devmiyax: writes to compiled code)
-		printf("codewrites same %u diff %u\n", rstv_cw_same, rstv_cw_diff); }
+	{ extern unsigned rstv_cw_same __attribute__((weak)), rstv_cw_diff __attribute__((weak)); // (devmiyax: writes to
+		if (&rstv_cw_same && &rstv_cw_diff)                                                        // compiled code)
+			printf("codewrites same %u diff %u\n", rstv_cw_same, rstv_cw_diff); }
 	printf("done %d frames in %.2fs (%.1f fps)\n", frames, dt, frames / dt);
 	YabauseDeInit();
 	return 0;

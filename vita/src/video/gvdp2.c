@@ -9,6 +9,7 @@
 
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include <stdio.h>
@@ -956,17 +957,22 @@ static int cl_has(uint32_t h)
 }
 static void cl_load(void)
 {
-	char path[128];
-	snprintf(path, sizeof(path), VARLIST_DIR "/cl_%s.txt", s_game);
-	FILE *f = fopen(path, "r");
-	if (!f)
-		return;
-	unsigned h;
-	while (s_cl_n < MAX_VARIANTS && fscanf(f, "%x", &h) == 1)
-		if (!cl_has(h))
-			s_cl_set[s_cl_n++] = h;
-	fclose(f);
-	s_cl_loaded = 1;
+	// the user's list, merged with the one the app ships (ADR-247: a first run, or the first after an update; the user's
+	// list then holds only what this device added)
+	static const char *const dirs[2] = { VARLIST_DIR, "app0:shaders" };
+	for (int k = 0; k < 2; k++) {
+		char path[128];
+		snprintf(path, sizeof(path), "%s/cl_%s.txt", dirs[k], s_game);
+		FILE *f = fopen(path, "r");
+		if (!f)
+			continue;
+		unsigned h;
+		while (s_cl_n < MAX_VARIANTS && fscanf(f, "%x", &h) == 1)
+			if (!cl_has(h))
+				s_cl_set[s_cl_n++] = h;
+		fclose(f);
+		s_cl_loaded = 1;
+	}
 }
 static void cl_note(CmpVariant *v)
 {
@@ -1271,7 +1277,7 @@ static void argb_flush(const FrameSet *s)
 static RbgqState s_rbgq;
 static GxTex *s_rbg_pages_b;  // ADR-067: map-order cell layout of the B map when there are two maps
 // ADR-077: draw RBG0 at half horizontal resolution (256 x 256, render target slot 20) and stretch-copy into the layer texture (half the rotation shader pixels)
-int rstv_rbg_half; // 0: game table (RSTV_HACK_RBG_HALF), 1: on (ux0:data/restv/rbghalf), 2: off (norbghalf)
+int rstv_rbg_half; // ADR-245: 0 = on for every game (was: the game table, RSTV_HACK_RBG_HALF), 1 on, 2 off (norbghalf)
 static GxTex *s_rbg_halftex;
 static RbgqState s_rbgq_b;
 static int s_rbg_dbg; // test: ux0:data/restv/rbgdbg (1 constant, 2 up to page table, 3 up to cell attrs)
@@ -3332,7 +3338,8 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 			// RBG0 rotation: draw on GPU, or on CPU if not possible (not drawn in capture mode)
 			const RstvRotCapture *rc = &rstv_rot_capture;
 			const int h = s->h < rc->nrows ? s->h : rc->nrows;
-			float *v = (s_prog_rbg && h > 0) ? (float *)gx_temp(h * 4 * 4 * 4 * (int)sizeof(float)) : NULL; // up to 4 spans per line
+			// up to RSTV_ROT_SUB spans per line (ADR-242 per-dot pieces; 4 for the window runs)
+			float *v = (s_prog_rbg && h > 0) ? (float *)gx_temp(h * RSTV_ROT_SUB * 16 * (int)sizeof(float)) : NULL;
 			float *vb = NULL;
 			int okb = 1;
 			uint32_t bank_b[4] = { 0, 0, 0, 0 };
@@ -3366,6 +3373,23 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 				uint32_t rvh = 2166136261u;
 				for (int y = 0; y < h; y++) {
 					const RstvRotLine *rl = &rc->row[y];
+					if (rl->nsub) {
+						// ADR-242: per-dot coefficients: straight pieces between exact positions
+						const float n0 = -1.0f + 2.0f * y / LAYER_H, n1 = -1.0f + 2.0f * (y + 1) / LAYER_H;
+						for (int k = 0; k < rl->nsub; k++) {
+							if (!rl->suben[k])
+								continue;
+							const float xs = (float)rl->subx[k], xe = (float)rl->subx[k + 1];
+							const float ns = -1.0f + 2.0f * xs / LAYER_W, ne = -1.0f + 2.0f * xe / LAYER_W;
+							const float ma = rl->sx0[k] + (xs - 0.5f) * rl->sdx[k], mb = rl->sy0[k] + (xs - 0.5f) * rl->sdy[k];
+							const float mc = rl->sx0[k] + (xe - 0.5f) * rl->sdx[k], md = rl->sy0[k] + (xe - 0.5f) * rl->sdy[k];
+							const float d[16] = { ns, n0, ma, mb, ne, n0, mc, md, ns, n1, ma, mb, ne, n1, mc, md };
+							rvh = mixw(rvh, d, sizeof(d));
+							memcpy(v + n * 16, d, sizeof(d));
+							n++;
+						}
+						continue;
+					}
 					if (rl->nseg) {
 						// rotation parameter window (ADR-037): A or B coords per span
 						const float n0 = -1.0f + 2.0f * y / LAYER_H, n1 = -1.0f + 2.0f * (y + 1) / LAYER_H;
@@ -4074,7 +4098,9 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 			}
 			gx_end();
 		}
-		const int rbg_half = L == 4 && (rstv_rbg_half == 1 || (rstv_rbg_half == 0 && (rstv_game_hacks & RSTV_HACK_RBG_HALF))) &&
+		// ADR-245 (owner: lower the resolution of heavy parts): RBG0 at half width for every game (rsgun boss: RBG0 GPU
+		// 5.2 -> 3.4 ms a frame); the rotated, perspective-scaled floor hides the halved columns
+		const int rbg_half = L == 4 && rstv_rbg_half != 2 &&
 			s_rbg_halftex && s_prog_pcopy && !s->pl_on[L];
 		gx_begin(rbg_half ? s_rbg_halftex : tgt);
 		if (s->bq_on[L]) {
@@ -4203,6 +4229,17 @@ static void gpu_submit(FrameSet *s, int oi, int on_worker)
 		}
 		if (s->quad_n[L] >= 0) {
 			// cell quads: clear, then draw only the quads
+#ifdef RSTV_DEBUG_TOOLS
+			{ // diag: what each cell-quad layer is (colour mode, palette-index shader, quads, colour calc), every 600 frames
+				static unsigned last[4];
+				if (s_frame - last[L] >= 600) {
+					last[L] = s_frame;
+					RSTV_LOG("layer L%d f%u: cells cn %d idx %d quads %d clr %d lines %d cfg %.0f %.0f %.0f %.0f", L, s_frame, s->quad_cn[L],
+						s->pl_idx[L], s->quad_n[L], s->qclr_n[L], s->nbgh_n[L], s->quad_cfg[L][0][0], s->quad_cfg[L][0][1], s->quad_cfg[L][0][2],
+						s->quad_cfg[L][0][3]);
+				}
+			}
+#endif
 			clear_target();
 			if (s->quad_n[L] > 0) {
 				const float scale[4] = { 2.0f / LAYER_W, 2.0f / LAYER_H, 1.0f / NBGQ_ATLAS, 0 };
@@ -4511,19 +4548,20 @@ static int var_known(const char *key)
 			return 1;
 	return 0;
 }
-static void preload_variants(void)
+// one folder of variant files: the user's cache, then (ADR-247) the ones the app ships in app0:shaders/ (skipped when
+// the cache has the same file)
+static void preload_dir(const char *dir, int *pnc, int *pnr, int *pnn, int *pnskip)
 {
-	SceUID d = sceIoDopen(VARLIST_DIR);
+	SceUID d = sceIoDopen(dir);
 	if (d < 0)
 		return;
+	const int shipped = strcmp(dir, VARLIST_DIR) != 0;
 	char pre_c[16], pre_r[16], pre_n[16];
 	snprintf(pre_n, sizeof(pre_n), "nv_%08x_", (unsigned)fnv_str(s_fs_nbg));
-	int nn = 0;
+	int nn = *pnn;
 	snprintf(pre_c, sizeof(pre_c), "cv_%08x_", (unsigned)fnv_str(s_fs_fast));
 	snprintf(pre_r, sizeof(pre_r), "rv_%08x_", (unsigned)fnv_str(s_fs_rbg2));
-	const u64 t0 = RSTV_PROF_T();
-	int nc = 0, nr = 0, nskip = 0;
-	cl_load();
+	int nc = *pnc, nr = *pnr, nskip = *pnskip;
 	SceIoDirent e;
 	// pass 1: this game's listed composite variants + NBG/RBG variants; pass 2 (if a list exists): up to 128 composite variants not yet in the list
 	// (avoids the registration delay on first encounter before the list fills, leaves room for new variants)
@@ -4531,17 +4569,24 @@ static void preload_variants(void)
 	if (pass == 1) {
 		sceIoDclose(d);
 		d = -1;
-		if (!s_cl_loaded || s_nvar >= 128 || (d = sceIoDopen(VARLIST_DIR)) < 0)
+		if (!s_cl_loaded || s_nvar >= 128 || (d = sceIoDopen(dir)) < 0)
 			break;
 	}
 	while (sceIoDread(d, &e) > 0) {
+		if (shipped) { // (the user's cache has its own copy: already read)
+			char up[160];
+			SceIoStat ust;
+			snprintf(up, sizeof(up), VARLIST_DIR "/%s", e.d_name);
+			if (sceIoGetstat(up, &ust) >= 0)
+				continue;
+		}
 		if (s_cmp_spec && !strncmp(e.d_name, pre_c, 12) && s_nvar < (pass ? 128 : MAX_VARIANTS)) {
 			if (s_cl_loaded && cl_has((uint32_t)strtoul(e.d_name + 12, NULL, 16)) != !pass) {
 				nskip += pass == 0; // outside the list (another game, or not yet confirmed)
 				continue;
 			}
 			char path[160];
-			snprintf(path, sizeof(path), VARLIST_DIR "/%s", e.d_name);
+			snprintf(path, sizeof(path), "%s/%s", dir, e.d_name);
 			FILE *f = fopen(path, "rb");
 			if (!f)
 				continue;
@@ -4629,6 +4674,21 @@ static void preload_variants(void)
 	}
 	if (d >= 0)
 		sceIoDclose(d);
+	*pnc = nc;
+	*pnr = nr;
+	*pnn = nn;
+	*pnskip = nskip;
+}
+static void preload_variants(void)
+{
+	char pre_c[16], pre_r[16];
+	snprintf(pre_c, sizeof(pre_c), "cv_%08x_", (unsigned)fnv_str(s_fs_fast));
+	snprintf(pre_r, sizeof(pre_r), "rv_%08x_", (unsigned)fnv_str(s_fs_rbg2));
+	const u64 t0 = RSTV_PROF_T();
+	int nc = 0, nr = 0, nn = 0, nskip = 0;
+	cl_load();
+	preload_dir(VARLIST_DIR, &nc, &nr, &nn, &nskip);
+	preload_dir("app0:shaders", &nc, &nr, &nn, &nskip);
 	// ADR-066: migration of cached variants from the previous source: worker thread reads files (mig_scan), main registers a few per frame (mig_take)
 	if (!s_preload_again) {
 		s_mig_pending = 1;

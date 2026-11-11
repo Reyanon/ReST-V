@@ -7,6 +7,7 @@
 
 #include <psp2/common_dialog.h>
 #include <psp2/display.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
@@ -123,6 +124,66 @@ static int make_rt(int w, int h, int scenes, SceGxmRenderTarget **rt)
 	p.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
 	p.driverMemBlock = -1;
 	return sceGxmCreateRenderTarget(&p, rt);
+}
+
+// ADR-246 (owner): a new app version starts with an empty shader cache: the shaders of the old one (and its variant lists)
+// are deleted, the new version's come from app0:shaders/ or are compiled again. SHADER_DIR/version holds the version
+// the cache belongs to
+static int cache_delete_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	char path[160];
+	int n = 0;
+	const SceUID d = sceIoDopen(SHADER_DIR "_old");
+	if (d >= 0) {
+		SceIoDirent e;
+		while (sceIoDread(d, &e) > 0) {
+			if (SCE_S_ISDIR(e.d_stat.st_mode))
+				continue;
+			snprintf(path, sizeof(path), SHADER_DIR "_old/%s", e.d_name);
+			if (sceIoRemove(path) >= 0)
+				n++;
+		}
+		sceIoDclose(d);
+	}
+	sceIoRmdir(SHADER_DIR "_old");
+	RSTV_LOG("gx: old shader cache deleted (%d files)", n);
+	return sceKernelExitDeleteThread(0);
+}
+void gx_cache_version(const char *version)
+{
+	char path[160], old[64] = "";
+	snprintf(path, sizeof(path), SHADER_DIR "/version");
+	FILE *f = fopen(path, "r");
+	if (f) {
+		if (!fgets(old, sizeof(old), f))
+			old[0] = 0;
+		fclose(f);
+		old[strcspn(old, "\r\n")] = 0;
+	}
+	if (strcmp(old, version)) {
+		// the old cache is renamed at once (deleting ~800 files one by one held the start for about 40 s on the Vita)
+		// and deleted by a low-priority thread below
+		sceIoRmdir(SHADER_DIR "_old"); // (only goes if an earlier delete finished)
+		if (sceIoRename(SHADER_DIR, SHADER_DIR "_old") < 0)
+			RSTV_LOG("gx: shader cache rename failed");
+		sceIoMkdir(SHADER_DIR, 0777);
+		snprintf(path, sizeof(path), SHADER_DIR "/version");
+		f = fopen(path, "w");
+		if (f) {
+			fprintf(f, "%s\n", version);
+			fclose(f);
+		}
+		RSTV_LOG("gx: shader cache of %s set aside for %s", old[0] ? old : "an older version", version);
+	}
+	// an old cache left aside (now, or by a start that ended before its delete finished): delete it in the background
+	SceIoStat st;
+	if (sceIoGetstat(SHADER_DIR "_old", &st) >= 0) {
+		const SceUID t = sceKernelCreateThread("rstv_shdel", cache_delete_thread, 191, 0x2000, 0, 0, NULL);
+		if (t >= 0)
+			sceKernelStartThread(t, 0, NULL);
+	}
 }
 
 int gx_init(int vsync)
@@ -419,6 +480,11 @@ static const SceGxmProgram *compile_uncached(const char *src, int fragment, uint
 	if (!(s_fresh && fragment))
 #endif
 	f = fopen(path, "rb");
+	if (!f) { // ADR-243: shaders the app ships compiled (app0:shaders/, the same names): no 4-8 s compile on a first run
+		char pk[96];
+		snprintf(pk, sizeof(pk), "app0:shaders/%08x.gxp", (unsigned)h);
+		f = fopen(pk, "rb");
+	}
 	if (f) {
 		fseek(f, 0, SEEK_END);
 		long n = ftell(f);
@@ -757,8 +823,15 @@ void *gx_temp(int bytes)
 	return p;
 }
 
+#ifdef RSTV_DEBUG_TOOLS
+int gx_nodraw; // test: no draws in texture scenes (their fixed cost alone; ux0:data/restv/gxnodraw)
+#endif
 void gx_draw(SceGxmPrimitiveType prim, const void *vertices, const uint16_t *indices, int count)
 {
+#ifdef RSTV_DEBUG_TOOLS
+	if (gx_nodraw && !s_scene_disp)
+		return;
+#endif
 	sceGxmSetVertexStream(s_ctx, 0, vertices);
 	const int r = sceGxmDraw(s_ctx, prim, SCE_GXM_INDEX_FORMAT_U16, indices, count);
 	static int logged;

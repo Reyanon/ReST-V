@@ -195,6 +195,14 @@ set(RSTV_VPK_ADD_ARGS -a "${CMAKE_BINARY_DIR}/restv_kctrl.skprx=module/restv_kct
   -a "${CMAKE_SOURCE_DIR}/res/cacert.pem=cacert.pem")
 set(RSTV_VPK_DEPS "${CMAKE_BINARY_DIR}/restv_kctrl.skprx" "${CMAKE_BINARY_DIR}/repad.skprx" "${CMAKE_SOURCE_DIR}/sce_sys_src/blankArtwork.png"
   "${CMAKE_SOURCE_DIR}/res/cacert.pem")
+# ADR-243: compiled shaders shipped as app0:shaders/<hash>.gxp (vita/shader_pack, filled by tools/pull_shaders.sh from a
+# device's cache; names are hashes of the shader source, so stale ones are simply never read)
+file(GLOB RSTV_SHADER_PACK "${CMAKE_SOURCE_DIR}/shader_pack/*.gxp" "${CMAKE_SOURCE_DIR}/shader_pack/*.txt")
+foreach(f ${RSTV_SHADER_PACK})
+  get_filename_component(n "${f}" NAME)
+  list(APPEND RSTV_VPK_ADD_ARGS -a "${f}=shaders/${n}")
+  list(APPEND RSTV_VPK_DEPS "${f}")
+endforeach()
 foreach(f ${RSTV_SCE_SYS_FILES})
   list(APPEND RSTV_VPK_ADD_ARGS -a "${CMAKE_SOURCE_DIR}/${f}=${f}")
   list(APPEND RSTV_VPK_DEPS "${CMAKE_SOURCE_DIR}/${f}")

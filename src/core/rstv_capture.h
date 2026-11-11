@@ -49,9 +49,16 @@ extern RstvLayerCapture rstv_layer_capture[6]; /* Titan layer index */
 
 /* RBG0 rotation capture (GPU rotation renderer, ADR-016). Per line the map position of screen pixel i is
    (x0 + i*dx, y0 + i*dy) before integer truncation; line coefficients with the MSB set make the line transparent. */
+/* ADR-242: per-dot coefficients (deltaKAx != 0): the line in nsub pieces [subx[k], subx[k + 1]), each straight from
+   the exact map positions at its ends (x(i) = sx0[k] + i * sdx[k]), shown if suben[k] (the coefficient MSB at its start) */
+#define RSTV_ROT_SUB 16
 typedef struct {
    float x0, dx, y0, dy;
    u8 enable;
+   u8 nsub;
+   u8 suben[RSTV_ROT_SUB];
+   u16 subx[RSTV_ROT_SUB + 1];
+   float sx0[RSTV_ROT_SUB], sdx[RSTV_ROT_SUB], sy0[RSTV_ROT_SUB], sdy[RSTV_ROT_SUB];
    /* ADR-037 RPMD 3: the rotation parameter window splits the line into nseg runs [sx, ex] using parameter A (sp 0)
       or B (sp 1, coordinates xb0..). nseg 0 = the whole line uses A */
    u8 nseg, enb;
@@ -82,6 +89,8 @@ extern RstvRotCapture rstv_rot_capture;
 /* last RBG0 capture refusal: 1 bitmap, 2 RPMD>=2, 4 window, 8 line colour/coef, 16 per-dot prio, 32 hires,
    64 screenover 3, 128 colour mode, 256 per-dot coef, 512 coef mode 3, 1024 no rotation */
 extern int rstv_rot_why;
+/* ADR-242: per-dot coefficients on the GPU as line pieces (0: such frames to the CPU as before; debug A/B) */
+extern int rstv_rbg_perdot_on;
 
 /* back/line screen drawing into Titan (VIDSoftVdp2DrawStart); the GPU compositor sets rstv_skip_back_line and
    calls rstv_vidsoft_draw_back_line() itself for CPU-composed frames */
