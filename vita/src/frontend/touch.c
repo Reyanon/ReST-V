@@ -9,6 +9,7 @@
 
 #include "frontend/menu.h"
 #include "platform/log.h"
+#include "platform/timer.h"
 
 #define TOUCH_PATH "ux0:data/restv/touch.cfg"
 
@@ -172,6 +173,20 @@ uint32_t rstv_touch_buttons(void)
 		return 0;
 	int x[6], y[6];
 	const int n = rstv_touch_read(x, y);
+	// owner: a coin went in by itself at times when a game started (thuntk): the finger that tapped Play or a game in the
+	// list (the touch Select button sits over that corner) was still down. After a pause in these calls (a game start, a
+	// closed menu, loading: over 100 ms) the touch buttons wait until no finger is down
+	static uint64_t last;
+	static int hold;
+	const uint64_t now = rstv_time_us();
+	if (now - last > 100000)
+		hold = 1;
+	last = now;
+	if (hold) {
+		if (n == 0)
+			hold = 0;
+		return 0;
+	}
 	uint32_t b = 0;
 	for (int k = 0; k < n; k++)
 		for (int i = 0; i < s_n; i++) {

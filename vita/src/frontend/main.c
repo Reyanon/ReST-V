@@ -475,6 +475,16 @@ static void map_player(int pl, const SceCtrlData *pad, uint16_t *pp, uint8_t *sy
 	// coin and start also from assigned buttons (ADR-126, default SELECT, START)
 	if ((nb & rstv_key_code(km[RSTV_ACT_COIN])) || (stick_btn & (1u << 6)))
 		s |= pl ? STV_SYS_COIN2 : STV_SYS_COIN1;
+#ifdef RSTV_DEBUG_TOOLS
+	{ // diag (owner: a coin went in by itself at the start in thuntk): where a coin press comes from
+		static int was[2];
+		const int now = (s & (pl ? STV_SYS_COIN2 : STV_SYS_COIN1)) != 0;
+		if (now && !was[pl])
+			RSTV_LOG("input: %dP coin at f%u (buttons %08x, key %d, stick %x, profile %d)", pl + 1, frame, (unsigned)b,
+				km[RSTV_ACT_COIN], stick_btn, re_pad_player_profile(pl));
+		was[pl] = now;
+	}
+#endif
 	if ((nb & rstv_key_code(km[RSTV_ACT_START])) || (stick_btn & (1u << 7)))
 		s |= pl ? STV_SYS_START2 : STV_SYS_START1;
 	if (pl) {

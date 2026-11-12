@@ -5092,6 +5092,16 @@ int gvdp2_game_start(void)
 		memset(qs[k]->flat_slot, 0xFF, sizeof(qs[k]->flat_slot));
 	}
 	v1gpu_reset();
+	// ADR-249: owner: after a game switch the previous game's picture showed for a moment. Fast boot records VDP1 lists
+	// without drawing them, so the GPU VDP1 framebuffers still held the old game's sprites when the compose started,
+	// and the output sets the old frames. Both to black, as in a new process (gvdp2_game_end waited for the GPU)
+	for (int b = 0; b < 2; b++)
+		if (s_v1rt[b])
+			memset(s_v1rt[b]->data, 0, (size_t)s_v1rt[b]->stride * (size_t)s_v1rt[b]->h);
+	for (int k = 0; k < NSETS; k++)
+		if (s_out_tex[k])
+			memset(s_out_tex[k]->data, 0, (size_t)s_out_tex[k]->stride * (size_t)s_out_tex[k]->h);
+	s_cur = -1;
 	s_frame = 0;
 	// this game's variant list (gvdp2_set_game): its compose variants not loaded yet, and the list noted afresh
 	s_cl_n = 0;

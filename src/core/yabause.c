@@ -197,6 +197,10 @@ int YabauseInit(yabauseinit_struct *init)
   // ReST-V (ADR-211): the cycle remainders start at 0 as in a new process (a game started after another one)
   saved_scsp_cycles = 0;
   saved_m68k_cycles = 0;
+  {
+    extern void rstv_scsp_lag_reset(void);
+    rstv_scsp_lag_reset();
+  }
   q_scsp_frame_start = YabThreadCreateQueue(1);
   q_scsp_finish = YabThreadCreateQueue(1);
   setM68kCounter(0);
@@ -1030,6 +1034,16 @@ static int rstv_scsp_quiesced = 0; /* the frame-end wait was already done by rst
    5 ms for a 12 ms sound frame (2.7 ms a frame on average) */
 int rstv_scsp_depth = 2;
 static int rstv_scsp_out = 0;
+/* ADR-249: a new game in the same process (ADR-211) starts the lag from scratch, as in a new process. Left set, the
+   new sound thread ran its first frame without a start event while the SH-2 side still counted the old game's frames
+   (out / started), so SH-2 and 68K frames were paired differently from a fresh start. thuntk then showed "CREDITS 2"
+   after every game switch with Fast boot on (short SH-2 frames); with this reset, none (3 of 3 switches on the Vita) */
+void rstv_scsp_lag_reset(void)
+{
+  rstv_scsp_lag_started = 0;
+  rstv_scsp_quiesced = 0;
+  rstv_scsp_out = 0;
+}
 
 /* ReST-V save state: wait until the sound thread has finished the frame it was given (between frames only).
    The next SyncCPUtoSCSP skips its wait. */

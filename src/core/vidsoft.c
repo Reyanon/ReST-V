@@ -109,6 +109,8 @@ static INLINE u32 COLSATSTRIPPRIORITY(u32 pixel) { return (0xFF000000 | pixel); 
 
 
 int VIDSoftInit(void);
+void rstv_vdp1rec_reset(void);
+static unsigned rstv_v1fb_seen, rstv_v1fb_until;
 void VIDSoftSetupGL(void);
 void VIDSoftDeInit(void);
 void VIDSoftResize(int,int,unsigned int, unsigned int, int, int);
@@ -2954,6 +2956,9 @@ int VIDSoftInit(void)
 
    vdp1backframebuffer = vdp1framebuffer[0];
    vdp1frontframebuffer = vdp1framebuffer[1];
+#ifdef RSTV
+   rstv_vdp1rec_reset(); /* ADR-249 */
+#endif
    rbg0width = vdp2width = 320;
    vdp2height = 224;
 
@@ -3243,12 +3248,11 @@ void VIDSoftVdp1DrawStart()
          /* the game writes the VDP1 framebuffer itself (pblbeach clears and draws its course into it with the CPU):
             those writes only reach the CPU framebuffer, so VDP1 is drawn on the CPU until 120 frames after the last */
          extern unsigned rstv_v1fb_writes;
-         static unsigned seen, until;
-         if (rstv_v1fb_writes != seen) {
-            seen = rstv_v1fb_writes;
-            until = (unsigned)yabsys.frame_count + 120;
+         if (rstv_v1fb_writes != rstv_v1fb_seen) {
+            rstv_v1fb_seen = rstv_v1fb_writes;
+            rstv_v1fb_until = (unsigned)yabsys.frame_count + 120;
          }
-         if ((int)(until - (unsigned)yabsys.frame_count) > 0)
+         if ((int)(rstv_v1fb_until - (unsigned)yabsys.frame_count) > 0)
             rstv_v1_unsupported(11);
          extern int rstv_v1_force_cpu;
          if (rstv_v1_force_cpu)
@@ -4589,6 +4593,24 @@ u8 rstv_v1_dropped_erase[2]; /* ADR-149/154: a list with an erase was dropped fo
                                  requests: vfremix makes one every frame, and the fighters were cleared away) */
 u8 rstv_v1_erase_pend_gpu[2]; /* GPU framebuffers: kept apart, VDP1 falls back to the CPU while the compose is off
                                  (VDP2 display off at scene changes) and those draws used up the erase (diehard title) */
+/* (rstv_v1fb_seen / rstv_v1fb_until, declared at the top: the CPU drawing window after game writes to the VDP1
+   framebuffer, VIDSoftVdp1DrawStart, in frame numbers) */
+/* ADR-249: a new game in the same process (in-process switch, ADR-211) starts with none of the previous game's
+   recording state. The window above is in frame numbers, which start again at 0: the new game drew VDP1 on the CPU
+   (real draw timing) for the old game's remaining frames, other lists were appended to a stale ready list */
+void rstv_vdp1rec_reset(void)
+{
+   extern unsigned rstv_v1fb_writes;
+   rstv_v1fb_seen = rstv_v1fb_writes;
+   rstv_v1fb_until = 0;
+   rstv_v1rec = rstv_v1unsup = rstv_v1n = rstv_v1_ccn = 0;
+   rstv_v1ready = rstv_v1ready_target = rstv_vdp1_back_idx = 0;
+   rstv_vdp1_gpu_on = 0;
+   rstv_vdp1_gpu_drawn[0] = rstv_vdp1_gpu_drawn[1] = 0;
+   memset(rstv_v1_erase_pend, 0, sizeof(rstv_v1_erase_pend));
+   memset(rstv_v1_dropped_erase, 0, sizeof(rstv_v1_dropped_erase));
+   memset(rstv_v1_erase_pend_gpu, 0, sizeof(rstv_v1_erase_pend_gpu));
+}
 int rstv_vdp1_back_idx_get(void) { return rstv_vdp1_back_idx; }
 void rstv_vdp1_manual_erase_req(void)
 {
