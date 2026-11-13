@@ -209,9 +209,12 @@ void rbgq_atlas_rgb_update(uint8_t *argb, int pitch_px, const uint8_t *vram, con
 uint32_t rbgq_shade(const RstvRotCapture *c, const uint8_t *pages, const uint8_t *table, const uint8_t *table_b, const uint8_t *a4,
 	const uint8_t *a8, const uint8_t *argb, const uint8_t (*pal)[4], int i, int j, int flat)
 {
-	if (j >= c->nrows || !c->row[j].enable)
+	if (j >= c->nrows)
 		return 0;
 	const RstvRotLine *r = &c->row[j];
+	// (window runs decide per run, as gvdp2 draws them: a B run is shown on a line whose A is off)
+	if (!r->enable && !r->nseg)
+		return 0;
 	float x0 = r->x0, dx = r->dx, y0 = r->y0, dy = r->dy;
 	int so = c->screenover;
 	if (r->nsub) {
@@ -221,6 +224,12 @@ uint32_t rbgq_shade(const RstvRotCapture *c, const uint8_t *pages, const uint8_t
 			k++;
 		if (!r->suben[k])
 			return 0;
+		if (r->subb[k] && c->two_maps) { // ADR-250: a parameter B piece (B map, ADR-046/071)
+			if (!table_b)
+				return 0;
+			table = table_b;
+			so = c->screenover_b;
+		}
 		x0 = r->sx0[k]; dx = r->sdx[k]; y0 = r->sy0[k]; dy = r->sdy[k];
 	} else if (r->nseg) {
 		// line spans (ADR-037 rotation parameter window, ADR-063 layer window): nothing drawn outside spans, B spans use B coords
@@ -228,6 +237,8 @@ uint32_t rbgq_shade(const RstvRotCapture *c, const uint8_t *pages, const uint8_t
 		while (k < r->nseg && !(r->sx[k] <= i && i <= r->ex[k]))
 			k++;
 		if (k == r->nseg)
+			return 0;
+		if (!r->sp[k] && !r->enable)
 			return 0;
 		if (r->sp[k]) {
 			if (!r->enb)

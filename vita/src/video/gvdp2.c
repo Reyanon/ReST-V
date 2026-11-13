@@ -1187,6 +1187,7 @@ static GxProg *cmp_variant(const FrameSet *s, GxParam **loc)
 // ---- stage 2: NBG layer shader (vidsoft Vdp2DrawScroll's MapCalcXY + PatternAddr + FetchPixel + GetAlpha) ----
 // ---- cell quad path (ADR-014) ----
 #define MAXQ 16384 // quad cap per layer (pixel shader if exceeded). 16384 x 4 vertices = u16 index limit (ADR-052)
+_Static_assert(RSTV_CAP_ROWS * RSTV_ROT_PIECES <= MAXQ, "RBG0 pieces past the quad index buffer (ADR-250)");
 static GxProg *s_prog_q, *s_prog_clear, *s_prog_qrgb;
 static GxParam s_qloc[8], s_qrloc[8];
 enum { QR_scale, QR_tRgb, QR_qcfg, QR_qcodeLo, QR_qcodeHi, QR_COUNT };
@@ -3184,6 +3185,18 @@ static void capture_layers(void)
 	rstv_capture_mode = 0;
 	s_stats.rbg_why = (unsigned)rstv_rot_why;
 	s_stats.t_core += RSTV_PROF_T() - tp;
+	{ // diag: frames whose RBG0 went to the CPU drawer, and their reasons, every 60 frames
+		static unsigned n, cpu, why;
+		if (rstv_rot_why) {
+			cpu++;
+			why |= (unsigned)rstv_rot_why;
+		}
+		if (++n == 60) {
+			if (cpu)
+				RSTV_LOG("gvdp2: RBG0 on the CPU %u of 60 frames (why %x)", cpu, why);
+			n = cpu = why = 0;
+		}
+	}
 }
 
 // second half of layer prep (ADR-025): reads only the snapshot. On the worker thread (CPU2) or main
@@ -3338,8 +3351,12 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 			// RBG0 rotation: draw on GPU, or on CPU if not possible (not drawn in capture mode)
 			const RstvRotCapture *rc = &rstv_rot_capture;
 			const int h = s->h < rc->nrows ? s->h : rc->nrows;
-			// up to RSTV_ROT_SUB spans per line (ADR-242 per-dot pieces; 4 for the window runs)
-			float *v = (s_prog_rbg && h > 0) ? (float *)gx_temp(h * RSTV_ROT_SUB * 16 * (int)sizeof(float)) : NULL;
+			// quads: one a line, its window runs, or its pieces (ADR-242/250 per-dot coefficients, up to RSTV_ROT_PIECES)
+			int nquad = 0;
+			for (int y = 0; y < h; y++)
+				nquad += rc->row[y].nsub ? rc->row[y].nsub : rc->row[y].nseg ? rc->row[y].nseg : 1;
+			// (never past the quad index buffer: indices beyond it made the GPU read out of bounds and the Vita power off)
+			float *v = (s_prog_rbg && h > 0 && nquad <= MAXQ) ? (float *)gx_temp(nquad * 16 * (int)sizeof(float)) : NULL;
 			float *vb = NULL;
 			int okb = 1;
 			uint32_t bank_b[4] = { 0, 0, 0, 0 };
@@ -3358,7 +3375,7 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 				memcpy(&cb, rc, offsetof(RstvRotCapture, nrows));
 				memcpy(cb.planetbl, rc->planetbl_b, sizeof(cb.planetbl));
 				cb.screenover = rc->screenover_b;
-				vb = (float *)gx_temp(h * 4 * 4 * 4 * (int)sizeof(float));
+				vb = (float *)gx_temp(nquad * 16 * (int)sizeof(float)); // (B runs or pieces, ADR-250)
 				// in plane mode the B map is separate (own decode cache and texture), otherwise it shares page slots with A
 				RbgqState *qb = flat ? &s_rbgq_b : &s_rbgq;
 				okb = vb && rbgq_prepare(qb, &cb, s_snap_vram, rbg_stamp, rbg_serial, s_frame,
@@ -3385,8 +3402,14 @@ static void prep_b(FrameSet *s, u8 *front, u64 tp)
 							const float mc = rl->sx0[k] + (xe - 0.5f) * rl->sdx[k], md = rl->sy0[k] + (xe - 0.5f) * rl->sdy[k];
 							const float d[16] = { ns, n0, ma, mb, ne, n0, mc, md, ns, n1, ma, mb, ne, n1, mc, md };
 							rvh = mixw(rvh, d, sizeof(d));
-							memcpy(v + n * 16, d, sizeof(d));
-							n++;
+							if (rl->subb[k] && vb) { // ADR-250: a parameter B piece on B's map
+								MIXV(rvh, 1);
+								memcpy(vb + nb * 16, d, sizeof(d));
+								nb++;
+							} else {
+								memcpy(v + n * 16, d, sizeof(d));
+								n++;
+							}
 						}
 						continue;
 					}

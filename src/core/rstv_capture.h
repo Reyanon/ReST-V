@@ -52,13 +52,18 @@ extern RstvLayerCapture rstv_layer_capture[6]; /* Titan layer index */
 /* ADR-242: per-dot coefficients (deltaKAx != 0): the line in nsub pieces [subx[k], subx[k + 1]), each straight from
    the exact map positions at its ends (x(i) = sx0[k] + i * sdx[k]), shown if suben[k] (the coefficient MSB at its start) */
 #define RSTV_ROT_SUB 16
+/* ADR-250: the pieces also carry the window runs (rotation parameter window RPMD 3, layer window) when A or B has
+   per-dot coefficients: subb[k] = the piece uses parameter B (its map, ADR-046). At most RSTV_ROT_SUB pieces of each
+   run plus the run edges and the hidden gaps between runs. RSTV_CAP_ROWS * RSTV_ROT_PIECES must stay within the GPU
+   quad index buffer (gvdp2 MAXQ 16384): 192 overran it and the Vita powered off in rsgun's boss scenes */
+#define RSTV_ROT_PIECES 64
 typedef struct {
    float x0, dx, y0, dy;
    u8 enable;
    u8 nsub;
-   u8 suben[RSTV_ROT_SUB];
-   u16 subx[RSTV_ROT_SUB + 1];
-   float sx0[RSTV_ROT_SUB], sdx[RSTV_ROT_SUB], sy0[RSTV_ROT_SUB], sdy[RSTV_ROT_SUB];
+   u8 suben[RSTV_ROT_PIECES], subb[RSTV_ROT_PIECES];
+   u16 subx[RSTV_ROT_PIECES + 1];
+   float sx0[RSTV_ROT_PIECES], sdx[RSTV_ROT_PIECES], sy0[RSTV_ROT_PIECES], sdy[RSTV_ROT_PIECES];
    /* ADR-037 RPMD 3: the rotation parameter window splits the line into nseg runs [sx, ex] using parameter A (sp 0)
       or B (sp 1, coordinates xb0..). nseg 0 = the whole line uses A */
    u8 nseg, enb;

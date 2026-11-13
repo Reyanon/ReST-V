@@ -361,6 +361,38 @@ static void check_rbg(void)
 	int tw = 0;
 	const struct PixelData *buf = TitanGetLayerBuffer(4, &tw);
 	const int w = vdp2width, h = vdp2height < 256 ? vdp2height : 256;
+	{ // RSTV_RBGSHOT=N: RBG0 of the Nth checked frame as rbgshot_cpu.ppm / rbgshot_ref.ppm (CPU drawer / GPU reference)
+		static long shot = -2;
+		if (shot == -2)
+			shot = getenv("RSTV_RBGSHOT") ? atol(getenv("RSTV_RBGSHOT")) : -1;
+		if (shot >= 0 && (long)s_r_frames == shot) {
+			FILE *fc = fopen("rbgshot_cpu.ppm", "wb"), *fr = fopen("rbgshot_ref.ppm", "wb");
+			if (fc && fr) {
+				fprintf(fc, "P6 %d %d 255\n", w, h);
+				fprintf(fr, "P6 %d %d 255\n", w, h);
+				for (int y = 0; y < h; y++)
+					for (int x = 0; x < w; x++) {
+						const u32 a = titan_px(buf + y * tw + x);
+						const u32 b = rbgq_shade(c, s_pages, s_table, have_b ? s_table_b : NULL, s_a4, s_a8, s_argb,
+							(const uint8_t (*)[4])s_pal, x, y, fl);
+						const uint8_t pa[3] = { (uint8_t)a, (uint8_t)(a >> 8), (uint8_t)(a >> 16) };
+						const uint8_t pb[3] = { (uint8_t)b, (uint8_t)(b >> 8), (uint8_t)(b >> 16) };
+						fwrite(pa, 1, 3, fc);
+						fwrite(pb, 1, 3, fr);
+					}
+			}
+			if (fc) fclose(fc);
+			if (fr) fclose(fr);
+			for (int y = 20; y < h; y += 40) {
+				const RstvRotLine *rr = &c->row[y];
+				printf("rbgshot row %d: en %d nsub %d nseg %d enb %d x0 %.1f dx %.3f y0 %.1f dy %.3f", y, rr->enable, rr->nsub, rr->nseg,
+					rr->enb, rr->x0, rr->dx, rr->y0, rr->dy);
+				for (int k = 0; k < rr->nsub && k < 6; k++)
+					printf(" [%d en %d b %d]", rr->subx[k], rr->suben[k], rr->subb[k]);
+				printf("%c", 10);
+			}
+		}
+	}
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) {
 			const u32 want = titan_px(buf + y * tw + x);

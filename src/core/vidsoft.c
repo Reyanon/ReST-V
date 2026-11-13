@@ -79,6 +79,8 @@ int Rbg0CheckRam(Vdp2* regs);
 #include "threads.h"
 
 #include <stdlib.h>
+#include <math.h>
+#include <time.h>
 #include <limits.h>
 
 #if defined WORDS_BIGENDIAN
@@ -1501,6 +1503,164 @@ int Rbg0CheckRam(Vdp2* regs)
 int rstv_rbg_unrot_on = 1; /* ADR-083; 0: ux0:data/restv/norbgunrot */
 int rstv_rbg_perdot_on = 1; /* ADR-242; 0: ux0:data/restv/noperdot (debug builds) */
 volatile int rstv_rbg_unrot_seen; /* ADR-083 diagnostics: frames captured as unrotated (the frontend can take a picture) */
+/* ADR-242/250: map position and coefficient MSB of dot i (Vdp2DrawRotationFP's per-dot coefficient read; the line
+   end i = W takes the last dot's coefficient) */
+#ifndef __vita__
+static unsigned rstv_rot_dots; /* (diag: harness RSTV_ROTTIME) */
+#endif
+static void rstv_rot_dot(vdp2rotationparameterfp_struct *q, fixed32 Xsp, fixed32 Ysp, u32 cy, u32 rcy, int i, int W, u8 *ram,
+                         double *x, double *y, int *msb)
+{
+   const int ic = i < W ? i : W - 1;
+#ifndef __vita__
+   rstv_rot_dots++;
+#endif
+   const u32 idx = (u32)(cy + ic * toint(q->deltaKAx) + toint(ic * decipart(q->deltaKAx) + rcy));
+   Vdp2ReadCoefficientFP(q, q->coeftbladdr + idx * q->coefdatasize, ram);
+   *msb = q->msb;
+   *x = (double)q->kx * ((double)Xsp + (double)q->dX * i) / 4294967296.0 + (double)q->Xp / 65536.0;
+   *y = (double)q->ky * ((double)Ysp + (double)q->dY * i) / 4294967296.0 + (double)q->Yp / 65536.0;
+}
+
+/* the coefficient MSB of dot i alone (no map position): the edge search reads only this */
+static int rstv_rot_msb(vdp2rotationparameterfp_struct *q, u32 cy, u32 rcy, int i, int W, u8 *ram)
+{
+   const int ic = i < W ? i : W - 1;
+   const u32 idx = (u32)(cy + ic * toint(q->deltaKAx) + toint(ic * decipart(q->deltaKAx) + rcy));
+   const u32 a = q->coeftbladdr + idx * q->coefdatasize;
+   return q->coefdatasize == 2 ? (T1ReadWord(ram, a) >> 15) & 1 : (T1ReadLong(ram, a) >> 31) & 1;
+}
+
+typedef struct {
+   vdp2rotationparameterfp_struct *q; /* the parameter of the run */
+   fixed32 Xs, Ys;                    /* its line start (Xsp, Ysp) */
+   u32 cy, rcy;                       /* its coefficient line position */
+   int W, b, np;
+   u8 *ram;
+   RstvRotLine *r;
+} RstvPieceCtx;
+
+static int rstv_piece_add(RstvRotLine *r, int *np, int i0, int en, int b, double x0, double dx, double y0, double dy)
+{
+   if (*np >= RSTV_ROT_PIECES)
+      return 0;
+   r->subx[*np] = (u16)i0;
+   r->suben[*np] = (u8)(en != 0);
+   r->subb[*np] = (u8)b;
+   r->sx0[*np] = (float)x0;
+   r->sdx[*np] = (float)dx;
+   r->sy0[*np] = (float)y0;
+   r->sdy[*np] = (float)dy;
+   (*np)++;
+   return 1;
+}
+
+/* ADR-250: run [s0, s1) of a per-dot parameter as pieces, each straight between exact map positions at its ends (dot i
+   with the coefficient read at dot i; the run end takes the last dot's). Cut first at the RSTV_ROT_SUB line boundaries,
+   then (1) where the coefficient MSB changes inside a piece, halved down to the dot (the transparent edge); then (2),
+   level by level over the whole run while the budget lasts, pieces whose middle dot is more than RSTV_RUN_TEXELS off their
+   straight line (the coefficients make the scale a curve: rsgun's floors seen from the side). Edges first: with
+   position splits first the budget ran out on one side and the edges stayed 22 dots coarse (stairs) */
+#define RSTV_RUN_PTS (RSTV_ROT_PIECES + 1)
+#define RSTV_RUN_END 0xFF
+/* position tolerance in map texels, times the texels a screen dot spans when that is more than one: RBG0 is drawn at
+   half width (ADR-245); 1 texel everywhere took 6 ms a frame on the Vita in rsgun's boss (~280 ns a dot) for no
+   visible difference */
+#define RSTV_RUN_TEXELS 2.0
+/* fin: the piece from here passed the position test. The points form a list in dot order (nx); a sorted array with
+   memmove inserts cost 6 ms a frame on the Vita (rsgun boss), the list inserts in place */
+typedef struct { int i, m, fin; double x, y; } RstvRunPt;
+static int rstv_run_pieces(RstvPieceCtx *t, int s0, int s1, int budget)
+{
+   RstvRunPt pt[RSTV_RUN_PTS];
+   u8 nx[RSTV_RUN_PTS];
+   const int W = t->W, nsub = W < RSTV_ROT_SUB ? W : RSTV_ROT_SUB;
+   int n = 0, k, a, grew;
+#define RSTV_RUN_DOT(p_) rstv_rot_dot(t->q, t->Xs, t->Ys, t->cy, t->rcy, (p_)->i, W, t->ram, &(p_)->x, &(p_)->y, &(p_)->m)
+   /* points: run start, the line boundaries inside, run end (always: over a line these are at most RSTV_ROT_SUB plus
+      the runs, well inside RSTV_ROT_PIECES; the budget only limits the refining) */
+   for (k = 0; k <= nsub; k++)
+   {
+      const int i = k == 0 ? s0 : k * W / nsub;
+      if (k > 0 && (i <= s0 || i >= s1))
+         continue;
+      pt[n].i = i;
+      pt[n].fin = 0;
+      RSTV_RUN_DOT(&pt[n]);
+      nx[n] = (u8)(n + 1);
+      n++;
+   }
+   pt[n].i = s1;
+   pt[n].fin = 1;
+   RSTV_RUN_DOT(&pt[n]);
+   nx[n] = RSTV_RUN_END;
+   n++;
+   if (budget > RSTV_RUN_PTS - 1)
+      budget = RSTV_RUN_PTS - 1;
+   if (budget > RSTV_ROT_PIECES - t->np)
+      budget = RSTV_ROT_PIECES - t->np;
+   /* (1) MSB edges to the dot */
+   for (a = 0; nx[a] != RSTV_RUN_END && n <= budget;)
+   {
+      RstvRunPt *p0 = &pt[a], *p1 = &pt[nx[a]];
+      if (p1->i - p0->i >= 2)
+      {
+         if (rstv_rot_msb(t->q, t->cy, t->rcy, p1->i - 1, W, t->ram) != p0->m)
+         {
+            RstvRunPt *q = &pt[n];
+            q->i = (p0->i + p1->i) / 2;
+            q->fin = 0;
+            RSTV_RUN_DOT(q);
+            nx[n] = nx[a];
+            nx[a] = (u8)n;
+            n++;
+            continue; /* look at the left half again */
+         }
+      }
+      a = nx[a];
+   }
+   /* (2) position, a level at a time */
+   do
+   {
+      grew = 0;
+      for (a = 0; nx[a] != RSTV_RUN_END && n <= budget;)
+      {
+         RstvRunPt *p0 = &pt[a], *p1 = &pt[nx[a]], *q = &pt[n];
+         if (p0->fin || p1->i - p0->i < 2)
+         {
+            a = nx[a];
+            continue;
+         }
+         q->i = (p0->i + p1->i) / 2;
+         q->fin = 0;
+         RSTV_RUN_DOT(q);
+         const double w = (double)(p1->i - p0->i), f = (double)(q->i - p0->i) / w;
+         /* (in screen dots: where one dot spans many texels, near a horizon, the picture is sampling noise anyway) */
+         const double sl = fabs(p1->x - p0->x) / w + fabs(p1->y - p0->y) / w, tol = RSTV_RUN_TEXELS * (sl > 1.0 ? sl : 1.0);
+         if (fabs(q->x - (p0->x + (p1->x - p0->x) * f)) <= tol && fabs(q->y - (p0->y + (p1->y - p0->y) * f)) <= tol)
+         {
+            p0->fin = 1; /* (not tested again) */
+            a = nx[a];
+            continue;
+         }
+         nx[n] = nx[a];
+         nx[a] = (u8)n;
+         a = nx[n]; /* (both halves wait for the next level) */
+         n++;
+         grew = 1;
+      }
+   } while (grew && n <= budget);
+#undef RSTV_RUN_DOT
+   for (a = 0; nx[a] != RSTV_RUN_END; a = nx[a])
+   {
+      const RstvRunPt *p0 = &pt[a], *p1 = &pt[nx[a]];
+      const double w = (double)(p1->i - p0->i), ddx = (p1->x - p0->x) / w, ddy = (p1->y - p0->y) / w;
+      if (!rstv_piece_add(t->r, &t->np, p0->i, !p0->m, t->b, p0->x - ddx * p0->i, ddx, p0->y - ddy * p0->i, ddy))
+         return 0;
+   }
+   return 1;
+}
+
 static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_struct *parameter, Vdp2 *regs, u8 *ram)
 {
    vdp2rotationparameterfp_struct *p = &parameter[info->rotatenum];
@@ -1528,9 +1688,20 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
          KTCTL 0x11 with LNCLEN 0: RBG0 went to the CPU, 27 ms a frame) */
       ((regs->KTCTL & 0x1010) && (regs->LNCLEN & 0x10) ? 8 : 0) | (info->specialprimode == 2 ? 16 : 0) | (vdp2_x_hires ? 32 : 0) |
       (!(info->colornumber <= 1 || info->colornumber == 3) ? 128 : 0) |
-      /* ADR-242: per-dot coefficients go to the GPU as line pieces (parameter A, no rotation parameter or layer window) */
-      (p->coefenab && p->deltaKAx != 0 && (!rstv_rbg_perdot_on || (regs->RPMD & 3) >= 2 || (info->wctl & 0x0A)) ? 256 : 0) |
+      /* ADR-242: per-dot coefficients go to the GPU as line pieces. ADR-250: also inside window runs (RPMD 3 parameter
+         window, layer window); RPMD 2 (B chosen by A's coefficient MSB) stays on the CPU */
+      (p->coefenab && p->deltaKAx != 0 && (!rstv_rbg_perdot_on || (regs->RPMD & 3) == 2) ? 256 : 0) |
       (p->coefenab && p->coefmode > 2 ? 512 : 0);
+#ifndef __vita__
+   { /* diag (harness RSTV_ROTWHY): the reject reason and the registers behind it, one line every 60 frames */
+      static int lg = -1;
+      if (lg < 0) lg = getenv("RSTV_ROTWHY") != NULL;
+      if (lg && yabsys.frame_count % 60 == 0)
+         fprintf(stderr, "rotwhy f%u why %x RPMD %x WCTLC %x WCTLD %x wctl %x coefA en %d mode %d dKAx %d bmp %d cn %d rotnum %d\n",
+                 (unsigned)yabsys.frame_count, rstv_rot_why, regs->RPMD, regs->WCTLC, regs->WCTLD, info->wctl, p->coefenab,
+                 p->coefmode, p->deltaKAx, info->isbitmap, info->colornumber, info->rotatenum);
+   }
+#endif
    if (rstv_rot_why)
       return 0;
    /* ADR-083: no coefficients and no rotation (IsScreenRotatedFP is true when the plane is NOT rotated):
@@ -1573,7 +1744,8 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
       CalculateRotationValuesFP(p2);
       SetupScreenVars(info, &sinfo2, p2->PlaneAddr, regs);
       /* the GPU keeps one map: B must use the same map layout and screen-over mode, line coefficients only */
-      rstv_rot_why = ((p2->coefenab && (p2->deltaKAx != 0 || p2->coefmode > 2)) ? 0x1000 : 0) |
+      rstv_rot_why = ((p2->coefenab && ((p2->deltaKAx != 0 && (!rstv_rbg_perdot_on || (regs->RPMD & 3) != 3)) ||
+                                       p2->coefmode > 2)) ? 0x1000 : 0) |
          (p2->screenover != p->screenover && info->isbitmap ? 0x2000 : 0) |
          (sinfo2.xmask != sinfo.xmask || sinfo2.ymask != sinfo.ymask ? 0x4000 : 0);
       if (rstv_rot_why)
@@ -1745,39 +1917,8 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
          r->dx = (float)((double)p->kx * (double)p->dX / 4294967296.0);
          r->y0 = (float)((double)p->ky * (double)Ysp / 4294967296.0 + (double)p->Yp / 65536.0);
          r->dy = (float)((double)p->ky * (double)p->dY / 4294967296.0);
-         if (p->coefenab && p->deltaKAx != 0)
-         {
-            /* ADR-242: per-dot coefficients (Vdp2DrawRotationFP reads one at every dot: dot i takes entry
-               coefy + i * int(dKAx) + int(i * frac(dKAx) + rcoefy)). The line in RSTV_ROT_SUB pieces, each straight
-               between the exact positions at its ends; a piece is shown if its first dot's coefficient MSB is clear */
-            const int nsub = rbg0width < RSTV_ROT_SUB ? rbg0width : RSTV_ROT_SUB;
-            double ex[RSTV_ROT_SUB + 1], ey[RSTV_ROT_SUB + 1];
-            u8 en[RSTV_ROT_SUB + 1];
-            int k;
-            for (k = 0; k <= nsub; k++)
-            {
-               const int i = k * rbg0width / nsub;
-               const int ic = i < rbg0width ? i : rbg0width - 1; /* (the end: the last dot's coefficient) */
-               const u32 idx = (u32)(coefy + ic * toint(p->deltaKAx) + toint(ic * decipart(p->deltaKAx) + rcoefy));
-               Vdp2ReadCoefficientFP(p, p->coeftbladdr + idx * p->coefdatasize, ram);
-               en[k] = !p->msb;
-               ex[k] = (double)p->kx * ((double)Xsp + (double)p->dX * i) / 4294967296.0 + (double)p->Xp / 65536.0;
-               ey[k] = (double)p->ky * ((double)Ysp + (double)p->dY * i) / 4294967296.0 + (double)p->Yp / 65536.0;
-               r->subx[k] = (u16)i;
-            }
-            for (k = 0; k < nsub; k++)
-            {
-               const double w = (double)(r->subx[k + 1] - r->subx[k]);
-               const double ddx = (ex[k + 1] - ex[k]) / w, ddy = (ey[k + 1] - ey[k]) / w;
-               r->sdx[k] = (float)ddx;
-               r->sdy[k] = (float)ddy;
-               r->sx0[k] = (float)(ex[k] - ddx * r->subx[k]);
-               r->sy0[k] = (float)(ey[k] - ddy * r->subx[k]);
-               r->suben[k] = en[k];
-            }
-            r->nsub = (u8)nsub;
-            r->enable = 1;
-         }
+         /* ADR-242: per-dot coefficients (Vdp2DrawRotationFP reads one at every dot): the line becomes pieces below
+            (ADR-250) */
       }
       if (lwin && !rpwin)
       {
@@ -1820,6 +1961,90 @@ static int rstv_capture_rotation(vdp2draw_struct *info, vdp2rotationparameterfp_
             r->enable = 0;
          r->nseg = (u8)n;
       }
+      {
+         /* ADR-250: per-dot coefficients as line pieces, also inside window runs (rsgun bosses: RPMD 3 with per-dot A and
+            B, 75 ms a frame on the CPU): each run becomes pieces of its own parameter; with per-dot coefficients the
+            run is cut at the RSTV_ROT_SUB boundaries and each piece refined (rstv_piece_refine); gaps between runs are
+            hidden pieces */
+         const int pdA = p->coefenab && p->deltaKAx != 0 && !unrot && !lineb;
+         const int pdB = rpwin && p2 && p2->coefenab && p2->deltaKAx != 0;
+         u8 rsp[4];
+         u16 rsx[4], rex[4];
+         int nrun = 0;
+         if (r->nseg)
+         {
+            for (nrun = 0; nrun < r->nseg; nrun++)
+            {
+               rsp[nrun] = r->sp[nrun];
+               rsx[nrun] = r->sx[nrun];
+               rex[nrun] = r->ex[nrun];
+            }
+         }
+         else if (pdA && !lwin && !rpwin)
+         {
+            rsp[0] = 0; rsx[0] = 0; rex[0] = (u16)(rbg0width - 1);
+            nrun = 1;
+         }
+         if ((pdA || pdB) && (lwin || rpwin) && r->nseg == 0)
+            r->nsub = 0; /* (every dot outside the windows) */
+         else if ((pdA || pdB) && nrun)
+         {
+            const int W = rbg0width, nsub = W < RSTV_ROT_SUB ? W : RSTV_ROT_SUB;
+            RstvPieceCtx t;
+            int at = 0, sg, ok = 1;
+            t.r = r;
+            t.np = 0;
+            t.W = W;
+            t.ram = ram;
+            for (sg = 0; sg < nrun && ok; sg++)
+            {
+               const int b = rsp[sg], s0 = rsx[sg], s1 = rex[sg] + 1;
+               if (s0 > at)
+                  ok = rstv_piece_add(r, &t.np, at, 0, 0, 0, 0, 0, 0);
+               if (!ok)
+                  break;
+               if (!(b ? pdB : pdA))
+               {
+                  /* this parameter's line values (one coefficient a line) */
+                  if (b)
+                     ok = rstv_piece_add(r, &t.np, s0, r->enb, 1, r->xb0, r->dxb, r->yb0, r->dyb);
+                  else
+                     ok = rstv_piece_add(r, &t.np, s0, r->enable, 0, r->x0, r->dx, r->y0, r->dy);
+               }
+               else
+               {
+                  t.q = b ? p2 : p;
+                  t.b = b;
+                  t.Xs = b ? mulfixed(p2->A, xmul2) + mulfixed(p2->B, ymul2) + C2 : mulfixed(p->A, xmul) + mulfixed(p->B, ymul) + C;
+                  t.Ys = b ? mulfixed(p2->D, xmul2) + mulfixed(p2->E, ymul2) + F2 : mulfixed(p->D, xmul) + mulfixed(p->E, ymul) + F;
+                  t.cy = b ? coefy2 : coefy;
+                  t.rcy = b ? rcoefy2 : rcoefy;
+                  /* the run's share of what is left, by width over this and the later runs (gaps and line runs keep 2
+                     entries each) */
+                  int later = 0, wleft = s1 - s0, r2;
+                  for (r2 = sg + 1; r2 < nrun; r2++)
+                  {
+                     later += 2;
+                     if (rsp[r2] ? pdB : pdA)
+                        wleft += rex[r2] + 1 - rsx[r2];
+                  }
+                  ok = rstv_run_pieces(&t, s0, s1, (RSTV_ROT_PIECES - t.np - later - 2) * (s1 - s0) / (wleft > 0 ? wleft : 1));
+               }
+               at = s1;
+            }
+            if (ok && at < W)
+               ok = rstv_piece_add(r, &t.np, at, 0, 0, 0, 0, 0, 0);
+            if (!ok)
+            {
+               rstv_rot_why = 0x10000; /* too many pieces */
+               c->captured = 0;
+               return 0;
+            }
+            r->subx[t.np] = (u16)W;
+            r->nsub = (u8)t.np;
+            r->enable = 1;
+         }
+      }
       xmul += p->deltaXst;
       ymul += p->deltaYst;
       if (p->coefenab)
@@ -1857,6 +2082,24 @@ static void FASTCALL Vdp2DrawRotationFP(vdp2draw_struct *info, vdp2rotationparam
    ReadLineWindowData(&info->islinewindow, info->wctl, &linewnd0addr, &linewnd1addr, regs);
 
    Vdp2ReadRotationTableFP(info->rotatenum, p, regs, ram);
+#ifndef __vita__
+   if (rstv_capture_mode && info->titan_which_layer == TITAN_RBG0 && getenv("RSTV_ROTTIME"))
+   { /* diag (harness RSTV_ROTTIME): time of the RBG0 capture, average every 60 calls */
+      static double tsum; static int tn;
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      const int got = rstv_capture_rotation(info, parameter, regs, ram);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      tsum += (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+      if (++tn == 60) { fprintf(stderr, "rottime %.0f us dots %u\n", tsum / tn, rstv_rot_dots / tn); tsum = 0; tn = 0; rstv_rot_dots = 0; }
+      if (got)
+      {
+         rstv_rbg0_erase_pending = 0;
+         return;
+      }
+   }
+   else
+#endif
    if (rstv_capture_mode && info->titan_which_layer == TITAN_RBG0 && rstv_capture_rotation(info, parameter, regs, ram))
    {
       rstv_rbg0_erase_pending = 0; /* the GPU draws it; the Titan buffer is not read */

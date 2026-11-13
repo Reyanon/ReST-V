@@ -2468,6 +2468,13 @@ int DynarecSh2::RstvTierRun()
   sh->regs.SR.all = GET_SR(); sh->regs.GBR = GET_GBR(); sh->regs.VBR = GET_VBR();
   sh->regs.MACH = GET_MACH(); sh->regs.MACL = GET_MACL(); sh->regs.PR = GET_PR(); sh->regs.PC = GET_PC();
   sh->cycles = 0;
+  // ADR-251: the interpreter's ldc Rm,sr takes interrupts from sh->interrupts. With the recompiler that list is not the
+  // queue (m_IntruptTbl is): it still held what a state load put there, and every interpreted ldc that lowered the mask
+  // took those interrupts again (rsgun: a level-1 DMA end long after the DMA, whose handler was then the SGL halt stub:
+  // the master stopped, 477k cycles a frame of dispatching). Interrupts stay with the recompiler's queue (the tier
+  // run ends after an ldc to sr, then CheckInterupt)
+  const u32 saved_nint = sh->NumberOfInterrupts;
+  sh->NumberOfInterrupts = 0;
   rstv_tier_wnotify++;
   for (int n = 0; n < 256; n++) {
     const u32 pc = sh->regs.PC;
@@ -2486,6 +2493,7 @@ int DynarecSh2::RstvTierRun()
   sh->regs = saved_regs;
   sh->cycles = saved_cycles;
   sh->instruction = saved_instr;
+  sh->NumberOfInterrupts = saved_nint;
   CurrentSH2 = saved_cur;
   m_pDynaSh2->SysReg[4] += cyc ? cyc : 1;
   rstv_tier_runs++;
@@ -6529,7 +6537,14 @@ inline int DynarecSh2::Execute(){
           return 0;
         }
       }
+#if !defined(__vita__)
+      static u32 tlo = 1, thi; // diag (harness RSTV_TIERRANGE=lo,hi hex): tiered execution only for those PCs
+      if (tlo == 1) { const char *e = getenv("RSTV_TIERRANGE"); tlo = 0; thi = 0xFFFFFFFFu; if (e) sscanf(e, "%x,%x", &tlo, &thi); }
+      if (pBlock == NULL && rstv_tier_n && !m_pCompiler->debug_mode_ && rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1] < rstv_tier_n
+          && GET_PC() >= tlo && GET_PC() <= thi) {
+#else
       if (pBlock == NULL && rstv_tier_n && !m_pCompiler->debug_mode_ && rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1] < rstv_tier_n) {
+#endif
         rstv_tier_hot[(GET_PC() & 0x000FFFFF) >> 1]++;
         RstvTierRun();
         if ((GET_SR() & 0xF0) < GET_ICOUNT())
@@ -6694,6 +6709,11 @@ inline int DynarecSh2::Execute(){
         (unsigned)yabsys.frame_count, yabsys.LineCount, GET_PR(), m_pDynaSh2->GenReg[4], m_pDynaSh2->GenReg[5],
         m_pDynaSh2->GenReg[6], m_pDynaSh2->GenReg[7], m_pDynaSh2->GenReg[14], sp, MappedMemoryReadLongNocache(sp), MappedMemoryReadLongNocache(sp + 4),
         MappedMemoryReadLongNocache(sp + 8), MappedMemoryReadLongNocache(sp + 12), MappedMemoryReadLongNocache(sp + 16), MappedMemoryReadLongNocache(sp + 20));
+      for (u32 a = sp + 24; a < sp + 88; a += 32) // (the stack further up: interrupt frames)
+        rstv_log_printf("pctrap stack %08x: %08x %08x %08x %08x %08x %08x %08x %08x", a, MappedMemoryReadLongNocache(a),
+          MappedMemoryReadLongNocache(a + 4), MappedMemoryReadLongNocache(a + 8), MappedMemoryReadLongNocache(a + 12),
+          MappedMemoryReadLongNocache(a + 16), MappedMemoryReadLongNocache(a + 20), MappedMemoryReadLongNocache(a + 24),
+          MappedMemoryReadLongNocache(a + 28));
       for (u32 a = 0x06000700; a < 0x06000760; a += 32)
         rstv_log_printf("pctrap mem %08x: %08x %08x %08x %08x %08x %08x %08x %08x", a, MappedMemoryReadLongNocache(a),
           MappedMemoryReadLongNocache(a + 4), MappedMemoryReadLongNocache(a + 8), MappedMemoryReadLongNocache(a + 12),
@@ -6809,7 +6829,21 @@ int DynarecSh2::CheckInterupt(){
     return 0;
   }
   dlstIntct::iterator pos = m_IntruptTbl.begin();
+#if defined(RSTV)
+  const u32 rstv_iv = (*pos).Vector, rstv_il = (*pos).level, rstv_isr = GET_SR(), rstv_ipc = GET_PC();
+#endif
   if( InterruptRutine((*pos).Vector, (*pos).level ) != 0 ) {
+#if defined(RSTV)
+    { // diag (with pctrap): the first 40 interrupts the master takes (from the pctrap FROM frame)
+      static int n;
+      extern unsigned int rstv_dev_trace_from;
+      if (rstv_dev_trap && !is_slave_ && n < 40 && yabsys.frame_count >= rstv_dev_trace_from) {
+        n++;
+        rstv_log_printf("int M f%u l%d vec %02x lvl %u sr %03x pc %08x", (unsigned)yabsys.frame_count, yabsys.LineCount, rstv_iv, rstv_il,
+          rstv_isr, rstv_ipc);
+      }
+    }
+#endif
     m_IntruptTbl.pop_front();
     if( m_IntruptTbl.size() != 0 ) {
       m_pDynaSh2->SysReg[5] = m_IntruptTbl.begin()->level<<4;
