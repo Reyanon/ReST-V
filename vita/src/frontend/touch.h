@@ -6,7 +6,8 @@
 #include <stdint.h>
 
 // keys an area can press: RSTV_KEY_* (Cross .. Start), then the d-pad
-enum { RSTV_TKEY_UP = 8, RSTV_TKEY_DOWN, RSTV_TKEY_LEFT, RSTV_TKEY_RIGHT, RSTV_TKEY_COUNT };
+// RSTV_TKEY_MENU (owner): opens the menu, as SELECT+START (no key goes to the game)
+enum { RSTV_TKEY_UP = 8, RSTV_TKEY_DOWN, RSTV_TKEY_LEFT, RSTV_TKEY_RIGHT, RSTV_TKEY_MENU, RSTV_TKEY_COUNT };
 // owner: a touch button can also press two keys together (its own, apart from Controls > Combo keys):
 // key = RSTV_TKEY_COMBO + bit mask (1 << RSTV_KEY_*) of the two
 #define RSTV_TKEY_COMBO 256
@@ -30,5 +31,9 @@ const char *rstv_touch_key_name(int key);
 int rstv_touch_read(int *x, int *y);
 // SCE_CTRL_* bits of the areas touched now
 uint32_t rstv_touch_buttons(void);
+// 1 once when a menu touch button was touched (in rstv_touch_buttons since the last call)
+int rstv_touch_menu_take(void);
+// the areas touched in the last rstv_touch_buttons (bit i = area i, the first 64); 0 while the buttons wait for a release
+uint64_t rstv_touch_pressed(void);
 
 #endif

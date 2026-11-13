@@ -908,6 +908,7 @@ static int main_list(int *k)
 		k[n++] = M_FASTBOOT;
 		k[n++] = M_REFRESH;
 		k[n++] = M_UPDATE; // (owner: under Refresh ROM list)
+		k[n++] = M_ABOUT;  // (owner: the options had no About)
 		k[n++] = M_BACK;
 		return n;
 	}
@@ -1109,6 +1110,8 @@ static const char *act_name(int act)
 }
 int rstv_menu_buttons(void) { return s_nbuttons; }
 static int s_page, s_sel, s_main_sel, s_reset_armed, s_state_slot, s_about_scroll, s_dirty = 1;
+static int s_mt_wait_up; // the menu opened with a finger down (a touch Menu button): it is not a tap in the menu
+static int s_about_direct; // About opened from the game list's footer: back closes the options (as ReBOX)
 static int s_drawn_h; // panel height currently drawn on the menu canvas (0 = other content)
 // the footer line on the Controls pages: what the selected row does (NULL: the page's own footer)
 static const char *row_help(int kind)
@@ -1148,7 +1151,7 @@ static const char *page_row_help(void)
 		switch (main_kind(s_sel)) {
 		case M_RESUME: return "Back to the game";
 		case M_RESET: return "Start the game again from power-on (press twice)";
-		case M_TEST: return "The board's TEST switch: the BIOS test menu (in it: L = SERVICE moves, R = TEST enters)";
+		case M_TEST: return "The board's TEST switch: the test menus (in them: Up/Down or L = SERVICE moves, OK or R = TEST selects)";
 		case M_STATES: return "Save the game at this point or load it again (10 slots)";
 		case M_CHEATS: return "This game's cheats (ux0:data/restv/cheats); they apply from the next game start";
 		case M_DISPLAY: return "Screen size, rotation, filter, scanlines, border, FPS and menu colors";
@@ -1422,6 +1425,7 @@ int rstv_menu_should_open(uint32_t buttons)
 	const int open = (combo && !prev_combo) || ps;
 	s_prev_buttons = buttons; // so the same press does not act right away inside the menu
 	if (open) {
+		s_mt_wait_up = 1; // (a finger down now, e.g. on a touch Menu button, is not a tap in the menu; none: cleared at once)
 		if (!s_keep_place) { // (closed with SELECT+START: opens where it was, sub pages too, owner)
 			s_page = PAGE_MAIN;
 			s_sel = 0;
@@ -1821,7 +1825,7 @@ static void change(int dir)
 #define TE_ROW_DEL (RSTV_TKEY_COUNT + 2)
 #define TE_CPOP_N (te_cpop == 2 ? RSTV_COMBO_SRC - 1 : RSTV_COMBO_SRC) // a pair: its first key, then its second (e.g. L, R)
 #define TE_CPOP_RH 26
-#define TE_POP_RH 30 // (with Duplicate the window still fits the screen)
+#define TE_POP_RH 28 // (with Duplicate and Menu the window still fits the screen)
 enum { TE_IDLE, TE_NEW, TE_MOVE, TE_SIZE };
 enum { TE_L = 1, TE_R = 2, TE_T = 4, TE_B = 8 }; // edges being dragged (TE_SIZE)
 static int te_sel = -1, te_mode, te_prev_n, te_sx, te_sy, te_ox, te_oy, te_ow, te_oh, te_moved, te_pop = -1, te_pop_sel;
@@ -2043,8 +2047,8 @@ static void tedit_update(uint32_t pressed)
 			te_nh = (dy < 0 ? -dy : dy) / TE_STEP * TE_STEP;
 			te_nx = dx < 0 ? te_sx - te_nw : te_sx;
 			te_ny = dy < 0 ? te_sy - te_nh : te_sy;
-		} else if (a && te_moved && te_mode == TE_MOVE) {
-			const int nx = te_ox + dx, ny = te_oy + dy;
+		} else if (a && te_moved && te_mode == TE_MOVE) { // owner: in TE_STEP steps too, as the size
+			const int nx = te_ox + dx / TE_STEP * TE_STEP, ny = te_oy + dy / TE_STEP * TE_STEP;
 			a->x = (int16_t)(nx < 0 ? 0 : nx > SCREEN_W - a->w ? SCREEN_W - a->w : nx);
 			a->y = (int16_t)(ny < 0 ? 0 : ny > SCREEN_H - a->h ? SCREEN_H - a->h : ny);
 			rstv_touch_changed();
@@ -2325,6 +2329,12 @@ static uint32_t menu_touch(int o_ok)
 	static int down, x0, y0, last, moved, stopped;
 	int tx[6], ty[6];
 	const int tn = rstv_touch_read(tx, ty);
+	if (s_mt_wait_up) { // owner: the menu closed at once (that finger's release was a tap outside the panel = back)
+		if (!tn)
+			s_mt_wait_up = 0;
+		down = 0;
+		return 0;
+	}
 	const uint32_t ok = o_ok ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS, back = o_ok ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
 	if (tn) {
 		if (!down) {
@@ -2337,7 +2347,14 @@ static uint32_t menu_touch(int o_ok)
 		} else {
 			if (abs(ty[0] - y0) > 12 || abs(tx[0] - x0) > 12)
 				moved = 1;
-			if (moved && !s_pop && s_page != PAGE_ABOUT && x0 >= s_mt_px && x0 < s_mt_px + PANEL_W && y0 >= s_mt_ra &&
+			if (moved && !s_pop && s_page == PAGE_ABOUT) { // (owner) About: the text follows the finger, a line at a time
+				static float acc;
+				const int max = ABOUT_LINES > ABOUT_VISIBLE ? ABOUT_LINES - ABOUT_VISIBLE : 0;
+				acc += (float)(last - ty[0]) / ABOUT_LH;
+				while (acc >= 1.0f) { acc -= 1.0f; if (s_about_scroll < max) s_about_scroll++; }
+				while (acc <= -1.0f) { acc += 1.0f; if (s_about_scroll > 0) s_about_scroll--; }
+				s_dirty = 1;
+			} else if (moved && !s_pop && x0 >= s_mt_px && x0 < s_mt_px + PANEL_W && y0 >= s_mt_ra &&
 				y0 < s_mt_rb) {
 				const float d = (float)(ty[0] - last);
 				s_mtgt -= d;
@@ -2608,7 +2625,7 @@ rstv_menu_result rstv_menu_update(uint32_t buttons)
 	if (pressed & ok)
 		r = confirm();
 	else if (pressed & back) {
-		if (s_page == PAGE_MAIN)
+		if (s_page == PAGE_MAIN || (s_page == PAGE_ABOUT && s_about_direct))
 			r = RSTV_MENU_CLOSE;
 		else
 			back_out();
@@ -2890,8 +2907,15 @@ static void menu_paint(UiCanvas *c, int overlay)
 			if (sy + 2 * lh > s_mtgt + view)
 				s_mtgt = (float)(sy + 2 * lh - view);
 		}
-		if (s_mtgt > maxs) s_mtgt = maxs;
-		if (s_mtgt < 0) s_mtgt = 0;
+		// owner: dragging or gliding past an end shook the rows (the drawn position was set past the end, then eased
+		// back each frame): at the ends both stop, the glide too
+		if (s_mtgt > maxs || s_mtgt < 0) {
+			s_mtgt = s_mtgt > maxs ? (maxs > 0 ? maxs : 0) : 0;
+			if (s_mdrag) {
+				s_mscr = s_mtgt;
+				s_mvel = 0;
+			}
+		}
 		if (s_page != last_page || n != last_n)
 			s_mscr = s_mtgt; // another page: no animation
 		last_page = s_page;
@@ -3329,10 +3353,12 @@ static void tarea(UiCanvas *c, const RstvTouchArea *a, int sel, int edit)
 			for (int i = 0; i < 3; i++)
 				if ((i != 1 || j != 1) && (sel || (i != 1 && j != 1)))
 					ui_rect(c, cx[i] - hs / 2, cy[j] - hs / 2, hs, hs, hc);
-		if (sel) { // its size (in TE_STEP steps)
-			char sz[16];
+		if (sel) { // its size (in TE_STEP steps) and place
+			char sz[24];
 			snprintf(sz, sizeof(sz), "%dx%d", a->w, a->h);
 			ui_text(c, a->x + 4, a->y + a->h - 6, hc, 0.6f, sz);
+			snprintf(sz, sizeof(sz), "%d,%d", a->x, a->y);
+			ui_text(c, a->x + 4, a->y + 14, hc, 0.6f, sz);
 		}
 	}
 }
@@ -3413,6 +3439,7 @@ static void tedit_paint(UiCanvas *c)
 // ---- touch buttons over the game (slot 4, under the other layers): drawn again only when the layout changes ----
 static UiCanvas *s_touch_cv;
 static int s_touch_drawn = -1, s_touch_vis;
+static uint64_t s_touch_pm; // (the presses drawn)
 void rstv_touch_overlay_update(int hidden)
 {
 	const int want = !hidden && g_set.touch_keys && g_set.touch_show && rstv_touch_count() > 0;
@@ -3422,17 +3449,33 @@ void rstv_touch_overlay_update(int hidden)
 		s_touch_vis = 0;
 		return;
 	}
-	if (s_touch_vis && s_touch_drawn == rstv_touch_gen())
+	// owner: a button shows its press (the theme's selection colours, as the editor's selected one). A press change
+	// redraws only the buttons it changed (the canvas commits only what was drawn)
+	const uint64_t pm = rstv_touch_pressed();
+	if (s_touch_vis && s_touch_drawn == rstv_touch_gen()) {
+		const uint64_t ch = pm ^ s_touch_pm;
+		if (!ch)
+			return;
+		for (int i = 0; i < rstv_touch_count() && i < 64; i++)
+			if (ch & (1ull << i)) {
+				const RstvTouchArea *a = rstv_touch_area(i);
+				ui_clear_rect(s_touch_cv, a->x, a->y, a->w, a->h);
+				tarea(s_touch_cv, a, (pm >> i) & 1, 0);
+			}
+		ui_commit(s_touch_cv);
+		s_touch_pm = pm;
 		return;
+	}
 	if (!s_touch_cv)
 		s_touch_cv = ui_canvas(4, 0, 0, SCREEN_W, SCREEN_H);
 	if (!s_touch_cv)
 		return;
 	ui_clear(s_touch_cv);
 	for (int i = 0; i < rstv_touch_count(); i++)
-		tarea(s_touch_cv, rstv_touch_area(i), 0, 0);
+		tarea(s_touch_cv, rstv_touch_area(i), i < 64 && ((pm >> i) & 1), 0);
 	ui_commit(s_touch_cv);
 	s_touch_drawn = rstv_touch_gen();
+	s_touch_pm = pm;
 	s_touch_vis = 1;
 }
 
@@ -3927,6 +3970,45 @@ static void gl_scrollbar(UiCanvas *c, int n, float scr, float rows_f, int la, in
 }
 
 // the list's header: the app name in its colours, the version, the position in the list, the filter with its count
+// the battery in the header (from ReSys12): the charge (0..100) | 0x100 while charging, -1 with none (PS TV, or a
+// value out of range); read at most once a second
+static int s_bat = -1;
+static int bat_poll(void)
+{
+	static uint64_t t;
+	static int read;
+	const uint64_t now = rstv_time_us();
+	if (read && now - t < 1000000)
+		return s_bat;
+	read = 1;
+	t = now;
+	if (re_pad_is_tv()) {
+		s_bat = -1;
+		return s_bat;
+	}
+	const int pct = scePowerGetBatteryLifePercent();
+	s_bat = pct < 0 || pct > 100 ? -1 : pct | (scePowerIsBatteryCharging() ? 0x100 : 0);
+	return s_bat;
+}
+// the battery icon (body 24 x 13 with its top at y, a cap at the right) filled to the charge, red at 20% or less; a bolt
+// over it while charging
+static void battery(UiCanvas *c, int x, int y, int pct, int chg)
+{
+	enum { BW = 24, BH = 13 };
+	rrect_outline(c, x, y, BW, BH, 3, 2, COL_DIM);
+	rrect(c, x + BW, y + 4, 3, BH - 8, 1, COL_DIM); // (the cap)
+	const int iw = BW - 6, fw = pct > 0 ? (iw * pct + 50) / 100 : 0;
+	if (fw > 0)
+		ui_rect(c, x + 3, y + 3, fw < 1 ? 1 : fw, BH - 6, pct <= 20 ? UI_RGBA(0xF0, 0x48, 0x40, 0xFF) : COL_DIM);
+	if (chg) { // a bolt of 7 rows (start, width), with a dark edge so it shows over the fill
+		static const signed char bolt[7][2] = { { 4, 2 }, { 3, 2 }, { 2, 2 }, { 1, 5 }, { 3, 2 }, { 2, 2 }, { 1, 2 } };
+		const int bx = x + (BW - 7) / 2, by = y + (BH - 7) / 2;
+		for (int r = 0; r < 7; r++)
+			ui_rect(c, bx + bolt[r][0] - 1, by + r, bolt[r][1] + 2, 1, UI_RGBA(0x00, 0x00, 0x00, 0xA0));
+		for (int r = 0; r < 7; r++)
+			ui_rect(c, bx + bolt[r][0], by + r, bolt[r][1], 1, COL_STAR);
+	}
+}
 static void gl_header(UiCanvas *c, int n, int sel)
 {
 	char title[96];
@@ -3936,9 +4018,14 @@ static void gl_header(UiCanvas *c, int n, int sel)
 		snprintf(title, sizeof(title), " (" RSTV_VERSION ") - SELECT GAME (%d/%d)", n ? sel + 1 : 0, n);
 	const int bw = draw_brand(c, 24, 36, 1.1f);
 	ui_text(c, 24 + bw, 36, COL_TEXT, 1.1f, title);
-	char have[40];
-	snprintf(have, sizeof(have), "%s %d", s_gl_filter_name[g_set.list_filter], s_gl_nvis);
-	ui_text(c, SCREEN_W - 24 - ui_text_width(0.85f, have), 34, COL_DIM, 0.85f, have);
+	// owner (as ReSys12): the battery at the right; the filter is in its footer pill now
+	if (s_bat >= 0) {
+		char pc[8];
+		snprintf(pc, sizeof(pc), "%d%%", s_bat & 0xFF);
+		const int px = SCREEN_W - 24 - ui_text_width(0.85f, pc);
+		ui_text(c, px, 34, COL_DIM, 0.85f, pc);
+		battery(c, px - 8 - 3 - 24, 22, s_bat & 0xFF, s_bat >> 8);
+	}
 }
 
 // ---- ADR-209: update window over the game list (Update / Close / Skip this version) ----
@@ -3949,15 +4036,26 @@ static void gl_header(UiCanvas *c, int n, int sel)
 #define UPD_VIS 13
 static char s_upd_line[UPD_LINES][160];
 static int s_upd_n, s_upd_scroll, s_upd_btn;
+static int s_upd_bx0[3], s_upd_bx1[3], s_upd_by; // (owner: the window by touch) its buttons as drawn
 static void upd_wrap(const char *notes) // the notes as lines of the window's width (word wrap)
 {
 	s_upd_n = 0;
 	const char *p = notes;
 	while (*p && s_upd_n < UPD_LINES) {
 		const char *e = strchr(p, '\n');
-		const size_t len = e ? (size_t)(e - p) : strlen(p);
+		size_t len = e ? (size_t)(e - p) : strlen(p);
 		char para[1024];
 		snprintf(para, sizeof(para), "%.*s", (int)(len < sizeof(para) - 1 ? len : sizeof(para) - 1), p);
+		// owner: the notes broke lines in mid sentence: the release notes wrap list items onto lines indented by two
+		// spaces; those lines continue the paragraph (wrapped here to the window's width)
+		while (e && e[1] == ' ' && e[2] == ' ' && e[3] && e[3] != '-' && e[3] != ' ') {
+			const char *e2 = strchr(e + 1, '\n');
+			const size_t l2 = e2 ? (size_t)(e2 - (e + 3)) : strlen(e + 3);
+			const size_t have = strlen(para);
+			snprintf(para + have, sizeof(para) - have, " %.*s", (int)l2, e + 3);
+			e = e2;
+		}
+		len = e ? (size_t)(e - p) : strlen(p);
 		if (!para[0])
 			s_upd_line[s_upd_n++][0] = 0;
 		for (char *q = para; *q && s_upd_n < UPD_LINES;) {
@@ -4006,6 +4104,9 @@ static void upd_draw(UiCanvas *c, int o_ok)
 	int bx = mx + 24;
 	for (int i = 0; i < 3; i++) {
 		const int bw = ui_text_width(0.9f, names[i]) + 40, by = my + UPD_H - 74;
+		s_upd_bx0[i] = bx;
+		s_upd_bx1[i] = bx + bw;
+		s_upd_by = by;
 		rrect(c, bx, by, bw, 36, 6, i == s_upd_btn ? COL_SEL : UI_RGBA(0xFF, 0xFF, 0xFF, 0x20));
 		ui_text(c, bx + 20, by + 25, i == s_upd_btn ? COL_PANEL : COL_TEXT, 0.9f, names[i]);
 		bx += bw + 16;
@@ -4044,6 +4145,10 @@ static void upd_progress(const char *stage, int pct) // (called while the update
 	rstv_video_present();
 }
 
+// the tab row slid left by s_tab_cur pixels, gliding to s_tab_tgt (owner, from ReBOX: a finger drags it; a new current
+// tab out of view is brought in smoothly). s_tab_max: the row's widest slide, from its last drawing
+static float s_tab_cur, s_tab_tgt, s_tab_max;
+static int s_tab_last = -1;
 const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 {
 	ensure_canvases();
@@ -4069,12 +4174,12 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 	float scr = -1, tgt = 0; // list scroll (rows): drawn position easing to the target
 	// touch: finger down, start point, last y, moved past the tap slop, started on the list; drag = the list was
 	// moved by touch (the cursor need not stay in view), vel = glide after a flick (rows per frame)
-	int t_down = 0, t_x0 = 0, t_y0 = 0, t_last = 0, t_moved = 0, t_list = 0, t_stop = 0, drag = 0;
+	int t_down = 0, t_x0 = 0, t_y0 = 0, t_last = 0, t_moved = 0, t_list = 0, t_stop = 0, drag = 0, t_tab = 0, t_lastx = 0;
 	float vel = 0;
 	static uint32_t *under; // the dimmed list under the options window
 	int under_ok = 0, under_gen = 0;
 	int mq_sel = -1, mq_t = 0, mq_tw = 0; // scrolling title of the selected row (marquee)
-	int fast_ok = 0, fast_key[7] = { 0 }, hdr_sel = -1, bar_n = -1, sync_left = 0; // rows as strips
+	int fast_ok = 0, fast_key[8] = { 0 }, hdr_sel = -1, hdr_bat = -2, bar_n = -1, sync_left = 0; // rows as strips
 	float bar_scr = -1;
 	s_gl_ntabs = s_gl_tab = 0;
 	int n = gl_build(idx, want, &sel);
@@ -4180,6 +4285,43 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			const int tall = rstv_touch_read(tx, ty);
 			touch_fx(tall, tx[0], ty[0]); // (the light under the finger, over the options too)
 			const int tn = (!upd && !s_list_mode && !about) ? tall : 0;
+			if (upd) { // owner: the update window by touch: drag the notes, tap a button, tap outside = Close
+				static int ud, ux0, uy0, ulast, umoved;
+				static float uacc;
+				if (tall) {
+					if (!ud) {
+						ud = 1;
+						ux0 = tx[0];
+						uy0 = ulast = ty[0];
+						umoved = 0;
+						uacc = 0;
+					} else {
+						if (abs(ty[0] - uy0) > 12 || abs(tx[0] - ux0) > 12)
+							umoved = 1;
+						if (umoved) {
+							uacc += (float)(ulast - ty[0]) / 24.0f;
+							while (uacc >= 1.0f) { uacc -= 1.0f; if (s_upd_scroll + UPD_VIS < s_upd_n) s_upd_scroll++; }
+							while (uacc <= -1.0f) { uacc += 1.0f; if (s_upd_scroll > 0) s_upd_scroll--; }
+							dirty = 1;
+						}
+						ulast = ty[0];
+					}
+				} else if (ud) {
+					ud = 0;
+					const int mx = (SCREEN_W - UPD_W) / 2, my = (SCREEN_H - UPD_H) / 2;
+					if (!umoved) {
+						if (ux0 < mx || ux0 >= mx + UPD_W || uy0 < my || uy0 >= my + UPD_H)
+							pressed |= back;
+						else if (uy0 >= s_upd_by && uy0 < s_upd_by + 36)
+							for (int k = 0; k < 3; k++)
+								if (ux0 >= s_upd_bx0[k] && ux0 < s_upd_bx1[k]) {
+									s_upd_btn = k;
+									pressed |= ok;
+								}
+						dirty = 1;
+					}
+				}
+			}
 			const int la = TITLE_H + 40, lb = SCREEN_H - LIST_FOOT_H;
 			if (tn > 0) {
 				if (!t_down) {
@@ -4188,8 +4330,21 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					t_y0 = t_last = ty[0];
 					t_moved = 0;
 					t_list = !msg[0] && ty[0] >= la && ty[0] < lb;
+					t_tab = !msg[0] && ty[0] >= TITLE_H && ty[0] < la;
+					t_lastx = tx[0];
 					t_stop = vel != 0; // (a touch during a glide only stops it)
 					vel = 0;
+				} else if (t_tab) { // the tab row follows the finger, within its ends
+					if (!t_moved && (abs(ty[0] - t_y0) > 12 || abs(tx[0] - t_x0) > 12))
+						t_moved = 1;
+					if (t_moved) {
+						s_tab_tgt -= (float)(tx[0] - t_lastx);
+						if (s_tab_tgt > s_tab_max) s_tab_tgt = s_tab_max;
+						if (s_tab_tgt < 0.0f) s_tab_tgt = 0.0f;
+						s_tab_cur = s_tab_tgt;
+						dirty = 1;
+					}
+					t_lastx = tx[0];
 				} else if (t_list) {
 					if (!t_moved && (abs(ty[0] - t_y0) > 12 || abs(tx[0] - t_x0) > 12))
 						t_moved = 1;
@@ -4213,10 +4368,9 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					pressed |= ok; // (closes the notice)
 				else if ((t_x0 - GL_GEAR_CX) * (t_x0 - GL_GEAR_CX) + (t_y0 - GL_GEAR_CY) * (t_y0 - GL_GEAR_CY) < 30 * 30)
 					pressed |= SCE_CTRL_START; // the gear: options
-				else if (t_y0 < TITLE_H) { // the filter's name at the top right
-					if (t_x0 > SCREEN_W - 200)
-						pressed |= SCE_CTRL_SELECT;
-				} else if (t_y0 >= lb) { // footer pill
+				else if (t_y0 < TITLE_H)
+					; // (the header: the battery now; the filter is the footer's SELECT pill)
+				else if (t_y0 >= lb) { // footer pill
 					for (int k = 0; k < s_ft_n; k++)
 						if (t_x0 >= s_ft_x0[k] && t_x0 < s_ft_x1[k])
 							pressed |= s_ft_key[k];
@@ -4330,6 +4484,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			if (mr != RSTV_MENU_STAY) {
 				s_list_mode = 0;
 				s_page = PAGE_MAIN;
+				s_about_direct = 0;
 				ui_clear(c);
 			}
 			if (g_set.list_group != group0) { // (another grouping: the same game, in its tab)
@@ -4417,9 +4572,16 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				}
 				fast_ok = 0; // (drawn again in full: header, tabs and footer change)
 				dirty = 1;
-			} else if (pressed & GL_FT_ABOUT) { // the footer's About (touch only)
-				about = 1;
+			} else if (pressed & GL_FT_ABOUT) { // the footer's About (touch only): the options' About page (touch scroll),
+				                                    // closed straight back to the list (as ReBOX)
+				rstv_settings_use_global();
+				s_list_mode = 1;
+				s_page = PAGE_MAIN;
+				s_sel = s_main_sel = 0;
+				go_page(PAGE_ABOUT);
 				s_about_scroll = 0;
+				s_about_direct = 1;
+				s_prev_buttons = b;
 			} else if (pressed & SCE_CTRL_START) { // options: edit and save global settings only
 				rstv_settings_use_global();
 				s_list_mode = 1;
@@ -4447,6 +4609,16 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			}
 		}
 		focus_tick();
+		const int bat = bat_poll(); // (the header shows it; a new value redraws the header line)
+		{ // the tab row gliding to its target
+			if (s_tab_tgt > s_tab_max) s_tab_tgt = s_tab_max;
+			if (s_tab_tgt < 0.0f) s_tab_tgt = 0.0f;
+			s_tab_cur += (s_tab_tgt - s_tab_cur) * 0.3f;
+			if (fabsf(s_tab_tgt - s_tab_cur) < 0.5f)
+				s_tab_cur = s_tab_tgt;
+			if (!s_list_mode && s_tab_cur != s_tab_tgt)
+				dirty = 1;
+		}
 		if (s_list_mode && (menu_anim() || s_dirty)) {
 			// the options window is still scrolling, or it changed without a button press (the touch editor, a controller
 			// that came or went; touching Done leaves the editor that way: after Done it stayed on the screen)
@@ -4527,7 +4699,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 		int full = dirty && !fast;
 		if (fast) {
 			theme();
-			const int key[7] = { s_theme_gen, s_gl_tab, s_gl_ntabs, g_set.list_filter, s_gl_nvis, n, o_ok };
+			const int key[8] = { s_theme_gen, s_gl_tab, s_gl_ntabs, g_set.list_filter, s_gl_nvis, n, o_ok, (int)floorf(s_tab_cur + 0.5f) };
 			if (!fast_ok || memcmp(key, fast_key, sizeof(key))) {
 				memcpy(fast_key, key, sizeof(key));
 				fast_ok = 1;
@@ -4588,29 +4760,67 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				if (!fast)
 					gl_scrollbar(c, n, scr, rows_f, la, lb, 0, 0);
 				gl_header(c, n, sel);
-				{ // tab row: current tab highlighted; on overflow, scrolled so the current tab stays visible
-					int tx = px + 16, first = 0, total = 0;
+				{ // tab row (from ReBOX): the current tab bright with an accent underline; a row wider than the screen slides
+				  // (s_tab_cur) so the current tab comes into view, with fades at the ends that have more
+					int tws[GL_TAB_MAX], total = 0, cx0 = 0;
+					const int nt = s_gl_ntabs < GL_TAB_MAX ? s_gl_ntabs : GL_TAB_MAX;
 					for (int t = 0; t < GL_TAB_MAX; t++)
 						s_tab_x0[t] = s_tab_x1[t] = -1;
-					for (int t = 0; t < s_gl_ntabs; t++)
-						total += ui_text_width(0.95f, s_gl_tabs[t]) + 28;
-					while (total > w - 32 && first < s_gl_tab) {
-						total -= ui_text_width(0.95f, s_gl_tabs[first]) + 28;
-						first++;
+					for (int t = 0; t < nt; t++) {
+						tws[t] = ui_text_width(0.95f, s_gl_tabs[t]) + 20;
+						if (t < s_gl_tab)
+							cx0 += tws[t] + 8;
+						total += tws[t] + (t + 1 < nt ? 8 : 0);
 					}
-					for (int t = first; t < s_gl_ntabs; t++) {
-						const int tw = ui_text_width(0.95f, s_gl_tabs[t]) + 20;
-						if (tx + tw > px + w - 16)
-							break;
-						if (t == s_gl_tab) // ADR-194: current tab bright with an accent underline
-							rrect(c, tx + 6, py + TITLE_H + 26, tw - 12, 4, 2, COL_SEL);
-						ui_text(c, tx + 10, py + TITLE_H + 20, t == s_gl_tab ? COL_TEXT : COL_DIM, 0.95f, s_gl_tabs[t]);
-						if (t < GL_TAB_MAX) {
-							s_tab_x0[t] = tx - 4;
-							s_tab_x1[t] = tx + tw + 4;
+					const int left = px + 16, avail = w - 32, fw = 28;
+					const float maxoff = total > avail ? (float)(total - avail) : 0.0f;
+					s_tab_max = maxoff;
+					if (nt && s_gl_tab != s_tab_last) { // a new current tab: brought into view (clear of the fades)
+						const int cx1 = cx0 + tws[s_gl_tab < nt ? s_gl_tab : 0];
+						if ((float)cx1 - s_tab_tgt > (float)(avail - fw))
+							s_tab_tgt = (float)(cx1 - avail + fw);
+						if ((float)cx0 - s_tab_tgt < (float)fw)
+							s_tab_tgt = (float)(cx0 - fw);
+						if (s_tab_tgt > maxoff) s_tab_tgt = maxoff;
+						if (s_tab_tgt < 0.0f) s_tab_tgt = 0.0f;
+						if (s_tab_last < 0)
+							s_tab_cur = s_tab_tgt; // (the list's first drawing: no glide)
+						s_tab_last = s_gl_tab;
+					}
+					float cur = s_tab_cur;
+					if (cur > maxoff) cur = maxoff;
+					if (cur < 0.0f) cur = 0.0f;
+					const int off = (int)floorf(cur + 0.5f);
+					int tbx = left - off;
+					for (int t = 0; t < nt; t++) {
+						const int tw = tws[t];
+						const int vis = tbx + tw > left && tbx < left + avail; // (at least partly in view: clipped)
+						s_tab_x0[t] = vis ? (tbx < left ? left : tbx) - 4 : -1;
+						s_tab_x1[t] = vis ? (tbx + tw + 4 > left + avail ? left + avail : tbx + tw + 4) : -1;
+						if (vis) {
+							if (t == s_gl_tab) {
+								int ux0 = tbx + 6, ux1 = tbx + tw - 6;
+								if (ux0 < left) ux0 = left;
+								if (ux1 > left + avail) ux1 = left + avail;
+								if (ux1 > ux0)
+									rrect(c, ux0, py + TITLE_H + 26, ux1 - ux0, 4, 2, COL_SEL);
+							}
+							ui_text_clip(c, tbx + 10, py + TITLE_H + 20, t == s_gl_tab ? COL_TEXT : COL_DIM, 0.95f, s_gl_tabs[t],
+								left, left + avail);
 						}
-						tx += tw + 8;
+						tbx += tw + 8;
 					}
+					if (off > 0 || (float)off < maxoff) // fades at the ends that have more tabs
+						for (int y = py + TITLE_H; y < py + TITLE_H + tab_h; y++) {
+							const uint32_t rgb = bgr[y] & 0xFFFFFFu;
+							for (int k = 0; k < fw; k++) {
+								const unsigned al = (unsigned)(255 - k * 255 / fw);
+								if (off > 0)
+									ui_rect(c, left + k, y, 1, 1, rgb | (al << 24));
+								if ((float)off < maxoff)
+									ui_rect(c, left + avail - 1 - k, y, 1, 1, rgb | (al << 24));
+							}
+						}
 				}
 				if (!n && g_set.list_filter == RSTV_LIST_FAVORITES)
 					text_keys(c, px + 48, la + 40, COL_DIM, "No favorites. " G_SQU ": add, SELECT: filter");
@@ -4626,7 +4836,8 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 					fk[fn++] = SCE_CTRL_SQUARE;
 					snprintf(f[fn], sizeof(f[fn]), G_TRI "  %s", s_search[0] ? "All games" : "Search");
 					fk[fn++] = SCE_CTRL_TRIANGLE;
-					snprintf(f[fn], sizeof(f[fn]), "SELECT  %s", s_gl_filter_name[wrap(g_set.list_filter + 1, RSTV_LIST_FILTER_COUNT)]);
+					// owner (as ReSys12): the filter shown now (a press steps to the next; no count, owner)
+					snprintf(f[fn], sizeof(f[fn]), "SELECT  %s", s_gl_filter_name[g_set.list_filter]);
 					fk[fn++] = SCE_CTRL_SELECT;
 					snprintf(f[fn], sizeof(f[fn]), "About");
 					fk[fn++] = GL_FT_ABOUT;
@@ -4685,7 +4896,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 			const int rw = SCREEN_W - 16;
 			const uint32_t *bgr = theme_rows(1);
 			int drawn = full;
-			if (!full && hdr_sel != sel) { // the position in the header
+			if (!full && (hdr_sel != sel || hdr_bat != bat)) { // the position or the battery in the header
 				ui_fill_rows(c, bgr, 0, 0, SCREEN_W, TITLE_H - 8);
 				gl_header(c, n, sel);
 				drawn = 1;
@@ -4699,6 +4910,7 @@ const char *rstv_game_select(const char *initial_set, const char *rom_dir)
 				ui_commit(bar_cv);
 			}
 			hdr_sel = sel;
+			hdr_bat = bat;
 			bar_scr = scr;
 			bar_n = n;
 			// the fade bands at the top and bottom of the rows: the background over them, opaque at the edge

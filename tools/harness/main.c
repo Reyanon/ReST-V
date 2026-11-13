@@ -487,6 +487,25 @@ int main(int argc, char **argv)
 			if (sf == -2) { sf = -1; const char *e = getenv("RSTV_SYSHOLD"); if (e) sscanf(e, "%d,%d,%i", &sf, &st, &sb); }
 			if (sf >= 0 && f >= sf && f < st) sys |= (u8)sb;
 		}
+		{	// RSTV_INPUT=file: an input script, one press a line "frame length sys p1" (sys STV_SYS_*, p1 STV_IN_*; C
+			// number syntax, e.g. 0x10), to walk the BIOS test menu and similar with --shot
+			static int n = -1;
+			static int fr[256], ln[256], sb[256], pb[256];
+			if (n < 0) {
+				n = 0;
+				const char *e = getenv("RSTV_INPUT");
+				FILE *inf = e ? fopen(e, "r") : NULL;
+				while (inf && n < 256 && fscanf(inf, "%i %i %i %i", &fr[n], &ln[n], &sb[n], &pb[n]) == 4)
+					n++;
+				if (inf)
+					fclose(inf);
+			}
+			for (int k = 0; k < n; k++)
+				if (f >= fr[k] && f < fr[k] + ln[k]) {
+					sys |= (u8)sb[k];
+					p1 |= (u8)pb[k];
+				}
+		}
 		StvIoSetInputs(p1, 0, sys);
 		{	// RSTV_MJ=from,to,row,bits: mahjong panel keys (row layout in stvio.h)
 			static int mf = -2, mt, mr, mb;

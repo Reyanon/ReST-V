@@ -15,6 +15,8 @@
 
 static RstvTouchArea *s_area;
 static int s_n, s_cap, s_gen;
+static int s_menu_hit, s_menu_held;
+static uint64_t s_pressed; // (the overlay shows these pressed, owner) // a menu touch button (RSTV_TKEY_MENU): touched since the last take, still held
 
 void rstv_touch_init(void)
 {
@@ -85,6 +87,8 @@ void rstv_touch_save(void)
 uint32_t rstv_touch_key_code(int key)
 {
 	static const uint32_t dirs[4] = { SCE_CTRL_UP, SCE_CTRL_DOWN, SCE_CTRL_LEFT, SCE_CTRL_RIGHT };
+	if (key == RSTV_TKEY_MENU)
+		return 0; // (rstv_touch_menu_take)
 	if (key >= RSTV_TKEY_UP && key < RSTV_TKEY_COUNT)
 		return dirs[key - RSTV_TKEY_UP];
 	if (RSTV_TKEY_IS_COMBO(key)) {
@@ -100,6 +104,8 @@ uint32_t rstv_touch_key_code(int key)
 const char *rstv_touch_key_name(int key)
 {
 	static const char *const dirs[4] = { "Up", "Down", "Left", "Right" };
+	if (key == RSTV_TKEY_MENU)
+		return "Menu";
 	if (key >= RSTV_TKEY_UP && key < RSTV_TKEY_COUNT)
 		return dirs[key - RSTV_TKEY_UP];
 	if (RSTV_TKEY_IS_COMBO(key)) {
@@ -185,14 +191,35 @@ uint32_t rstv_touch_buttons(void)
 	if (hold) {
 		if (n == 0)
 			hold = 0;
+		s_menu_held = n > 0; // (the finger that was down before the pause is not a new touch)
+		s_pressed = 0;
 		return 0;
 	}
 	uint32_t b = 0;
+	int menu = 0;
+	uint64_t pm = 0;
 	for (int k = 0; k < n; k++)
 		for (int i = 0; i < s_n; i++) {
 			const RstvTouchArea *a = &s_area[i];
-			if (x[k] >= a->x && x[k] < a->x + a->w && y[k] >= a->y && y[k] < a->y + a->h)
+			if (x[k] >= a->x && x[k] < a->x + a->w && y[k] >= a->y && y[k] < a->y + a->h) {
 				b |= rstv_touch_key_code(a->key);
+				menu |= a->key == RSTV_TKEY_MENU;
+				if (i < 64)
+					pm |= 1ull << i;
+			}
 		}
+	s_pressed = pm;
+	if (menu && !s_menu_held)
+		s_menu_hit = 1; // (once a touch: the menu opens on the touch, not again while the finger stays)
+	s_menu_held = menu;
 	return b;
+}
+
+uint64_t rstv_touch_pressed(void) { return s_pressed; }
+
+int rstv_touch_menu_take(void)
+{
+	const int h = s_menu_hit;
+	s_menu_hit = 0;
+	return h;
 }

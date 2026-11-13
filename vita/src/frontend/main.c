@@ -396,6 +396,8 @@ static int s_test_frames; // frames left of the TEST switch press from the menu
 // ux0:data/restv/fastboot = that frame number (empty: 1300), also with the option off
 int rstv_fastboot_until, rstv_fastboot_now;
 int rstv_test_session;     // after the menu's TEST switch press: L = SERVICE (move), R = TEST (enter) in the BIOS test menu
+// (shown again every 2 s while the session lasts: the test menus have no help of their own for the Vita's keys)
+#define RSTV_TEST_HINT "Test menu: Up/Down or L = Service (move)   OK or R = Test (select)   START or coin: leave"
 // one player (re_pad: 1P and 2P each read their own controller with their own port settings: keys, stick, turbo,
 // combo keys, g_set.port, ADR-216). 1P sets *sys, 2P adds to it. The touch buttons, the test switches and the mahjong panel are 1P's
 static void map_player(int pl, const SceCtrlData *pad, uint16_t *pp, uint8_t *sys, unsigned frame)
@@ -416,8 +418,11 @@ static void map_player(int pl, const SceCtrlData *pad, uint16_t *pp, uint8_t *sy
 	// ADR-214: the touch buttons press their Vita keys (in the game only), for the player on the Vita's own controls
 	// (owner: 1P on a controller, 2P on the Vita: the touch is 2P's); 1P's when nobody reads the Vita
 	const int touch_pl = re_pad_port(0) == 0 ? 0 : re_pad_port(1) == 0 ? 1 : 0;
-	if (pl == touch_pl && g_set.touch_keys)
-		b |= rstv_touch_buttons();
+	if (pl == touch_pl && g_set.touch_keys) {
+		const uint32_t tb = rstv_touch_buttons();
+		if (!rstv_fastboot_now) // owner: they acted during the loading screen too (Fast boot)
+			b |= tb;
+	}
 	{ // ADR-214 combo keys (as ReiREM): a key with a combo acts as its two keys pressed together, not its own mapping
 		uint32_t add = 0;
 		for (int k = 0; k < RSTV_KEY_COUNT; k++)
@@ -496,10 +501,19 @@ static void map_player(int pl, const SceCtrlData *pad, uint16_t *pp, uint8_t *sy
 		s_test_frames--;
 		s |= STV_SYS_TEST;
 	}
+	if (rstv_test_session && (s & (STV_SYS_COIN1 | STV_SYS_START1))) {
+		// coin or start: back to playing (the test menus do not use them; Up/Down would give service credits in a game)
+		rstv_test_session = 0;
+		rstv_osd_show("Test menu keys off");
+	}
 	if (rstv_test_session) {
-		if (b & SCE_CTRL_LTRIGGER)
+		// the BIOS and game test menus move with SERVICE and select / change with TEST only. User report: the menus did
+		// not respond (the d-pad and the confirm button do nothing there): those work as SERVICE / TEST too (they still
+		// reach the game, for its input test)
+		const uint32_t okb = g_set.confirm == RSTV_CONFIRM_CIRCLE ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS;
+		if (b & (SCE_CTRL_LTRIGGER | SCE_CTRL_DOWN | SCE_CTRL_UP))
 			s |= STV_SYS_SERVICE;
-		if (b & SCE_CTRL_RTRIGGER)
+		if (b & (SCE_CTRL_RTRIGGER | okb))
 			s |= STV_SYS_TEST;
 	}
 	*pp = p;
@@ -1487,7 +1501,11 @@ next_game:
 			rstv_menu_selftest();
 			RSTV_LOG("menu: selftest images written");
 		}
-		if (rstv_menu_should_open(pad.buttons)) {
+		if (rstv_test_session && frame % 110 == 0)
+			rstv_osd_show(RSTV_TEST_HINT); // (kept on the screen while the test session lasts)
+		// (owner: a touch button can open the menu too, RSTV_TKEY_MENU)
+		const int touch_menu = rstv_touch_menu_take() && !rstv_fastboot_now; // (not from the loading screen)
+		if (rstv_menu_should_open(pad.buttons | (touch_menu ? (SCE_CTRL_SELECT | SCE_CTRL_START) : 0))) {
 			// ADR-094: in-game menu (SELECT+START). Emulation stops while the menu is open; the menu is drawn over the last frame
 			RSTV_LOG("menu: open f%u", frame);
 			rstv_fps_hide(); // (it covered the menu, e.g. Done of the touch layout editor)
@@ -1540,8 +1558,7 @@ next_game:
 					// menu on one press and leaves it on the next). L / R work as SERVICE / TEST until the next press
 					s_test_frames = 12; // the TEST switch held for 12 frames
 					rstv_test_session = !rstv_test_session;
-					rstv_osd_show(rstv_test_session ? "TEST switch pressed - in the test menu: L = Service (select), R = Test (enter)"
-						: "TEST switch pressed");
+					rstv_osd_show(rstv_test_session ? RSTV_TEST_HINT : "TEST switch pressed");
 					done = 1;
 					break;
 				default:
@@ -1751,8 +1768,12 @@ next_game:
 			}
 		}
 		// FPS (updated every second) + frame number; top-right box as in Reirem (ADR-094); expire notices
-		rstv_fps_update((float)osd_fps, frame);
-		rstv_touch_overlay_update(0); // ADR-214 (drawn again only when the layout changes)
+		// owner: not over the loading screen while Fast boot runs the BIOS unseen (the FPS showed there)
+		if (rstv_fastboot_now)
+			rstv_fps_hide();
+		else
+			rstv_fps_update((float)osd_fps, frame);
+		rstv_touch_overlay_update(rstv_fastboot_now); // ADR-214 (drawn again only when the layout changes)
 		rstv_osd_tick();
 		if (s_exit_req) {
 			// ADR-086: exit request from measurement tools; clean up and exit instead of a forced quit (checked by the writer thread, ADR-090)
