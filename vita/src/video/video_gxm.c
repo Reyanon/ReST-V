@@ -906,6 +906,8 @@ void rstv_video_present(void)
 		} else {
 			dh = 544.0f;
 			dw = side ? dh * 3.0f / 4.0f : dh * 4.0f / 3.0f;
+			if (s_scale_mode == 3) // 14:9 (user request: 4:3 squeezed round shapes, full was too wide): half of 4:3's
+				dw = (dw + 960.0f) * 0.5f; // black side bars filled
 		}
 		const float x0 = (960.0f - dw) * 0.5f, y0 = (544.0f - dh) * 0.5f;
 		s_pic_x = (int)(x0 + 0.5f);

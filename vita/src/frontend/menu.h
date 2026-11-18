@@ -24,7 +24,9 @@ enum { RSTV_SDIR_UP, RSTV_SDIR_DOWN, RSTV_SDIR_LEFT, RSTV_SDIR_RIGHT, RSTV_SDIR_
 enum { RSTV_STGT_NONE, RSTV_STGT_UP, RSTV_STGT_DOWN, RSTV_STGT_LEFT, RSTV_STGT_RIGHT, RSTV_STGT_B1, RSTV_STGT_B6 = RSTV_STGT_B1 + 5,
 	RSTV_STGT_COIN, RSTV_STGT_START, RSTV_STGT_COUNT };
 // screen (Reirem order): 4:3, full, integer
-enum { RSTV_ASPECT_4_3, RSTV_ASPECT_FULL, RSTV_ASPECT_INT, RSTV_ASPECT_COUNT };
+// RSTV_ASPECT_WIDE (user request): half way between 4:3 and the full screen (half of 4:3's black side bars filled, about
+// 14:9); added last so saved values keep their meaning, shown second (s_aspect_order)
+enum { RSTV_ASPECT_4_3, RSTV_ASPECT_FULL, RSTV_ASPECT_INT, RSTV_ASPECT_WIDE, RSTV_ASPECT_COUNT };
 enum { RSTV_FILTER_SMOOTH, RSTV_FILTER_SHARP, RSTV_FILTER_COUNT };
 // scanlines: CRT types follow game lines, PX types use screen pixel spacing
 enum { RSTV_SCAN_OFF, RSTV_SCAN_CRT_SOFT, RSTV_SCAN_CRT_SHARP, RSTV_SCAN_PX2, RSTV_SCAN_PX3, RSTV_SCAN_PX4, RSTV_SCAN_COUNT };

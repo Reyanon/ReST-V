@@ -466,8 +466,19 @@ void rstv_settings_apply_video(void)
 	default: break;
 	}
 	rstv_video_set_rotate(r);
-	// rstv_video_set_mode: 0 = 4:3, 1 = integer, 2 = full / 0 = sharp, 1 = smooth
-	const int scale = g_set.aspect == RSTV_ASPECT_FULL ? 2 : g_set.aspect == RSTV_ASPECT_INT ? 1 : 0;
+	// rstv_video_set_mode: 0 = 4:3, 1 = integer, 2 = full, 3 = 14:9 (between 4:3 and full) / 0 = sharp, 1 = smooth
+	int aspect = g_set.aspect;
+#ifdef RSTV_DEBUG_TOOLS
+	{ // test: ux0:data/restv/aspecttest = an aspect value (RSTV_ASPECT_*) shown instead of the setting (not saved)
+		FILE *af = fopen(DATA_DIR "/aspecttest", "r");
+		if (af) {
+			if (fscanf(af, "%d", &aspect) != 1 || aspect < 0 || aspect >= RSTV_ASPECT_COUNT)
+				aspect = g_set.aspect;
+			fclose(af);
+		}
+	}
+#endif
+	const int scale = aspect == RSTV_ASPECT_FULL ? 2 : aspect == RSTV_ASPECT_INT ? 1 : aspect == RSTV_ASPECT_WIDE ? 3 : 0;
 	rstv_video_set_mode(scale, g_set.filter == RSTV_FILTER_SMOOTH);
 	int border = g_set.border;
 #ifdef RSTV_DEBUG_TOOLS
@@ -1172,7 +1183,7 @@ static const char *page_row_help(void)
 	case PAGE_DISPLAY:
 		switch (s_sel) {
 		case D_FPS: return "Frames per second in a corner of the game picture";
-		case D_ASPECT: return "4:3, the full screen, or the largest whole-number scale";
+		case D_ASPECT: return "4:3, 14:9 (between 4:3 and full), the full screen, or the largest whole-number scale";
 		case D_ROTATE: return "Auto: vertical games upright. Vertical L / R: hold the Vita turned, the controls turn with it";
 		case D_FILTER: return "Smooth or sharp pixels";
 		case D_SCAN: return "Lines over the picture like an arcade monitor (CRT) or a pixel grid";
@@ -1524,7 +1535,15 @@ static int wrap(int v, int n)
 }
 
 // value names (items and the choice window)
-static const char *const aspect[] = { "4:3", "Full screen", "Integer" };
+static const char *const aspect[] = { "4:3", "14:9", "Full screen", "Integer" }; // (in s_aspect_order)
+static const int s_aspect_order[RSTV_ASPECT_COUNT] = { RSTV_ASPECT_4_3, RSTV_ASPECT_WIDE, RSTV_ASPECT_FULL, RSTV_ASPECT_INT };
+static int aspect_pos(int a)
+{
+	for (int i = 0; i < RSTV_ASPECT_COUNT; i++)
+		if (s_aspect_order[i] == a)
+			return i;
+	return 0;
+}
 static const char *const filter[] = { "Smooth", "Sharp" };
 static const char *const scan[] = { "Off", "CRT soft", "CRT sharp", "Every 2 px", "Every 3 px", "Every 4 px" };
 static const char *const scan_str[] = { "Light", "Medium", "Heavy" };
@@ -1586,7 +1605,7 @@ static int item_choices(const char **out, int *cur, const char **title)
 			"Theme" };
 		const char *const *v = NULL;
 		switch (s_sel) {
-		case D_ASPECT: v = aspect; n = RSTV_ASPECT_COUNT; *cur = g_set.aspect; break;
+		case D_ASPECT: v = aspect; n = RSTV_ASPECT_COUNT; *cur = aspect_pos(g_set.aspect); break;
 		case D_ROTATE: v = rotate; n = RSTV_ROT_COUNT; *cur = g_set.rotate; break;
 		case D_FILTER: v = filter; n = RSTV_FILTER_COUNT; *cur = g_set.filter; break;
 		case D_SCAN: v = scan; n = RSTV_SCAN_COUNT; *cur = g_set.scan_type; break;
@@ -1750,7 +1769,7 @@ static void change(int dir)
 	case PAGE_DISPLAY:
 		switch (s_sel) {
 		case D_FPS: g_set.fps = !g_set.fps; break;
-		case D_ASPECT: g_set.aspect = wrap(g_set.aspect + dir, RSTV_ASPECT_COUNT); break;
+		case D_ASPECT: g_set.aspect = s_aspect_order[wrap(aspect_pos(g_set.aspect) + dir, RSTV_ASPECT_COUNT)]; break;
 		case D_ROTATE: g_set.rotate = wrap(g_set.rotate + dir, RSTV_ROT_COUNT); break;
 		case D_FILTER: g_set.filter = wrap(g_set.filter + dir, RSTV_FILTER_COUNT); break;
 		case D_SCAN: g_set.scan_type = wrap(g_set.scan_type + dir, RSTV_SCAN_COUNT); break;
@@ -3089,7 +3108,7 @@ static void menu_paint(UiCanvas *c, int overlay)
 			const char *v = NULL;
 			switch (i) {
 			case D_FPS: v = g_set.fps ? VAL_ON : VAL_OFF; break;
-			case D_ASPECT: v = aspect[g_set.aspect]; break;
+			case D_ASPECT: v = aspect[aspect_pos(g_set.aspect)]; break;
 			case D_ROTATE: v = rotate[g_set.rotate]; break;
 			case D_FILTER: v = filter[g_set.filter]; break;
 			case D_SCAN: v = scan[g_set.scan_type]; break;
